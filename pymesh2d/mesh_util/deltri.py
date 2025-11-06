@@ -1,4 +1,5 @@
 import numpy as np
+
 from ..mesh_cost.triarea import triarea
 from ..poly_test.inpoly import inpoly
 from .cfmtri import cfmtri
@@ -6,15 +7,58 @@ from .cfmtri import cfmtri
 
 def deltri(vert=None, conn=None, node=None, PSLG=None, part=None, kind="constrained"):
     """
-    Python translation of Darren Engwirda's deltri.m
-    Constrained Delaunay triangulation (2D).
+    DELTRI : compute a constrained 2-simplex Delaunay triangulation in the 2D plane.
+
+    [vert, conn, tria, tnum] = deltri2(vert, conn, node, pslg, part)
+    computes the Delaunay triangulation {vert, tria}, the constraining edges `conn`,
+    and the "inside" status vector `tnum`.
+
+    Parameters
+    ----------
+    vert : ndarray (V, 2)
+        Array of XY coordinates to be triangulated.
+    conn : ndarray (C, 2)
+        Array of constraining edges, where each row defines an edge between vertices.
+    node : ndarray (N, 2)
+        Array of polygon vertices.
+    pslg : ndarray (P, 2)
+        Piecewise straight-line graph (PSLG) defining the polygon edges as pairs
+        of indices into `node`.
+    part : list of ndarray
+        List of polygonal parts, where each element `part[k]` contains edge indices
+        defining a polygonal region. `pslg[part[k], :]` corresponds to the edges
+        of the k-th region.
+    tria : ndarray (T, 3)
+        Array of vertex indices defining the triangles. Each row corresponds to one
+        triangle, such that:
+        `vert[tria[ii, 0], :]`, `vert[tria[ii, 1], :]`, and `vert[tria[ii, 2], :]`
+        are the coordinates of the ii-th triangle.
+    tnum : ndarray (T,)
+        Part index for each triangle, where `tnum[ii]` gives the index of the part
+        that contains the ii-th triangle.
+
+    See Also
+    --------
+    delaunayTriangulation : MATLAB equivalent triangulation function.
+    delaunaytri : legacy Delaunay triangulation.
+    delaunayn : N-dimensional Delaunay triangulation.
+
+    References
+    ----------
+    Translation of the MESH2D function `DELTRI2`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
 
-    if vert is None: vert = np.empty((0, 2))
-    if conn is None: conn = np.empty((0, 2), dtype=int)
-    if node is None: node = np.empty((0, 2))
-    if PSLG is None: PSLG = np.empty((0, 2), dtype=int)
-    if part is None: part = []
+    if vert is None:
+        vert = np.empty((0, 2))
+    if conn is None:
+        conn = np.empty((0, 2), dtype=int)
+    if node is None:
+        node = np.empty((0, 2))
+    if PSLG is None:
+        PSLG = np.empty((0, 2), dtype=int)
+    if part is None:
+        part = []
 
     vert = np.asarray(vert, float)
     conn = np.asarray(conn, int)
@@ -41,9 +85,7 @@ def deltri(vert=None, conn=None, node=None, PSLG=None, part=None, kind="constrai
     # -------------------------------- compute "inside" status
     tnum = np.zeros(tria.shape[0], dtype=int)
     if node.size and PSLG.size and part:
-        tmid = (vert[tria[:, 0], :] +
-                vert[tria[:, 1], :] +
-                vert[tria[:, 2], :]) / 3.0
+        tmid = (vert[tria[:, 0], :] + vert[tria[:, 1], :] + vert[tria[:, 2], :]) / 3.0
 
         for ppos, pedges in enumerate(part, start=1):
             stat, _ = inpoly(tmid, node, PSLG[pedges, :])

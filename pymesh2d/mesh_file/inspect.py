@@ -9,6 +9,11 @@ def inspect(mesh, base=None, item=None):
 
     Returns:
         bool: True if the specified field(s) exist and are not empty, False otherwise.
+
+    References
+    ----------
+    Translation of the MESH2D function `CERTIFY`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
     if not isinstance(mesh, dict):
         raise ValueError("inspect: MESH must be a valid dictionary.")
@@ -19,29 +24,29 @@ def inspect(mesh, base=None, item=None):
     if item is not None and not isinstance(item, str):
         raise ValueError("inspect: ITEM must be a valid string.")
 
-    # Default ITEM kinds given BASE types
+    # - default ITEM kinds given BASE types
     if item is None:
         base_to_item = {
-            'point': 'coord',
-            'edge2': 'index',
-            'tria3': 'index',
-            'quad4': 'index',
-            'tria4': 'index',
-            'hexa8': 'index',
-            'wedg6': 'index',
-            'pyra5': 'index',
-            'bound': 'index',
+            "point": "coord",
+            "edge2": "index",
+            "tria3": "index",
+            "quad4": "index",
+            "tria4": "index",
+            "hexa8": "index",
+            "wedg6": "index",
+            "pyra5": "index",
+            "bound": "index",
         }
         item = base_to_item.get(base.lower(), None) if base else None
 
-    # Check whether MESH.BASE exists
+    # -- check whether MESH.BASE exists
     if item is None:
         return base in mesh and mesh[base] is not None
 
-    # Check whether MESH.BASE.ITEM exists
+    # -- check whether MESH.BASE.ITEM exists
     return (
-        base in mesh and
-        isinstance(mesh[base], dict) and
-        item in mesh[base] and
-        mesh[base][item] is not None
+        base in mesh
+        and isinstance(mesh[base], dict)
+        and item in mesh[base]
+        and mesh[base][item] is not None
     )

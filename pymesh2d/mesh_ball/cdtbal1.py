@@ -1,21 +1,32 @@
 import numpy as np
 
+
 def cdtbal1(pp, ee):
     """
-    CDTBAL1 compute the circumballs associated with a 1-simplex
-    triangulation embedded in R^2.
+    Compute the circumballs associated with a 1-simplex triangulation in 2D.
+
+    This function computes the circumscribing balls (center and squared radius)
+    for a set of 1-simplexes (edges) defined in a 2D space.
 
     Parameters
     ----------
-    pp : (N,2) array
-        Points coordinates.
-    ee : (E,2) array
-        Edges connectivity.
+    PP : ndarray of shape (N, 2)
+        XY-coordinates of the mesh vertices.
+    EE : ndarray of shape (E, 2)
+        Edge connectivity array, where each row defines a line segment between
+        two vertex indices.
 
     Returns
     -------
-    bb : (E,3) array
-        Circumballs [xc, yc, rc^2].
+    BB : ndarray of shape (E, 3)
+        Array containing the circumball parameters for each edge:
+        `[XC, YC, RC²]`, where `(XC, YC)` is the ball center and `RC²`
+        is the squared radius.
+
+    References
+    ----------
+    Translation of the MESH2D function `CDTBAL1`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
     # ----------------------- basic checks
     if not (isinstance(pp, np.ndarray) and isinstance(ee, np.ndarray)):

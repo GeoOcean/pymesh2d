@@ -1,24 +1,45 @@
 import numpy as np
+
 from ..aabb_tree.maketree import maketree
+
 
 def idxtri(vert, tria):
     """
-    idxtri create a spatial-indexing structure for a 2-simplex
-    triangulation embedded in the two-dimensional plane.
+    IDXTRI : create a spatial-indexing structure for a 2-simplex triangulation in 2D.
+
+    [tree] = idxtri(vert, tria) builds an Axis-Aligned Bounding Box (AABB) tree
+    designed to accelerate spatial queries within a triangulation defined by
+    {vert, tria}.
 
     Parameters
     ----------
-    vert : (V,2) ndarray
-        Array of XY coordinates.
-    tria : (T,3) ndarray
-        Array of triangles (indices 0-based).
+    vert : ndarray (V, 2)
+        Array of XY coordinates of the triangulation vertices.
+    tria : ndarray (T, 3)
+        Array of vertex indices defining each triangle. Each row defines one
+        triangle such that:
+        `vert[tria[ii, 0], :]`, `vert[tria[ii, 1], :]`, and `vert[tria[ii, 2], :]`
+        are the coordinates of the ii-th triangle.
 
     Returns
     -------
-    tree : dict
-        AABB-tree structure (here returned as a dict with 'bmin','bmax','opts').
+    tree : dict or object
+        A spatial AABB-tree indexing the triangles of the mesh, useful for
+        efficient point-location and intersection queries.
+
+    See Also
+    --------
+    trihfn2 : evaluate a mesh-size function on a triangulation.
+    lfshfn2 : compute local feature-size estimates.
+    maketree : build an AABB tree for general rectangular bounds.
+
+    References
+    ----------
+    Translation of the MESH2D function `IDXTRI2`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
 
+    # --------------------------------------------- basic checks
     if not (isinstance(vert, np.ndarray) and isinstance(tria, np.ndarray)):
         raise TypeError("idxtri:incorrectInputClass")
 
@@ -42,7 +63,7 @@ def idxtri(vert, tria):
 
     # ------------------------------ opts (MATLAB/Octave specific, we mimic)
     opts = {}
-    opts["nobj"] = 16  # default for Python, like MATLAB
+    opts["nobj"] = 16
 
     # ------------------------------ build tree (dummy version)
     tree = maketree(np.hstack([bmin, bmax]), opts)

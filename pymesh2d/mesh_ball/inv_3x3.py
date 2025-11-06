@@ -1,22 +1,45 @@
 import numpy as np
 
+
 def inv_3x3(AA):
     """
-    INV_3X3 calc. the inverses for a block of 3-by-3 matrices.
-    Each inverse is actually DET(A) * A^(-1), to improve robustness.
+    Compute the inverses for a block of 3×3 matrices.
+
+    This function computes the determinants and numerically robust "incomplete inverses"
+    for a collection of 3×3 matrices. The inverse matrices are scaled by their determinants
+    to improve numerical stability.
 
     Parameters
     ----------
-    AA : (3,3,N) array
-        Block of 3x3 matrices.
+    AA : ndarray of shape (3, 3, N)
+        Array containing N individual 3×3 matrices.
 
     Returns
     -------
-    II : (3,3,N) array
-        Incomplete inverses (det * inv(A)).
-    DA : (N,) array
-        Determinants of each 3x3 matrix.
+    IA : ndarray of shape (3, 3, N)
+        Scaled inverses of each input matrix, such that:
+        `IA[:, :, k] = det(A[:, :, k]) * inv(A[:, :, k])`.
+    DA : ndarray of shape (N,)
+        Determinants of each input matrix.
+
+    Notes
+    -----
+    - Each returned matrix `IA[:, :, k]` is an *incomplete inverse*,
+      scaled by its determinant to enhance numerical robustness.
+    - To solve a linear system `A * X = B`, compute `(IA * B) / DA`,
+      provided that `DA` is non-zero.
+
+    See Also
+    --------
+    inv_2x2 : Compute the same for 2×2 matrices.
+
+    References
+    ----------
+    Translation of the MESH2D function `INV_3X3`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
+
+    # ---------------------------------------------- basic checks
     if not isinstance(AA, np.ndarray):
         raise TypeError("inv_3x3:incorrectInputClass")
 
@@ -26,7 +49,7 @@ def inv_3x3(AA):
     if AA.shape[0] != 3 or AA.shape[1] != 3:
         raise ValueError("inv_3x3:incorrectDimensions")
 
-    # build inv(A)
+    # --------------------------------------------- build inv(A)
     II = np.zeros_like(AA)
     DA = det_3x3(AA)
 

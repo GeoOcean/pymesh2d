@@ -3,39 +3,54 @@ import numpy as np
 
 def bfsgeo(node, PSLG, seed, deltri, findtria, bfstri, setset):
     """
-    bfsgeo partition geometry about "seeds" via breadth-first search.
+    Partition polygonal geometry into regions using a breadth-first search.
+
+    This function divides a 2D polygonal geometry into manifold partitions
+    by expanding regions around a set of user-defined seed points.
+    The expansion proceeds in a breadth-first manner until polygon boundaries
+    are encountered, effectively grouping edges into connected geometric parts.
 
     Parameters
     ----------
-    node : ndarray (N, 2)
-        Polygon vertices.
-    PSLG : ndarray (E, 2)
-        Polygon edges, each row is a pair of indices into `node`.
-    seed : ndarray (S, 2)
-        Seed points.
-    deltri : callable
-        Function (node, PSLG) -> (node, PSLG, tria).
-    findtria : callable
-        Function (node, tria, seed) -> (sptr, stri).
-    bfstri : callable
-        Function (PSLG, tria, itri) -> mark.
-    setset : callable
-        Function (edge_subset, PSLG) -> (same, epos).
+    NODE : ndarray of shape (N, 2)
+        XY-coordinates of the polygon vertices.
+    EDGE : ndarray of shape (E, 2)
+        Array of polygon edge indices. Each row defines one edge, such that:
+        `NODE[EDGE[j, 0], :]` and `NODE[EDGE[j, 1], :]` are the endpoints
+        of the j-th edge.
+    SEED : ndarray of shape (S, 2)
+        XY-coordinates of the seed points used to initiate the expansion.
 
     Returns
     -------
-    node : ndarray
-        Possibly updated vertices.
-    PSLG : ndarray
-        Possibly updated edges.
-    part : list of lists
-        Each sublist contains edge indices into PSLG defining one partition.
+    NODE : ndarray of shape (N, 2)
+        The vertex coordinates (returned unchanged).
+    EDGE : ndarray of shape (E, 2)
+        The polygon edge connectivity (returned unchanged).
+    PART : list of lists or list of ndarrays
+        A list of geometry partitions, one per seed.
+        Each `PART[k]` contains the indices of edges (referring to `EDGE`)
+        that define the k-th partition.
 
     Notes
     -----
-    MESH2D is designed to provide a simple and easy-to-understand 
-    implementation of Delaunay-based mesh-generation techniques.
-    Traduction of Matlab Mesh2D repository by Darren Engwirda
+    - The breadth-first expansion continues until the traversal reaches
+      the outer or inner boundaries of the polygon.
+    - Useful for decomposing complex, non-manifold geometries into
+      well-defined manifold parts suitable for triangulation.
+    - Often used as a preprocessing step before applying mesh generation
+      or refinement algorithms such as `refine`.
+
+    References
+    ----------
+    Translation of the MESH2D function `BFSGEO2`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
+
+    See also
+    --------
+    refine : Generate constrained Delaunay triangulations.
+    fixgeo : Clean or validate polygonal geometries.
+    bfstri : Partition triangulations via breadth-first traversal.
     """
 
     # ---------------- basic checks
@@ -53,7 +68,7 @@ def bfsgeo(node, PSLG, seed, deltri, findtria, bfstri, setset):
         raise ValueError("bfsgeo: incorrect dimensions")
 
     nnod = node.shape[0]
-    nedg = PSLG.shape[0]
+    _nedg = PSLG.shape[0]
 
     # ---------------- basic checks on indices
     if PSLG.min() < 1 or PSLG.max() > nnod:
@@ -68,7 +83,7 @@ def bfsgeo(node, PSLG, seed, deltri, findtria, bfstri, setset):
     okay = sptr[:, 1] >= sptr[:, 0]
     itri = stri[sptr[okay, 0]]
 
-    # ---------------- partitions
+    # ---------------- PART for all seed
     part = []
 
     for ipos in range(itri.shape[0]):

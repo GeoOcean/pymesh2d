@@ -1,11 +1,15 @@
 import numpy as np
+
 from .tricon import tricon
+
 
 def bfstri(PSLG, tria, seed):
     """
-    bfstri expand about a single seed triangle via BFS. The search terminates
-    when constraining edges are encountered.
-    SEEN[i] is True if the i-th triangle is found in the current expansion.
+    BFSTRI : expand around a single seed triangle using breadth-first search (BFS).
+
+    The search expands from an initial triangle until constraining edges are
+    encountered. The array `seen[ii]` is `True` if the `ii`-th triangle is
+    included in the current expansion.
 
     Parameters
     ----------
@@ -20,8 +24,19 @@ def bfstri(PSLG, tria, seed):
     -------
     seen : (T,) boolean array
         True if triangle was visited.
-    """
 
+    See Also
+    --------
+    bfsgio2 : partition geometry using BFS.
+    refine2 : perform (Frontal-)Delaunay refinement.
+    fixgeo2 : repair invalid or redundant geometry definitions.
+
+    References
+    ----------
+    Translation of the MESH2D function `BFSTRI2`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
+    """
+    # --------------------------------------------- basic checks
     if not isinstance(tria, np.ndarray) or not isinstance(seed, np.ndarray):
         raise TypeError("bfstri:incorrectInputClass")
 
@@ -34,27 +49,27 @@ def bfstri(PSLG, tria, seed):
         if PSLG.ndim != 2 or PSLG.shape[1] != 2:
             raise ValueError("bfstri:incorrectDimensions")
 
+    # ---------------------------------------- form adj. indices
     ntri = tria.shape[0]
 
-    # tricon must return (edge, tria_adj)
     edge, tria_adj = tricon(tria, PSLG)
 
     seed = seed.ravel()
     list_buf = np.zeros(ntri, dtype=int)
     nlst = len(seed)
     list_buf[:nlst] = seed
-
+    # ----------------------------------------- do BFS iterations
     seen = np.zeros(ntri, dtype=bool)
 
-    # BFS iterations
     while nlst >= 1:
-        next_t = list_buf[nlst-1]
+        # ------------- pop tria from stack top
+        next_t = list_buf[nlst - 1]
         nlst -= 1
         seen[next_t] = True
 
-        # visit 1-ring neighbours
+        # ---------- find adjacent triangles
         for eadj in range(3):
-            epos = tria_adj[next_t, eadj+3]
+            epos = tria_adj[next_t, eadj + 3]
 
             # if edge not constrained
             if edge[epos, 4] == 0:
@@ -64,8 +79,9 @@ def bfstri(PSLG, tria, seed):
                     tadj = edge[epos, 3]
 
                 if tadj > 0 and not seen[tadj]:
+                    # ---------- add unvisited neighbour
                     seen[tadj] = True
                     nlst += 1
-                    list_buf[nlst-1] = tadj
+                    list_buf[nlst - 1] = tadj
 
     return seen
