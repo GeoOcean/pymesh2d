@@ -20,7 +20,15 @@ setup(
     include_package_data=True,
     install_requires=[
         "numpy",
-        "deloney",
+        "scipy",
+        "matplotlib",
+        "os",
+        "typing",
+        "sys",
+        "math",
+        "time",
+        "netCDF4",
+        "rasterio",
     ],
     classifiers=["Programming Language :: Python :: 3.3.7"],
     python_requires=">=3.7",  # Specify the Python version required
