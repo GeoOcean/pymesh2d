@@ -29,6 +29,7 @@ setup(
         "time",
         "netCDF4",
         "rasterio",
+        "mpl_toolkits",
     ],
     classifiers=["Programming Language :: Python :: 3.3.7"],
     python_requires=">=3.7",  # Specify the Python version required

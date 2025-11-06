@@ -7,43 +7,75 @@ from .queryset import queryset
 
 def findtria(pp, tt, pj, tree=None, options=None):
     """
-    FINDTRIA - spatial queries for collections of d-simplexes.
+    Perform spatial queries for collections of d-dimensional simplexes.
+
+    This function finds the set of d-dimensional simplexes that intersect
+    a given set of query points. Simplexes are specified by their vertex
+    coordinates and indexing arrays, and do not need to form a conforming
+    triangulation — non-Delaunay, non-convex, and even overlapping
+    configurations are supported.
+
+    For each query point, the function returns the subset of simplexes that
+    contain or intersect it. Multiple matches may occur in overlapping meshes.
 
     Parameters
     ----------
-    pp : np.ndarray
-        (n_points, n_dim) coordinates of vertices.
-    tt : np.ndarray
-        (n_simplexes, n_vertices_per_simplex) connectivity (0-based indices).
-    pj : np.ndarray
-        (n_queries, n_dim) coordinates of query points.
-    tree : dict, optional
-        Precomputed AABB tree from `maketree`.
-    options : dict, optional
-        Parameters to control AABB tree creation.
+    PP : ndarray of shape (N, ND)
+        Array of vertex coordinates, where `ND` is the number of dimensions.
+    TT : ndarray of shape (NS, M)
+        Indexing array defining the vertices of each simplex.
+        For example, in 2D, `M=3` for triangles, in 3D `M=4` for tetrahedra.
+    PJ : ndarray of shape (NP, ND)
+        Query points for which intersecting simplexes are sought.
+    TR : object, optional
+        Precomputed AABB tree structure used to accelerate the search.
+        If provided, it will be reused for faster subsequent queries.
+    OP : dict, optional
+        Additional parameters to control the creation or behavior of the
+        underlying AABB tree.
 
     Returns
     -------
-    tp : np.ndarray
-        (n_queries, 2) start/end indices per query point.
-    tj : np.ndarray
-        Array of simplex indices intersecting each point.
-    tree : dict
-        AABB tree used for the query.
+    TP : ndarray of shape (NP, 2)
+        Index pairs defining, for each query point, the start and end
+        positions in `TI` listing the intersecting simplexes.
+        Points with no matches have `TP[i, 0] == 0`.
+    TI : ndarray of shape (K,)
+        Flattened list of simplex indices intersecting the query points.
+        For query `i`, intersecting simplexes are `TI[TP[i,0]:TP[i,1]]`.
+    TR : object, optional
+        AABB tree structure used internally to compute the query.
+        It can be reused to improve performance in later calls.
 
     Notes
     -----
-    Traduced from MATLAB aabb-tree repository
+    - The collection of simplexes `[PP, TT]` does not need to be a
+      conforming triangulation.
+    - If the same simplex collection is queried multiple times,
+      reusing the returned `TR` can significantly improve performance,
+      but the simplexes **must remain unchanged** between calls.
+    - To obtain a single consistent index array (similar to MATLAB’s
+      `pointLocation`), one can postprocess the output as:
+
+        ```python
+        tp, tj = findtria(pp, tt, pj)
+        ti = np.full(tp.shape[0], np.nan)
+        mask = tp[:, 0] > 0
+        ti[mask] = tj[tp[mask, 0]]
+        ```
 
     References
     ----------
-    Darren Engwirda, Locally-optimal Delaunay-refinement
-    and optimisation-based mesh generation, Ph.D. Thesis,
-    School of Mathematics and Statistics, The University
-    of Sydney, September 2014.
+    Translation of the MESH2D function `FINDTRIA`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
+
+    Additional reference:
+    D. Engwirda, *"Locally-optimal Delaunay-refinement & optimisation-based mesh generation"*,
+    Ph.D. Thesis, School of Mathematics and Statistics, University of Sydney, 2014.
+    http://hdl.handle.net/2123/13148
     """
 
-    # Basic checks
+    # ---------------------------------------------- basic checks
     if not (
         isinstance(pp, np.ndarray)
         and isinstance(tt, np.ndarray)
@@ -66,7 +98,7 @@ def findtria(pp, tt, pj, tree=None, options=None):
     if pj.shape[1] != pp.shape[1]:
         raise ValueError("pj and pp must have the same dimensionality.")
 
-    # Build bounding boxes if tree is not given
+    # ----------------------------- compute aabb's for triangles
     if tree is None:
         bi = pp[tt[:, 0], :].copy()
         bj = pp[tt[:, 0], :].copy()
@@ -74,20 +106,19 @@ def findtria(pp, tt, pj, tree=None, options=None):
             bi = np.minimum(bi, pp[tt[:, ii], :])
             bj = np.maximum(bj, pp[tt[:, ii], :])
         bb = np.hstack([bi, bj])
-        tree = maketree(bb, options)
+        tree = maketree(bb, options)  # compute aabb-tree
 
-    # Map query vertices to tree nodes
+    # ----------------------------- compute tree-to-vert mapping
     tm, _ = mapvert(tree, pj)
 
-    # Compute tolerance
+    # ------------------------------ compute vert-to-tria queries
     x0 = np.min(pp, axis=0)
     x1 = np.max(pp, axis=0)
     rt = np.prod(x1 - x0) * np.finfo(float).eps ** 0.8
 
-    # Perform spatial queries
     ti, ip, tj = queryset(tree, tm, triakern, pj, pp, tt, rt)
 
-    # Build range index array
+    # ------------------------------ re-index onto full obj. list
     tp = np.zeros((pj.shape[0], 2), dtype=int)
     tp[:, 1] = -1
     if ti.size == 0:
@@ -129,10 +160,9 @@ def triakern(pk, tk, pi, pp, tt, rt):
 
     References
     ----------
-    Darren Engwirda, Locally-optimal Delaunay-refinement
-    and optimisation-based mesh generation, Ph.D. Thesis,
-    School of Mathematics and Statistics, The University
-    of Sydney, September 2014.
+    Translation of the MESH2D function `TRIAKERN`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
+
     """
     mp = len(pk)
     mt = len(tk)
@@ -183,21 +213,19 @@ def intria2(pp, tt, pi, rt):
 
     References
     ----------
-    Darren Engwirda, Locally-optimal Delaunay-refinement
-    and optimisation-based mesh generation, Ph.D. Thesis,
-    School of Mathematics and Statistics, The University
-    of Sydney, September 2014.
+    Translation of the MESH2D function `INTRIA2`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
     t1, t2, t3 = tt[:, 0], tt[:, 1], tt[:, 2]
     vi = pp[t1, :] - pi
     vj = pp[t2, :] - pi
     vk = pp[t3, :] - pi
-
+    # ------------------------------- compute sub-volume about PI
     aa = np.zeros((tt.shape[0], 3))
     aa[:, 0] = vi[:, 0] * vj[:, 1] - vj[:, 0] * vi[:, 1]
     aa[:, 1] = vj[:, 0] * vk[:, 1] - vk[:, 0] * vj[:, 1]
     aa[:, 2] = vk[:, 0] * vi[:, 1] - vi[:, 0] * vk[:, 1]
-
+    # ------------------------------- PI is internal if same sign
     rt2 = rt**2
     inside = (
         (aa[:, 0] * aa[:, 1] >= -rt2)
@@ -234,17 +262,15 @@ def intria3(pp, tt, pi, rt):
 
     References
     ----------
-    Darren Engwirda, Locally-optimal Delaunay-refinement
-    and optimisation-based mesh generation, Ph.D. Thesis,
-    School of Mathematics and Statistics, The University
-    of Sydney, September 2014.
+    Translation of the MESH2D function `TRIAKERN`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
     t1, t2, t3, t4 = tt[:, 0], tt[:, 1], tt[:, 2], tt[:, 3]
     v1 = pi - pp[t1, :]
     v2 = pi - pp[t2, :]
     v3 = pi - pp[t3, :]
     v4 = pi - pp[t4, :]
-
+    # ------------------------------- compute sub-volume about PI
     aa = np.zeros((tt.shape[0], 4))
     aa[:, 0] = (
         v1[:, 0] * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1])
@@ -266,7 +292,7 @@ def intria3(pp, tt, pi, rt):
         - v3[:, 1] * (v4[:, 0] * v1[:, 2] - v4[:, 2] * v1[:, 0])
         + v3[:, 2] * (v4[:, 0] * v1[:, 1] - v4[:, 1] * v1[:, 0])
     )
-
+    # ------------------------------- PI is internal if same sign
     rt2 = rt**2
     inside = (
         (aa[:, 0] * aa[:, 1] >= -rt2)
@@ -306,31 +332,30 @@ def intrian(pp, tt, pi):
 
     References
     ----------
-    Darren Engwirda, Locally-optimal Delaunay-refinement
-    and optimisation-based mesh generation, Ph.D. Thesis,
-    School of Mathematics and Statistics, The University
-    of Sydney, September 2014.
+    Translation of the MESH2D function `INTRIAN`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
     np_, pd = pi.shape
     nt, td = tt.shape
-
+    # ---------------- coefficient matrices for barycentric coord.
     mm = np.zeros((pd, pd, nt))
     for id_ in range(pd):
         for jd in range(pd):
             mm[id_, jd, :] = pp[tt[:, jd], id_] - pp[tt[:, td - 1], id_]
-
+    # ---------------- solve linear systems for barycentric coord.
     xx = np.zeros((pd, np_, nt))
     vp = np.zeros((pd, np_))
 
     for ti in range(nt):
+        # ------------------------------------- form rhs coeff.
         for id_ in range(pd):
             vp[id_, :] = pi[:, id_] - pp[tt[ti, td - 1], id_]
-        # Solve linear systems (LU equivalent)
+        # -------------- solve linear systems (LU equivalent)
         xx[:, :, ti] = np.linalg.solve(mm[:, :, ti], vp)
-
+    # -------------------- PI is internal if coord. have same sign
     in_mask = np.all(xx >= -(np.finfo(float).eps ** 0.8), axis=0) & (
         np.sum(xx, axis=0) <= 1.0 + np.finfo(float).eps ** 0.8
     )
-
+    # -------------------- find lists of matching points/simplexes
     ii, jj = np.where(in_mask.T)
     return ii, jj

@@ -7,39 +7,60 @@ from .queryset import queryset
 
 def findball(bb, pp, tr=None, op=None):
     """
-    FINDBALL: spatial queries for collections of d-balls.
+    Perform spatial queries for collections of d-dimensional balls.
+
+    This routine identifies which d-dimensional balls intersect a set of
+    query points. Balls are defined by their centers and squared radii.
+
+    Specifically, for each query point in `PI`, the function returns the
+    subset of balls from `BB` that enclose or intersect the point. This
+    operation is typically used in geometric and meshing algorithms to
+    detect neighborhood relations or spatial overlaps.
 
     Parameters
     ----------
-    bb : (B, ND+1) array
-        Ball definitions: first ND columns are centers, last column is squared radii.
-    pp : (P, ND) array
-        Query points.
-    tr : dict, optional
-        Precomputed AABB tree (see maketree).
-    op : dict, optional
-        Options for tree creation.
+    BB : ndarray of shape (M, ND + 1)
+        Array of ball definitions, where the first `ND` columns correspond
+        to the center coordinates, and the last column gives the **squared radius**.
+        For example, in 2D: `BB[:, :2] = centers`, `BB[:, 2] = radii²`.
+    PI : ndarray of shape (P, ND)
+        Query points for which intersecting balls are to be found.
+    TR : object, optional
+        Precomputed AABB tree structure used to accelerate the search.
+        If provided, it is reused for faster queries, assuming that the
+        set of balls in `BB` has not changed.
+    OP : dict, optional
+        Additional parameters controlling the creation or behavior of the
+        underlying AABB tree.
 
     Returns
     -------
-    bp : (P,2) array
-        For each query point, indices into bj such that
-        balls for query i are bj[bp[i,0]:bp[i,1]].
-    bj : (M,) array
-        Flattened list of intersecting ball indices.
-    tr : dict
-        AABB tree (for reuse in subsequent calls).
+    BP : ndarray of shape (P, 2)
+        Index array defining, for each query point, the start and end
+        positions in `BI` that list the intersecting balls.
+        Points not enclosed by any ball have `BP[i, 0] == 0`.
+    BI : ndarray of shape (K,)
+        Flattened list of ball indices that intersect the query points.
+        For query `i`, intersecting balls are `BI[BP[i,0]:BP[i,1]]`.
+    TR : object, optional
+        AABB tree structure used internally to compute the query.
+        Can be reused in future calls for efficiency.
 
     Notes
     -----
-    Traduced from MATLAB aabb-tree repository
+    If the same collection of balls is queried multiple times, reusing
+    the returned `TR` structure can significantly improve performance.
+    However, the ball set `BB` **must not be modified** between queries.
 
     References
     ----------
-    Darren Engwirda, Locally-optimal Delaunay-refinement
-    and optimisation-based mesh generation, Ph.D. Thesis,
-    School of Mathematics and Statistics, The University
-    of Sydney, September 2014.
+    Translation of the MESH2D function `FINDBALL`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
+
+    Additional reference:
+    D. Engwirda, *"Locally-optimal Delaunay-refinement & optimisation-based mesh generation"*,
+    Ph.D. Thesis, School of Mathematics and Statistics, University of Sydney, 2014.
+    http://hdl.handle.net/2123/13148
     """
 
     bp, bj = np.array([]), np.array([])
@@ -115,25 +136,22 @@ def ballkern(pk, bk, pp, bb):
 
     References
     ----------
-    Darren Engwirda, Locally-optimal Delaunay-refinement
-    and optimisation-based mesh generation, Ph.D. Thesis,
-    School of Mathematics and Statistics, The University
-    of Sydney, September 2014.
+    Translation of the MESH2D function `BALLKERN`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
 
     """
     mp = len(pk)
     mb = len(bk)
     nd = pp.shape[1]
 
-    # Tile points and balls
+    # -------------------------- push ball/vert onto n*m tile
     bk_tiled = np.tile(bk, mp)
     pk_tiled = np.repeat(pk, mb)
 
-    # Compute squared distances
+    # -------------------------- compute O(n*m) loc. distance
     diff = pp[pk_tiled, :] - bb[bk_tiled, :nd]
     dd = np.sum(diff**2, axis=1)
 
-    # Check intersection
     inside = dd <= bb[bk_tiled, nd]
 
     ip = pk_tiled[inside]
