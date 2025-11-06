@@ -13,7 +13,7 @@ Algorithms implemented in `pymesh2D` are "provably-good" - ensuring convergence,
 `pymesh2D` is a pure `Python` package, consisting of a core library + associated utilities:
 
     pymesh2D::
-    ├── examples      --      examples of use
+    ├── examples      --      examples of use.
     ├── pymesh2d      --      core pymesh2D library functions. See refine, smooth, etc.
     ├── pymesh2d/aabb_tree -- support for fast spatial indexing, via tree-based data-structures.
     ├── pymesh2d/geom_util -- geometry processing, repair, etc.
@@ -51,6 +51,8 @@ pip install -e .
 ```
 
 to install the package in **developer mode**.
+
+### Examples
 
     examples/tridemo.py  0; % a very simple example to get everything started.
     examples/tridemo.py  1; % investigate the impact of the "radius-edge" threshold.
