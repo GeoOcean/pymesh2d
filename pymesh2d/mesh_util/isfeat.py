@@ -1,30 +1,48 @@
 import numpy as np
 
+
 def isfeat(pp, ee, tt):
     """
-    isfeat return "feature" status for the triangles in a two-
-    dimensional constrained triangulation.
+    ISFEAT : identify "feature" triangles in a 2D constrained triangulation.
+
+    [stat] = isfeat(vert, edge, tria) returns a boolean array indicating which
+    triangles contain sufficiently "sharp" angles located at the intersection of
+    two constrained edges. Triangles with angles sharper than `acos(+0.8)` degrees
+    are flagged as features.
 
     Parameters
     ----------
-    pp : (N,2) ndarray
-        Vertex coordinates
-    ee : (E,>=5) ndarray
-        Edge array with constraint info
-    tt : (T,>=6) ndarray
-        Triangle connectivity with edge indices
+    vert : ndarray (V, 2)
+        Array of XY coordinates of the triangulation vertices.
+    edge : ndarray (E, 2)
+        Array of constrained edges, where each row defines an edge by vertex indices.
+    tria : ndarray (T, 3)
+        Array of triangles, where each row defines a triangle by vertex indices.
+    stat : ndarray (T,), bool
+        Boolean array where `True` indicates the presence of a sharp feature.
 
     Returns
     -------
-    isf : (T,) boolean ndarray
-        True if triangle includes a sharp feature
-    bv  : (T,3) boolean ndarray
-        Per-corner feature flags
+    stat : ndarray of bool
+        `True` for triangles that include a sharp feature (angle < acos(+0.8)).
+
+    Notes
+    -----
+    Sharp features typically correspond to corners or narrow regions in the
+    constrained polygonal geometry.
+
+    References
+    ----------
+    Translation of the MESH2D function `ISFEAT2`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
 
-    if not (isinstance(pp, np.ndarray) and 
-            isinstance(ee, np.ndarray) and 
-            isinstance(tt, np.ndarray)):
+    # --------------------------------------------- basic checks
+    if not (
+        isinstance(pp, np.ndarray)
+        and isinstance(ee, np.ndarray)
+        and isinstance(tt, np.ndarray)
+    ):
         raise TypeError("isfeat:incorrectInputClass")
 
     if pp.ndim != 2 or ee.ndim != 2 or tt.ndim != 2:
@@ -42,7 +60,7 @@ def isfeat(pp, ee, tt):
         raise ValueError("isfeat:invalidInputs")
     if np.min(ee[:, :2]) < 0 or np.max(ee[:, :2]) > nnod:
         raise ValueError("isfeat:invalidInputs")
-    if np.min(ee[:, 2:4]) < -1 or np.max(ee[:, 2:4]) > ntri:   ###0
+    if np.min(ee[:, 2:4]) < -1 or np.max(ee[:, 2:4]) > ntri:  ###0
         raise ValueError("isfeat:invalidInputs")
 
     # ----------------------------- compute "feature"
@@ -56,9 +74,10 @@ def isfeat(pp, ee, tt):
     NK = [1, 2, 0]
 
     for ii in range(3):
+        # ------------------------------------- common edge index
         ei = tt[:, EI[ii] + 3]
         ej = tt[:, EJ[ii] + 3]
-
+        # ------------------------------------ is boundary edge?
         bi = ee[ei, 4] >= 1
         bj = ee[ej, 4] >= 1
 
@@ -69,14 +88,14 @@ def isfeat(pp, ee, tt):
         ni = tt[ok, NI[ii]]
         nj = tt[ok, NJ[ii]]
         nk = tt[ok, NK[ii]]
-
+        # ------------------------------------- adj. edge vectors
         vi = pp[ni, :] - pp[nj, :]
         vj = pp[nk, :] - pp[nj, :]
-
+        # ------------------------------------- adj. edge lengths
         li = np.sqrt(np.sum(vi**2, axis=1))
         lj = np.sqrt(np.sum(vj**2, axis=1))
         ll = li * lj
-
+        # ------------------------------------- adj. dot-product!
         aa = np.sum(vi * vj, axis=1) / ll
 
         bv[ok, ii] = aa >= 0.80
