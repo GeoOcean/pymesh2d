@@ -1,21 +1,39 @@
 import numpy as np
+
 from .pwrbal1 import pwrbal1
+
 
 def tribal1(pp, ee):
     """
-    TRIBAL1 compute the circumballs associated with a 1-simplex
-    triangulation embedded in R^2 or R^3.
+    Compute the circumballs associated with a 1-simplex triangulation
+    embedded in R² or R³.
+
+    This function calculates the circumscribing balls for the set of
+    1-simplexes (edges) in a triangulation.
 
     Parameters
     ----------
-    pp : (N,2) or (N,3) array
-        Node coordinates.
-    ee : (E,2) array
-        Edge connectivity.
+    PP : ndarray of shape (N, D)
+        Coordinates of the vertices in the triangulation, where `D` = 2 or 3.
+    EE : ndarray of shape (E, 2)
+        Array of edge indices defining the 1-simplexes.
 
     Returns
     -------
-    bb : (E,3) or (E,4) array
-        Circumscribing balls [xc,yc,rc^2] (2D) or [xc,yc,zc,rc^2] (3D).
+    BB : ndarray of shape (E, 3)
+        Circumballs associated with each edge, where each row is `[XC, YC, RC²]`
+        — the center coordinates and squared radius of the circumball.
+
+    Notes
+    -----
+    - Each circumball is the smallest sphere (or circle in 2D) passing through
+      the vertices of the edge segment.
+    - Useful for Delaunay-based refinement and geometric quality evaluation.
+
+    References
+    ----------
+    Translation of the MESH2D function `TRIBAL1`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
+
     return pwrbal1(pp, np.zeros((pp.shape[0], 1)), ee)
