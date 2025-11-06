@@ -1,5 +1,6 @@
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
+
 
 def getiso(xpos, ypos, zdat, ilev, filt=0.0):
     """
@@ -22,27 +23,34 @@ def getiso(xpos, ypos, zdat, ilev, filt=0.0):
         Coordinates of contour vertices.
     edge : ndarray (E, 2)
         PSLG edges between contour vertices.
+
+    References
+    ----------
+    Translation of the MESH2D function `getiso`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
 
-    # --- basic checks
-    if not (isinstance(xpos, np.ndarray) and
-            isinstance(ypos, np.ndarray) and
-            isinstance(zdat, np.ndarray) and
-            np.isscalar(ilev) and
-            np.isscalar(filt)):
+    # ---------------------------------------------- basic checks
+    if not (
+        isinstance(xpos, np.ndarray)
+        and isinstance(ypos, np.ndarray)
+        and isinstance(zdat, np.ndarray)
+        and np.isscalar(ilev)
+        and np.isscalar(filt)
+    ):
         raise TypeError("getiso: incorrect input class")
 
     if xpos.shape != ypos.shape or xpos.shape != zdat.shape:
         raise ValueError("getiso: incorrect dimensions")
 
-    # --- compute the contour with matplotlib
+    # ----------------------------------- compute the isocontour
     fig, ax = plt.subplots()
     cs = ax.contour(xpos, ypos, zdat, levels=[ilev])
     plt.close(fig)  # close the figure, we just need data
 
     node = []
     edge = []
-
+    # ------------------------------------ "walk" contour segment
     for collection in cs.collections:
         for path in collection.get_paths():
             ppts = path.vertices
@@ -54,16 +62,18 @@ def getiso(xpos, ypos, zdat, ilev, filt=0.0):
 
             if np.min(pdel) >= filt:
                 if np.allclose(ppts[0], ppts[-1]):
-                    # closed loop
-                    enew = np.vstack([
-                        np.column_stack([np.arange(0, numc - 1),
-                                         np.arange(1, numc)]),
-                        [numc - 1, 0]
-                    ])
+                    # -------------------------------- closed - back to start
+                    enew = np.vstack(
+                        [
+                            np.column_stack(
+                                [np.arange(0, numc - 1), np.arange(1, numc)]
+                            ),
+                            [numc - 1, 0],
+                        ]
+                    )
                 else:
-                    # open contour
-                    enew = np.column_stack([np.arange(0, numc - 1),
-                                            np.arange(1, numc)])
+                    # -------------------------------- open - dangling endpts
+                    enew = np.column_stack([np.arange(0, numc - 1), np.arange(1, numc)])
 
                 offset = len(node)
                 enew = enew + offset

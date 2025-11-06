@@ -1,25 +1,59 @@
 import numpy as np
 
+
 def getnan(data=None, filt=0.0):
     """
-    getnan parse a NaN-delimited polygon into a PSLG.
+    Parse a NaN-delimited polygon definition into a PSLG (Planar Straight Line Graph).
+
+    This function converts a list of polygons separated by NaN rows into a
+    PSLG representation suitable for meshing or geometric processing.
+    Each polygon is defined by a sequence of vertex coordinates, with `NaN`
+    values marking the breaks between individual polygons. Optionally,
+    small polygons can be filtered out based on a minimum bounding-box size.
 
     Parameters
     ----------
-    data : ndarray (D, 2)
-        Array of coordinates with NaN delimiters between polygons.
-    filt : float or (2,)
-        Length filter: polygons with axis-aligned extents smaller than `filt`
-        are discarded. If scalar, applied to both x and y extents.
+    NANS : ndarray of shape (D, 2)
+        Array of polygon vertex coordinates.
+        Consecutive vertices define polygon edges, and rows containing NaN
+        values indicate breaks between polygons.
+    FILT : array_like of length 2
+        Minimum axis-aligned feature size `[dx_min, dy_min]`.
+        Polygons whose extents are smaller than these thresholds are removed
+        from the output.
 
     Returns
     -------
-    node : ndarray (N, 2)
-        Coordinates of vertices.
-    edge : ndarray (E, 2)
-        PSLG edges between vertices.
+    NODE : ndarray of shape (N, 2)
+        Array of unique vertex coordinates for the PSLG.
+    EDGE : ndarray of shape (E, 2)
+        Array of edge connectivity.
+        Each row defines one polygon edge as `[start_vertex, end_vertex]`, such that
+        `NODE[EDGE[j, 0], :]` and `NODE[EDGE[j, 1], :]` are the endpoints
+        of the j-th edge.
+
+    Notes
+    -----
+    - Input polygons must be defined in vertex order (either clockwise or counterclockwise).
+    - NaN rows are used as delimiters between individual polygons.
+    - Very small polygons, defined by bounding boxes smaller than the `FILT` thresholds,
+      are discarded automatically.
+    - The resulting PSLG (`NODE`, `EDGE`) can be passed directly to mesh generators
+      such as `refine`.
+
+    References
+    ----------
+    Translation of the MESH2D function `GETNAN2`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
+
+    See also
+    --------
+    fixgeo : Repair geometry definitions.
+    bfsgeo : Partition polygonal geometry via breadth-first traversal.
+    refine : Generate constrained Delaunay triangulations.
     """
 
+    # --------------------------------------------- basic checks
     if data is None:
         return np.zeros((0, 2)), np.zeros((0, 2), dtype=int)
 
@@ -37,13 +71,13 @@ def getnan(data=None, filt=0.0):
     elif filt.size > 2:
         raise ValueError("getnan: filt must be scalar or length 2")
 
-    # Find NaN delimiters
+    # --------------------------------- parse NaN delimited data
     nvec = np.where(np.isnan(data[:, 0]))[0].tolist()
 
-    if len(nvec) == 0:
+    if len(nvec) == 0:  # no NaN's at all!
         nvec = [data.shape[0]]
 
-    if nvec[-1] != data.shape[0]:
+    if nvec[-1] != data.shape[0]:  # append last poly
         nvec.append(data.shape[0])
 
     node_list = []
@@ -51,10 +85,9 @@ def getnan(data=None, filt=0.0):
     next_idx = 0
     nout = 0
 
-    # Parse polygons
     for stop in nvec:
         pnew = data[next_idx:stop, :]
-        next_idx = stop + 1  # skip the NaN row
+        next_idx = stop + 1
 
         if pnew.size == 0:
             continue
@@ -63,15 +96,16 @@ def getnan(data=None, filt=0.0):
         pmax = pnew.max(axis=0)
         pdel = pmax - pmin
 
-        # Keep only "large enough" polygons
         if np.any(pdel > filt):
+            # --------------------------------- push polygon onto output
             nnew = pnew.shape[0]
 
-            # Build edges
-            enew = np.vstack([
-                np.column_stack([np.arange(0, nnew - 1), np.arange(1, nnew)]),
-                [nnew - 1, 0]  # close polygon
-            ])
+            enew = np.vstack(
+                [
+                    np.column_stack([np.arange(0, nnew - 1), np.arange(1, nnew)]),
+                    [nnew - 1, 0],
+                ]
+            )
             enew = enew + nout
 
             node_list.append(pnew)
