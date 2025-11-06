@@ -1,0 +1,55 @@
+[build-system]
+
+requires = ["setuptools>=60", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+
+name = "pymesh2d"
+description = "Module collection..."
+readme = "README.md"
+keywords = ["mesh"]
+license = { file = "LICENSE" }
+authors = [
+    { name = "Geomatics and Ocean Engineering Group", email = "faugeree@unican.es" },
+]
+
+dynamic = ["version"]
+
+requires-python = ">=3.7"
+classifiers = [
+    "Programming Language :: Python :: 3 :: Only",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+    "numpy",
+    "deloney",
+]
+
+[project.optional-dependencies]
+
+geo = ["shapely"]
+
+[project.urls]
+
+Homepage = "https://github.com/GeoOcean/pymesh2d"
+Documentation = "https://github.com/GeoOcean/pymesh2d"
+Issues = "https://github.com/GeoOcean/pymesh2d/issues"
+
+[tool.spin]
+
+package = "pymesh2d"
+
+[tool.setuptools_scm]
+
+version_file = "pymesh2d/_version.py"
+local_scheme = "no-local-version"
