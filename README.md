@@ -52,18 +52,18 @@ pip install -e .
 
 to install the package in **developer mode**.
 
-examples/tridemo.py  0; % a very simple example to get everything started.
-examples/tridemo.py  1; % investigate the impact of the "radius-edge" threshold.
-examples/tridemo.py  2; % Frontal-Delaunay vs. Delaunay-refinement refinement.
-examples/tridemo.py  3; % explore impact of user-defined mesh-size constraints.
-examples/tridemo.py  4; % explore impact of "hill-climbing" mesh optimisations.
-examples/tridemo.py  5; % assemble triangulations for "multi-part" geometries.
-examples/tridemo.py  6; % assemble triangulations with "internal" constraints.
-examples/tridemo.py  7; % investigate the use of "quadtree"-type refinement.
-examples/tridemo.py  8; % explore use of custom, user-defined mesh-size functions.
-examples/tridemo.py  9; % larger-scale problem, mesh refinement + optimisation. 
-examples/tridemo.py 10; % medium-scale problem, mesh refinement + optimisation. 
-```
+    examples/tridemo.py  0; % a very simple example to get everything started.
+    examples/tridemo.py  1; % investigate the impact of the "radius-edge" threshold.
+    examples/tridemo.py  2; % Frontal-Delaunay vs. Delaunay-refinement refinement.
+    examples/tridemo.py  3; % explore impact of user-defined mesh-size constraints.
+    examples/tridemo.py  4; % explore impact of "hill-climbing" mesh optimisations.
+    examples/tridemo.py  5; % assemble triangulations for "multi-part" geometries.
+    examples/tridemo.py  6; % assemble triangulations with "internal" constraints.
+    examples/tridemo.py  7; % investigate the use of "quadtree"-type refinement.
+    examples/tridemo.py  8; % explore use of custom, user-defined mesh-size functions.
+    examples/tridemo.py  9; % larger-scale problem, mesh refinement + optimisation. 
+    examples/tridemo.py 10; % medium-scale problem, mesh refinement + optimisation. 
+
 
 ### `References`
 
