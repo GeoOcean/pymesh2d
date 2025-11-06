@@ -32,7 +32,15 @@ classifiers = [
 ]
 dependencies = [
     "numpy",
-    "deloney",
+    "scipy",
+    "matplotlib",
+    "os",
+    "typing",
+    "sys",
+    "math",
+    "time",
+    "netCDF4",
+    "rasterio",
 ]
 
 [project.optional-dependencies]
