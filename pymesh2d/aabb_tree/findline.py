@@ -7,39 +7,61 @@ from .queryset import queryset
 
 def findline(pa, pb, pp, tree=None, options=None):
     """
-    FINDLINE - 'point-on-line' queries in d-dimensional space.
+    Perform "point-on-line" spatial queries in d-dimensional space.
+
+    This function identifies which d-dimensional line segments intersect
+    a given set of query points. Lines are specified as pairs of endpoints
+    `[PA, PB]`, where both are arrays of coordinates defining each segment.
+
+    For each query point in `PI`, the routine returns the subset of lines
+    that intersect or contain the point. This is particularly useful in
+    mesh-generation or geometry-processing tasks to locate nearby or
+    enclosing edges.
 
     Parameters
     ----------
-    pa : np.ndarray
-        (n_lines, n_dim) array of line start points.
-    pb : np.ndarray
-        (n_lines, n_dim) array of line end points.
-    pp : np.ndarray
-        (n_points, n_dim) array of query points.
-    tree : dict, optional
-        Precomputed AABB tree from `maketree`.
-    options : dict, optional
-        Tree construction options (passed to maketree).
+    PA : ndarray of shape (NL, ND)
+        Coordinates of the first endpoints of the line segments.
+    PB : ndarray of shape (NL, ND)
+        Coordinates of the second endpoints of the line segments.
+    PI : ndarray of shape (NP, ND)
+        Query points for which intersecting line segments are sought.
+    TR : object, optional
+        Precomputed AABB tree structure used to accelerate the search.
+        If provided, it will be reused for efficiency, assuming that
+        the set of line segments has not changed.
+    OP : dict, optional
+        Additional parameters controlling the creation or behavior of the
+        underlying AABB tree.
 
     Returns
     -------
-    lp : np.ndarray
-        (n_points, 2) array of line index ranges per point (0-based).
-    lj : np.ndarray
-        List of intersecting line indices.
-    tree : dict
-        The AABB tree used in the computation.
+    LP : ndarray of shape (NP, 2)
+        Index pairs defining, for each query point, the start and end
+        positions in `LI` listing the intersecting line segments.
+        Points with no intersection have `LP[i, 0] == 0`.
+    LI : ndarray of shape (K,)
+        Flattened list of line indices that intersect the query points.
+        For query `i`, intersecting lines are `LI[LP[i,0]:LP[i,1]]`.
+    TR : object, optional
+        AABB tree structure used internally for the spatial queries.
+        It can be reused in subsequent calls for improved performance.
+
     Notes
     -----
-    Traduced from MATLAB aabb-tree repository
+    If the same line collection `[PA, PB]` is queried multiple times,
+    reusing the returned `TR` structure can significantly reduce computation
+    time. The line endpoints **must remain unchanged** between queries.
 
     References
     ----------
-    Darren Engwirda, Locally-optimal Delaunay-refinement
-    and optimisation-based mesh generation, Ph.D. Thesis,
-    School of Mathematics and Statistics, The University
-    of Sydney, September 2014.
+    Translation of the MESH2D function `FINDLINE`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
+
+    Additional reference:
+    D. Engwirda, *"Locally-optimal Delaunay-refinement & optimisation-based mesh generation"*,
+    Ph.D. Thesis, School of Mathematics and Statistics, University of Sydney, 2014.
+    http://hdl.handle.net/2123/13148
     """
 
     # --------------------- Basic checks
@@ -64,31 +86,30 @@ def findline(pa, pb, pp, tree=None, options=None):
     if pa.size == 0 or pb.size == 0:
         return np.zeros((0, 2), dtype=int), np.array([], dtype=int), tree
 
-    # --------------------- Build AABB tree if needed
+    # --------------------- compute aabb-tree for d-line
     if tree is None:
         n_dim = pp.shape[1]
         n_lines = pa.shape[0]
         ab = np.zeros((n_lines, n_dim * 2))
 
-        # Compute min/max bounds for each dimension
+        # compute aabb-tree
         for ax in range(n_dim):
             ab[:, ax] = np.minimum(pa[:, ax], pb[:, ax])
             ab[:, n_dim + ax] = np.maximum(pa[:, ax], pb[:, ax])
 
         tree = maketree(ab, options)
 
-    # --------------------- Map tree to query vertices
+    # ---------------------  compute tree-to-vert mapping
     tm = mapvert(tree, pp)
 
-    # --------------------- Compute relative tolerance
+    # --------------------- compute intersection rel-tol
     p0 = np.min(np.vstack([pa, pb]), axis=0)
     p1 = np.max(np.vstack([pa, pb]), axis=0)
     zt = np.max(p1 - p0) * np.finfo(float).eps ** 0.8
 
-    # --------------------- Query lines per vertex
+    # --------------------- compute vert-to-line queries
     li, ip, lj = queryset(tree, tm, linekernel, pp, pa, pb, zt)
-
-    # --------------------- Build range array (0-based)
+    # --------------------- re-index onto full obj. list
     lp = np.zeros((pp.shape[0], 2), dtype=int)
     lp[:, 1] = -1  # default for no intersection
 
@@ -129,20 +150,18 @@ def linekernel(pk, lk, pp, pa, pb, zt):
 
     References
     ----------
-    Darren Engwirda, Locally-optimal Delaunay-refinement
-    and optimisation-based mesh generation, Ph.D. Thesis,
-    School of Mathematics and Statistics, The University
-    of Sydney, September 2014.
+    Translation of the MESH2D function `LINEKERNEL`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
 
     mp = len(pk)
     ml = len(lk)
 
-    # Tile points and lines into n*m combinations
+    # -------------------------- push line/vert onto n*m tile
     pk = np.tile(pk, ml)
     lk = np.repeat(lk, mp)
 
-    # Midpoints and half-length vectors
+    # --------------------------  compute O(n*m) intersections
     mm = 0.5 * (pa[lk, :] + pb[lk, :])
     DD = 0.5 * (pb[lk, :] - pa[lk, :])
 
@@ -151,7 +170,7 @@ def linekernel(pk, lk, pp, pa, pb, zt):
     tt = -np.sum(mpv * DD, axis=1) / np.sum(DD * DD, axis=1)
     tt = np.clip(tt, -1.0, 1.0)
 
-    n_dim = pp.shape[1]
+    _n_dim = pp.shape[1]
     qq = mm + (tt[:, None] * DD)
 
     on = np.sum((pp[pk, :] - qq) ** 2, axis=1) <= zt**2

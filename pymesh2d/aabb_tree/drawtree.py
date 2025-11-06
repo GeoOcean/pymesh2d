@@ -22,10 +22,8 @@ def drawtree(tr, ax=None):
 
     References
     ----------
-    Darren Engwirda, Locally-optimal Delaunay-refinement
-    and optimisation-based mesh generation, Ph.D. Thesis,
-    School of Mathematics and Statistics, The University
-    of Sydney, September 2014.
+    Translation of the MESH2D function `drawtree`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
 
     # --- basic checks
@@ -40,11 +38,12 @@ def drawtree(tr, ax=None):
 
     dim = tr["xx"].shape[1]
 
+    # ------------------------------ draw all "leaf" nodes as patches
     if dim == 4:
         # ------------------------- tree in R^2
         np_leaf = np.count_nonzero(lf)
 
-        # nodes
+        # -------------------------nodes
         pp = np.vstack(
             [
                 np.column_stack((tr["xx"][lf, 0], tr["xx"][lf, 1])),
@@ -54,7 +53,7 @@ def drawtree(tr, ax=None):
             ]
         )
 
-        # faces
+        # -------------------------faces
         bb = np.column_stack([np.arange(np_leaf) + np_leaf * i for i in range(4)])
         if ax is None:
             fig, ax = plt.subplots()
@@ -67,7 +66,7 @@ def drawtree(tr, ax=None):
         # ------------------------- tree in R^3
         np_leaf = np.count_nonzero(lf)
 
-        # nodes
+        # -------------------------- nodes
         pp = np.vstack(
             [
                 np.column_stack((tr["xx"][lf, 0], tr["xx"][lf, 1], tr["xx"][lf, 2])),
@@ -81,7 +80,7 @@ def drawtree(tr, ax=None):
             ]
         )
 
-        # faces
+        # -------------------------- faces
         bb = np.vstack(
             [
                 np.column_stack(

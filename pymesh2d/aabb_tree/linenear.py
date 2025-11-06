@@ -23,16 +23,10 @@ def linenear(pa, pb, pc, pd):
     tq : np.ndarray
         Parametric coordinates along [pc, pd] in [-1, +1].
 
-    Notes
-    -----
-    Traduced from MATLAB aabb-tree repository
-
     References
     ----------
-    Darren Engwirda, Locally-optimal Delaunay-refinement
-    and optimisation-based mesh generation, Ph.D. Thesis,
-    School of Mathematics and Statistics, The University
-    of Sydney, September 2014.
+    Translation of the MESH2D function `LINENEAR`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
 
     # Midpoints and half-length direction vectors
