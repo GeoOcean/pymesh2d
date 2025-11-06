@@ -1,20 +1,111 @@
-import numpy as np
 import math
 import time
-from .mesh_util.deltri import deltri
-from .mesh_util.tricon import tricon
-from .mesh_util.isfeat import isfeat
-from .mesh_util.setset import setset
+
+import numpy as np
+
+from .aabb_tree.findball import findball
 from .mesh_ball.cdtbal1 import cdtbal1
 from .mesh_ball.cdtbal2 import cdtbal2
-from .aabb_tree.findball import findball
+from .mesh_util.deltri import deltri
+from .mesh_util.isfeat import isfeat
 from .mesh_util.minlen import minlen
+from .mesh_util.setset import setset
+from .mesh_util.tricon import tricon
+
 
 def refine(*args):
     """
-    refine (Frontal)-Delaunay-refinement for two-dimensional polygonal geometries.
-    Python translation of MATLAB refine.m by Darren Engwirda.
-    Debug version with print statements only (no logic change).
+    Perform (Frontal)-Delaunay-refinement for two-dimensional polygonal geometries.
+
+    [VERT, EDGE, TRIA, TNUM] = refine(NODE, EDGE) returns a constrained
+    Delaunay triangulation of the polygonal region defined by {NODE, EDGE}.
+
+    Parameters
+    ----------
+    node : ndarray of shape (N, 2)
+        XY coordinates of polygonal vertices.
+    edge : ndarray of shape (E, 2)
+        Edge connectivity array. Each row defines an edge such that
+        NODE[EDGE[j, 0], :] and NODE[EDGE[j, 1], :] are the coordinates
+        of the edge endpoints.
+        If omitted, vertices in NODE are assumed to be connected sequentially.
+    part : list of ndarray, optional
+        List of polygonal “parts” for multi-region geometries.
+        Each entry PART[k] contains the edge indices defining one subdomain.
+        The edges EDGE[PART[k], :] define the k-th polygonal region.
+    opts : dict, optional
+        Options dictionary containing user-defined parameters:
+        - 'kind' : {'DELFRONT', 'DELAUNAY'}, default='DELFRONT'
+          Type of refinement algorithm. The 'DELFRONT' method is slower but
+          typically yields higher-quality meshes.
+        - 'rho2' : float, default=1.025
+          Maximum allowable radius–edge ratio. Refinement continues until all
+          triangles satisfy this constraint. Smaller values improve element
+          quality (e.g., ρ₂=1 ensures all angles ≥30°), but ρ₂<1 may fail to converge.
+        - 'ref1' : {'REFINE', 'PRESERVE'}, default='REFINE'
+          Refinement mode for 1D entities (edges).
+        - 'ref2' : {'REFINE', 'PRESERVE'}, default='REFINE'
+          Refinement mode for 2D entities (triangles).
+        - 'siz1' : float, default=1.333
+          Normalized relative-length threshold for edge elements.
+          Refinement proceeds until L/H < SIZ1, where L is edge length and
+          H is the edge-centered mesh-size.
+        - 'siz2' : float, default=1.300
+          Normalized relative-length threshold for triangle elements.
+          Refinement continues until R/H < SIZ2, where R is an effective
+          triangle length (based on circumradius) and H is the tria-centered mesh-size.
+        - 'disp' : int or float, default=10
+          Refinement verbosity level. Set to `np.inf` for quiet execution.
+    hfun : float or callable, optional
+        Mesh-size function or scalar constraint.
+        If `hfun` is a float, a constant mesh size is imposed globally.
+        If `hfun` is callable, it must accept coordinates `PP` (N×2 array)
+        and return corresponding mesh-size values `HH` (N×1 array).
+        The function must be fully vectorized.
+    *harg : tuple, optional
+        Additional arguments passed to `hfun`.
+
+    Returns
+    -------
+    vert : ndarray of shape (V, 2)
+        Coordinates of the triangulated vertices.
+    edge : ndarray of shape (E, 2)
+        Constrained edges of the triangulation.
+    tria : ndarray of shape (T, 3)
+        Array of triangles (vertex indices).
+    tnum : ndarray of shape (T, 1)
+        Array of part indices indicating which subdomain each triangle belongs to.
+
+    Notes
+    -----
+    This function implements a "multi-refinement" variant of the Delaunay-refinement
+    mesh-generation algorithm. Both classical Delaunay-refinement and
+    Frontal-Delaunay variants are supported.
+
+    The Frontal-Delaunay method is a simplified version of the approach used in
+    the **JIGSAW** library.
+
+    References
+    ----------
+    - D. Engwirda (2014), *Locally-optimal Delaunay-refinement and
+      optimisation-based mesh generation*, PhD Thesis, University of Sydney.
+      http://hdl.handle.net/2123/13148
+    - D. Engwirda & D. Ivers (2016), *Off-centre Steiner points for
+      Delaunay-refinement on curved surfaces*, Computer-Aided Design, 72, 157–171.
+      https://doi.org/10.1016/j.cad.2015.10.007
+    - H. Erten & A. Üngör (2009), *Quality triangulation with locally optimal
+      Steiner points*, SIAM J. Sci. Comput. 31(3), 2103–2130.
+      https://doi.org/10.1137/080716748
+    - S. Rebay (1993), *Efficient Unstructured Mesh Generation by Means of
+      Delaunay Triangulation and Bowyer–Watson Algorithm*, J. Comput. Phys. 106(1), 125–138.
+      https://doi.org/10.1006/jcph.1993.1097
+    - J. Ruppert (1995), *A Delaunay refinement algorithm for quality
+      2-dimensional mesh generation*, Journal of Algorithms 18(3), 548–585.
+      https://doi.org/10.1006/jagm.1995.1021
+    - S.-W. Cheng, T. Dey & J. Shewchuk (2012), *Delaunay Mesh Generation*, CRC Press.
+
+    Translation of the MESH2D function `REFINE2`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
 
     # -------------------------------- init variables
@@ -113,7 +204,7 @@ def refine(*args):
     iter = 0
     conn = PSLG.copy()
 
-    vmin = vert.min(axis=0)
+    vmin = vert.min(axis=0)  # inflate bbox for stability
     vmax = vert.max(axis=0)
     vdel = vmax - 1.0 * vmin
     vmin = vmin - 0.5 * vdel
@@ -162,11 +253,46 @@ def refine(*args):
     return vert, conn, tria, tnum
 
 
-
 def cdtbal0(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
     """
-    CDTBAL0 constrained Delaunay-refinement for "sharp" 0-dim. features at PSLG vertices.
-    Python translation of cdtbal0.m (Darren Engwirda).
+    Perform constrained Delaunay refinement for "sharp" 0-dimensional features
+    at PSLG vertices.
+
+    This routine refines the set of 1-simplex elements incident to "sharp"
+    features in the planar straight-line graph (PSLG). Specifically, edges
+    that subtend small angles are subdivided around a set of new "collar"
+    vertices, which are evenly distributed about the center of the sharp feature.
+
+    The collar size is computed as the minimum between the lengths of the
+    incident edges and the local mesh-size constraints.
+
+    Parameters
+    ----------
+    vert : ndarray of shape (N, 2)
+        XY coordinates of the PSLG vertices.
+    edge : ndarray of shape (E, 2)
+        Array of edge connections representing the PSLG.
+    hfun : float or callable, optional
+        Mesh-size function or constant spacing constraint.
+    harg : tuple, optional
+        Additional arguments passed to `hfun`.
+
+    Returns
+    -------
+    vert : ndarray of shape (N', 2)
+        Updated vertex coordinates including collar points.
+    edge : ndarray of shape (E', 2)
+        Updated constrained edges.
+
+    Notes
+    -----
+    This step improves mesh quality around acute angles ("sharp corners")
+    by ensuring sufficient vertex density for conformity and element shape.
+
+    References
+    ----------
+    Translation of the MESH2D function `CDTBAL0`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
 
     if iter <= opts["iter"]:
@@ -191,7 +317,7 @@ def cdtbal0(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
         # ------------------------------------- form edge vectors
         evec = vert[conn[:, 1], :] - vert[conn[:, 0], :]
         elen = np.sqrt(np.sum(evec**2, axis=1))
-       
+
         # éviter les divisions par zéro comme MATLAB
         eps = np.finfo(float).eps
         mask_zero = elen < eps
@@ -232,10 +358,7 @@ def cdtbal0(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
         jset = np.arange(0, jnew.shape[0]) + inew.shape[0] + vert.shape[0]
 
         Iset = (
-            np.arange(0, Inew.shape[0])
-            + inew.shape[0]
-            + jnew.shape[0]
-            + vert.shape[0]
+            np.arange(0, Inew.shape[0]) + inew.shape[0] + jnew.shape[0] + vert.shape[0]
         )
 
         Jset = (
@@ -262,14 +385,76 @@ def cdtbal0(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
 
         conn = np.vstack([conn[keep, :], cnew])
 
-
     return vert, conn, tria, tnum, iter
 
 
 def cdtref1(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
     """
-    CDTREF1 constrained Delaunay-refinement for 1-simplex elements in R^2.
-    Python translation of cdtref1.m (Darren Engwirda), 0-based indexing.
+    Perform constrained Delaunay refinement for 1-simplex elements embedded in R².
+
+    This routine refines the set of 1-simplex (edge) elements in the triangulation
+    until all constraints are satisfied. Specifically, edges are refined until all
+    local mesh-spacing and encroachment conditions are met.
+
+    Refinement can proceed according to either a **Delaunay-refinement** or a
+    **Frontal-Delaunay** approach, depending on the user-defined settings.
+    In both cases, new Steiner vertices are introduced to split "bad" edges —
+    those that violate prescribed geometric or size constraints.
+
+    In the *Delaunay-refinement* ("-DR") method, edges are split about their
+    circumballs (i.e., midpoints of the circumscribed circles).
+    In the *Frontal-Delaunay* ("-FD") method, new vertices are placed to satisfy
+    local mesh-spacing constraints in a **locally optimal** manner.
+
+    Parameters
+    ----------
+    vert : ndarray of shape (N, 2)
+        XY coordinates of vertices in the triangulation.
+    conn : ndarray of shape (E, 2)
+        Edge connectivity array.
+    tria : ndarray of shape (T, 3)
+        Array of triangle vertex indices.
+    tnum : ndarray of shape (T, 1)
+        Part indices associated with each triangle.
+    node : ndarray, optional
+        Boundary vertex information for constrained edges.
+    PSLG : dict, optional
+        Planar straight-line graph structure defining the geometry.
+    part : list, optional
+        Polygonal parts defining subregions of the domain.
+    opts : dict
+        Refinement options dictionary (algorithm type, thresholds, iteration limits).
+    hfun : float or callable, optional
+        Mesh-size function or scalar value defining the target edge length.
+    harg : tuple, optional
+        Extra arguments passed to `hfun`.
+    iter : int
+        Current refinement iteration count.
+
+    Returns
+    -------
+    vert : ndarray of shape (N', 2)
+        Updated vertex coordinates including new Steiner points.
+    conn : ndarray of shape (E', 2)
+        Updated constrained edge connectivity.
+    tria : ndarray of shape (T', 3)
+        Updated triangle connectivity array.
+    tnum : ndarray of shape (T', 1)
+        Updated part indices.
+    iter : int
+        Updated iteration counter after refinement.
+
+    Notes
+    -----
+    This step ensures conformity of 1D features in the mesh by refining edges
+    that violate spacing or Delaunay criteria. Depending on `opts["kind"]`,
+    the process may follow either a classical Delaunay refinement or a
+    Frontal-Delaunay variant for improved element quality.
+
+    References
+    ----------
+    Translation of the MESH2D function `CDTREF1`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
 
     # timers
@@ -285,24 +470,24 @@ def cdtref1(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
         if iter >= opts["iter"]:
             break
 
-        #------------------------------------- calc. circumballs
+        # ------------------------------------- calc. circumballs
         ttic = time.time()
         bal1 = cdtbal1(vert, conn)
         tcpu["ball"] += time.time() - ttic
 
-        #------------------------------------- eval. length-fun.
+        # ------------------------------------- eval. length-fun.
         ttic = time.time()
         if hfun is not None and len(np.atleast_1d(hfun)) > 0:
             if isinstance(hfun, (int, float, np.number)):
                 fun0 = hfun * np.ones((vert.shape[0],), dtype=float)
                 fun1 = hfun
             else:
-                if 'fun0' not in locals():
+                if "fun0" not in locals():
                     fun0 = np.zeros((vert.shape[0],))
                 if np.max(vidx) >= len(fun0):
                     new_size = np.max(vidx) + 1
                     extended = np.full((new_size,), np.nan, dtype=float)
-                    extended[:len(fun0)] = fun0
+                    extended[: len(fun0)] = fun0
                     fun0 = extended
                 fun0[vidx] = np.ravel(hfun(vert[vidx, :], *harg))
                 fun1 = (fun0[conn[:, 0]] + fun0[conn[:, 1]]) / 2.0
@@ -313,18 +498,18 @@ def cdtref1(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
         siz1 = 4.0 * bal1[:, 2] / (fun1 * fun1)
         tcpu["hfun"] += time.time() - ttic
 
-        #------------------------------------- test encroachment
+        # ------------------------------------- test encroachment
         ttic = time.time()
-        bal1[:, 2] = (1.0 - np.finfo(float).eps**0.75) * bal1[:, 2]
+        bal1[:, 2] = (1.0 - np.finfo(float).eps ** 0.75) * bal1[:, 2]
 
         vp, vi, _ = findball(bal1, vert[:, 0:2])
-
+        # ------------------------------------- near=>[vert,edge]
         nexti = 0
         ebad = np.zeros((conn.shape[0],), dtype=bool)
         near = np.zeros((conn.shape[0], 2), dtype=int)
 
         for ii in range(vp.shape[0]):
-            for ip in range(vp[ii, 0], vp[ii, 1] +1):  # ip over vert in ball              for ip in range(vp[ii, 0], vp[ii, 1] + 1):
+            for ip in range(vp[ii, 0], vp[ii, 1] + 1):
                 jj = vi[ip]
                 if ii != conn[jj, 0] and ii != conn[jj, 1]:
                     if nexti >= len(near):
@@ -337,6 +522,11 @@ def cdtref1(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
         near = near[:nexti, :]
 
         if near.shape[0] > 0:
+            """
+            mark edge "encroached" if there is a vert within its
+            dia.-ball that is not joined to either of its vert's
+            via an existing edge...
+            """
             ivrt = conn[near[:, 1], 0]
             jvrt = conn[near[:, 1], 1]
 
@@ -351,57 +541,68 @@ def cdtref1(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
 
         tcpu["encr"] += time.time() - ttic
 
-        #------------------------------------- refinement queues
-        ref1 = np.zeros((conn.shape[0],), dtype=bool)
+        # ------------------------------------- refinement queues
+        ref1 = np.zeros((conn.shape[0],), dtype=bool)  # edge encroachment
         ref1[ebad] = True
-        ref1[siz1 > opts["siz1"] * opts["siz1"]] = True
+        ref1[siz1 > opts["siz1"] * opts["siz1"]] = True  # bad equiv. length
 
         num1 = np.where(ref1)[0]
 
-        #------------------------------------- dump-out progress
+        # ------------------------------------- dump-out progress
         if iter % opts["disp"] == 0:
             numc = conn.shape[0]
             numt = tria.shape[0]
             print(f"{iter:11d} {numc:18d} {numt:18d}")
 
-        #------------------------------------- nothing to refine
+        # ------------------------------------- nothing to refine
         if num1.size == 0:
             break
 
-        #------------------------------------- refine "bad" tria
+        # ------------------------------------- refine "bad" tria
         if opts["kind"].lower() == "delaunay":
-            # circ-ball points
+            # --------------------------------- do circ-ball pt's
             new1 = bal1[ref1, 0:2]
 
             vidx = np.arange(new1.shape[0]) + vert.shape[0]
 
-            cnew = np.vstack([
-                np.column_stack([conn[ref1, 0], vidx]),
-                np.column_stack([conn[ref1, 1], vidx])
-            ])
+            cnew = np.vstack(
+                [
+                    np.column_stack([conn[ref1, 0], vidx]),
+                    np.column_stack([conn[ref1, 1], vidx]),
+                ]
+            )
 
             conn = np.vstack([conn[~ref1, :], cnew])
+            # --------------------------------- update vertex set
             vert = np.vstack([vert, new1[:, 0:2]])
 
         elif opts["kind"].lower() == "delfront":
-            #-------------------------------- off-centre scheme
+            """
+            symmetric off-centre scheme:- refine edges from both
+            ends simultaneously, placing new vertices to satisfy
+            the worst of mesh-spacing and local voronoi constra-
+            ints.
+            """
+
             ttic = time.time()
 
             evec = vert[conn[ref1, 1], :] - vert[conn[ref1, 0], :]
             elen = np.sqrt(np.sum(evec**2, axis=1))
             evec = evec / np.column_stack([elen, elen])
-
+            # ------------------------------------- "voro"-type dist.
             vlen = np.sqrt(bal1[ref1, 2])
+            # ------------------------------------- "size"-type dist.
             ihfn = fun0[conn[ref1, 0]]
             jhfn = fun0[conn[ref1, 1]]
-
+            # ------------------------------------- bind "safe" dist.
             ilen = np.minimum(vlen, ihfn)
             jlen = np.minimum(vlen, jhfn)
 
             inew = vert[conn[ref1, 0], :] + np.column_stack([ilen, ilen]) * evec
             jnew = vert[conn[ref1, 1], :] - np.column_stack([jlen, jlen]) * evec
-
+            # ------------------------------------- iter. "size"-type
             for _ in range(3):
+                # ---------------------------------- eval. length-fun.
                 if hfun is not None and len(np.atleast_1d(hfun)) > 0:
                     if isinstance(hfun, (int, float, np.number)):
                         iprj = hfun * np.ones((inew.shape[0],))
@@ -415,35 +616,40 @@ def cdtref1(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
 
                 iprj = 0.5 * ihfn + 0.5 * iprj
                 jprj = 0.5 * jhfn + 0.5 * jprj
-
+                # ------------------------------------- bind "safe" dist.
                 ilen = np.minimum(vlen, iprj)
                 jlen = np.minimum(vlen, jprj)
-
+                # ------------------------------------- locate offcentres
                 inew = vert[conn[ref1, 0], :] + np.column_stack([ilen, ilen]) * evec
                 jnew = vert[conn[ref1, 1], :] - np.column_stack([jlen, jlen]) * evec
-
+            # ------------------------------------- merge i,j if near
             near = ilen + jlen >= vlen * ntol
 
             znew = 0.5 * (inew[near, :] + jnew[near, :])
             inew = inew[~near, :]
             jnew = jnew[~near, :]
-
+            # ------------------------------------- split constraints
             zset = np.arange(znew.shape[0]) + vert.shape[0]
             iset = np.arange(inew.shape[0]) + znew.shape[0] + vert.shape[0]
-            jset = np.arange(jnew.shape[0]) + znew.shape[0] + inew.shape[0] + vert.shape[0]
+            jset = (
+                np.arange(jnew.shape[0]) + znew.shape[0] + inew.shape[0] + vert.shape[0]
+            )
 
             set1 = num1[near]
             set2 = num1[~near]
 
-            cnew = np.vstack([
-                np.column_stack([conn[set1, 0], zset]),
-                np.column_stack([conn[set1, 1], zset]),
-                np.column_stack([conn[set2, 0], iset]),
-                np.column_stack([conn[set2, 1], jset]),
-                np.column_stack([iset, jset])
-            ])
+            cnew = np.vstack(
+                [
+                    np.column_stack([conn[set1, 0], zset]),
+                    np.column_stack([conn[set1, 1], zset]),
+                    np.column_stack([conn[set2, 0], iset]),
+                    np.column_stack([conn[set2, 1], jset]),
+                    np.column_stack([iset, jset]),
+                ]
+            )
 
             conn = np.vstack([conn[~ref1, :], cnew])
+            # ------------------------------------- update vertex set
             vert = np.vstack([vert, znew, inew, jnew])
             vidx = np.concatenate([zset, iset, jset])
 
@@ -452,6 +658,7 @@ def cdtref1(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
     tcpu["full"] += time.time() - tnow
 
     if not np.isinf(opts["disp"]):
+        # ------------------------------------- print final stats
         numc = conn.shape[0]
         numt = tria.shape[0]
         print(f"{iter:11d} {numc:18d} {numt:18d}")
@@ -467,20 +674,96 @@ def cdtref1(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
     return vert, conn, tria, tnum, iter
 
 
-def cdtref2(vert, conn, tria, tnum,
-            node, PSLG, part, opts,
-            hfun, harg, iter):
+def cdtref2(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
     """
-    CDTREF2 constrained Delaunay-refinement for 2-simplex
-    elements in R^2.
-    Python translation of cdtref2.m (Darren Engwirda).
-    0-based indexing.
+    Perform constrained Delaunay refinement for 2-simplex elements embedded in R².
+
+    This routine refines the set of 2-simplex (triangle) elements in the
+    triangulation until all constraints are satisfied. Specifically,
+    triangles are refined until local mesh-spacing and element-shape
+    conditions are met.
+
+    Refinement can follow either a **Delaunay-refinement** or a
+    **Frontal-Delaunay** strategy, depending on user-defined settings.
+    In both cases, new Steiner points are introduced to split "bad"
+    triangles — those that violate prescribed geometric or size
+    constraints.
+
+    In the *Delaunay-refinement* ("-DR") approach, triangles are split
+    about their **circumballs** (circumcenters of the elements).
+    In the *Frontal-Delaunay* ("-FD") method, new vertices are positioned
+    to satisfy mesh-spacing and shape constraints in a **locally optimal**
+    manner.
+
+    Parameters
+    ----------
+    vert : ndarray of shape (N, 2)
+        XY coordinates of vertices in the triangulation.
+    conn : ndarray of shape (E, 2)
+        Edge connectivity array.
+    tria : ndarray of shape (T, 3)
+        Triangle connectivity array.
+    tnum : ndarray of shape (T, 1)
+        Array of part indices corresponding to each triangle.
+    node : ndarray, optional
+        Boundary vertex information for constrained regions.
+    PSLG : dict, optional
+        Planar straight-line graph structure defining the domain geometry.
+    part : list, optional
+        Polygonal subregions defining different parts of the domain.
+    opts : dict
+        Refinement options, including:
+        - 'kind': {'DELFRONT', 'DELAUNAY'}
+          Algorithm type.
+        - 'siz2': float
+          Target normalized triangle size threshold.
+        - 'rho2': float
+          Target radius–edge ratio limit.
+        - 'ref2': {'REFINE', 'PRESERVE'}
+          Refinement flag for 2D entities.
+    hfun : float or callable, optional
+        Mesh-size function or scalar defining the target element size.
+    harg : tuple, optional
+        Additional arguments passed to `hfun`.
+    iter : int
+        Current refinement iteration count.
+
+    Returns
+    -------
+    vert : ndarray of shape (N', 2)
+        Updated vertex coordinates, including newly added Steiner points.
+    conn : ndarray of shape (E', 2)
+        Updated constrained edge connectivity.
+    tria : ndarray of shape (T', 3)
+        Updated triangle connectivity array.
+    tnum : ndarray of shape (T', 1)
+        Updated part indices for each triangle.
+    iter : int
+        Updated iteration counter after refinement.
+
+    Notes
+    -----
+    This procedure enforces both **element-shape** and **mesh-spacing**
+    constraints across the 2D mesh.
+    Depending on `opts["kind"]`, it performs either a classical
+    Delaunay-refinement or a Frontal-Delaunay method, the latter generally
+    providing smoother, higher-quality triangulations.
+
+    References
+    ----------
+    Translation of the MESH2D function `CDTREF2`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
 
-    # timers
-    tcpu = {"full": 0.0, "dtri": 0.0, "tcon": 0.0,
-            "ball": 0.0, "hfun": 0.0,
-            "offc": 0.0, "filt": 0.0}
+    tcpu = {
+        "full": 0.0,
+        "dtri": 0.0,
+        "tcon": 0.0,
+        "ball": 0.0,
+        "hfun": 0.0,
+        "offc": 0.0,
+        "filt": 0.0,
+    }
 
     vidx = np.arange(vert.shape[0])  # "new" vert list
 
@@ -490,19 +773,17 @@ def cdtref2(vert, conn, tria, tnum,
     while opts["ref2"].lower() == "refine":
         iter += 1
 
-        #------------------------------------- build current CDT
+        # ------------------------------------- build current CDT
         ttic = time.time()
         nold = vert.shape[0]
 
-        vert, conn, tria, tnum = deltri(
-            vert, conn, node, PSLG, part, opts["dtri"]
-        )
+        vert, conn, tria, tnum = deltri(vert, conn, node, PSLG, part, opts["dtri"])
 
         nnew = vert.shape[0]
         vidx = np.concatenate([vidx, np.arange(nold, nnew)])
 
         tcpu["dtri"] += time.time() - ttic
-        #------------------------------------- build current adj
+        # ------------------------------------- build current adj
         ttic = time.time()
         edge, tria = tricon(tria, conn)
         tcpu["tcon"] += time.time() - ttic
@@ -510,7 +791,7 @@ def cdtref2(vert, conn, tria, tnum,
         if iter >= opts["iter"]:
             break
 
-        #------------------------------------- calc. circumballs
+        # ------------------------------------- calc. circumballs
         ttic = time.time()
         bal1 = cdtbal1(vert, conn)
         bal2 = cdtbal2(vert, edge, tria)
@@ -519,24 +800,22 @@ def cdtref2(vert, conn, tria, tnum,
         scr2 = rho2 * bal2[:, 2]
         tcpu["ball"] += time.time() - ttic
 
-        #------------------------------------- eval. length-fun.
+        # ------------------------------------- eval. length-fun.
         ttic = time.time()
         if hfun is not None and len(np.atleast_1d(hfun)) > 0:
             if isinstance(hfun, (int, float, np.number)):
                 fun0 = hfun * np.ones(vert.shape[0])
                 fun2 = hfun
             else:
-                if 'fun0' not in locals():
+                if "fun0" not in locals():
                     fun0 = np.zeros((vert.shape[0],))
                 if np.max(vidx) >= len(fun0):
                     new_size = np.max(vidx) + 1
                     extended = np.full((new_size,), np.nan, dtype=float)
-                    extended[:len(fun0)] = fun0
+                    extended[: len(fun0)] = fun0
                     fun0 = extended
                 fun0[vidx] = hfun(vert[vidx, :], *harg).ravel()
-                fun2 = (fun0[tria[:, 0]] +
-                        fun0[tria[:, 1]] +
-                        fun0[tria[:, 2]]) / 3.0
+                fun2 = (fun0[tria[:, 0]] + fun0[tria[:, 1]] + fun0[tria[:, 2]]) / 3.0
         else:
             fun0 = np.full(vert.shape[0], np.inf)
             fun2 = np.inf
@@ -544,41 +823,51 @@ def cdtref2(vert, conn, tria, tnum,
         siz2 = 3.0 * bal2[:, 2] / (fun2 * fun2)
         tcpu["hfun"] += time.time() - ttic
 
-        #------------------------------------- refinement queues
+        # ------------------------------------- refinement queues
         ref1 = np.zeros(conn.shape[0], dtype=bool)
         ref2 = np.zeros(tria.shape[0], dtype=bool)
 
         stri, _ = isfeat(vert, edge, tria)
 
-        ref2[rho2 > opts["rho2"] * opts["rho2"]] = True
+        ref2[rho2 > opts["rho2"] * opts["rho2"]] = True  # bad rad-edge len.
         ref2[stri] = False
-        ref2[siz2 > opts["siz2"] * opts["siz2"]] = True
+        ref2[siz2 > opts["siz2"] * opts["siz2"]] = True  # bad equiv. length
 
         num2 = np.where(ref2)[0]
 
-        #------------------------------------- dump-out progress
+        # ------------------------------------- dump-out progress
         if iter % opts["disp"] == 0:
             numc = conn.shape[0]
             numt = tria.shape[0]
             print(f"{iter:11d} {numc:18d} {numt:18d}")
 
-        #------------------------------------- nothing to refine
+        # ------------------------------------- nothing to refine
         if num2.size == 0:
             break
 
         scr2_sorted = scr2[num2]
-        idx2 = np.argsort(-scr2_sorted)  # descend
+        idx2 = np.argsort(-scr2_sorted)
         num2 = num2[idx2]
 
-        #------------------------------------- refine "bad" tria
+        # ------------------------------------- refine "bad" tria
         if opts["kind"].lower() == "delaunay":
+            # ---------------------------------- do circ-ball pt's
             new2 = np.zeros((len(num2), 3))
             new2[:, 0:2] = bal2[num2, 0:2]
-            rmin = len2[num2] * (1.0 - np.finfo(float).eps**0.75) ** 2
+            rmin = (
+                len2[num2] * (1.0 - np.finfo(float).eps ** 0.75) ** 2
+            )  # min. insert radii
             new2[:, 2] = np.maximum(bal2[num2, 2] * near**2, rmin)
 
         elif opts["kind"].lower() == "delfront":
-            #------------------------------------- find frontal edge
+            """
+            off-centre scheme -- refine triangles by positioning
+            new vertices along a local segment of the voronoi
+            diagram, bounded by assoc. circmballs. New points
+            are placed to satisfy the worst of local mesh-length
+            and element-shape constraints.
+            """
+            # ------------------------------------- find frontal edge
             lmin, emin = minlen(vert, tria[num2, :])
             ftri = np.zeros(len(num2), dtype=bool)
             epos = np.zeros(len(num2), dtype=int)
@@ -587,7 +876,7 @@ def cdtref2(vert, conn, tria, tnum,
             for ii in range(len(epos)):
                 epos[ii] = tria[num2[ii], emin[ii] + 3]
 
-            #------------------------------------- find frontal tria
+            # ------------------------------------- find frontal tria
             for enum in range(3):
                 eidx = tria[num2, enum + 3]
                 ftri = ftri | (edge[eidx, 4] > 0)
@@ -603,28 +892,32 @@ def cdtref2(vert, conn, tria, tnum,
                 ftri[okay] = ftri[okay] | ~ref2[tidx]
 
             if not np.any(ftri):
-                ftri[:] = True
+                ftri[:] = True  # can this happen!?
 
-            #------------------------------------- locate offcentres
+            # ------------------------------------- locate offcentres
             emid = (vert[edge[epos, 0], :] + vert[edge[epos, 1], :]) * 0.5
             elen = np.sqrt(lmin[:])
+            # ------------------------------------- "voro"-type dist.
             vvec = bal2[num2, 0:2] - emid
             vlen = np.sqrt(np.sum(vvec**2, axis=1))
             vvec = vvec / np.column_stack([vlen, vlen])
 
             hmid = (fun0[edge[epos, 0]] + fun0[edge[epos, 1]]) * 0.5
-
+            # ------------------------------------- "ball"-type dist.
             rtri = elen * opts["off2"]
             rfac = elen * 0.5
             dsqr = rtri**2 - rfac**2
             doff = rtri + np.sqrt(np.maximum(0.0, dsqr))
-
+            # ------------------------------------- "size"-type dist.
             dsiz = np.sqrt(3.0) / 2.0 * hmid
+            # ------------------------------------- bind "safe" dist.
             dist = np.minimum.reduce([dsiz, doff, vlen])
+            # ------------------------------------- locate offcentres
             off2 = emid + np.column_stack([dist, dist]) * vvec
 
-            #------------------------------------- iter. "size"-type
+            # ------------------------------------- iter. "size"-type
             for _ in range(3):
+                # ---------------------------------- eval. length-fun.
                 if hfun is not None and len(np.atleast_1d(hfun)) > 0:
                     if isinstance(hfun, (int, float, np.number)):
                         hprj = hfun * np.ones(off2.shape[0])
@@ -632,27 +925,30 @@ def cdtref2(vert, conn, tria, tnum,
                         hprj = hfun(off2, *harg).ravel()
                 else:
                     hprj = np.full(off2.shape[0], np.inf)
-
+                # ----------------------------------- "size"-type dist.
                 hprj = 0.33 * hmid + 0.67 * hprj
                 dsiz = np.sqrt(3.0) / 2.0 * hprj
-                dsiz[dsiz < elen * 0.50] = np.inf
-                dsiz[dsiz > vlen * 0.95] = np.inf
-
+                dsiz[dsiz < elen * 0.50] = np.inf  # edge-ball limiter
+                dsiz[dsiz > vlen * 0.95] = np.inf  # circ-ball limiter
+                # ------------------------------------- bind "safe" dist.
                 dist = np.minimum.reduce([dsiz, doff, vlen])
+                # ------------------------------------- locate offcentres
                 off2 = emid + np.column_stack([dist, dist]) * vvec
 
             orad = np.sqrt((elen * 0.5) ** 2 + dist**2)
-
+            # ------------------------------------- do offcentre pt's
             new2 = np.zeros((np.count_nonzero(ftri), 3))
             new2[:, 0:2] = off2[ftri, 0:2]
-            rmin = lmin[ftri] * (1.0 - np.finfo(float).eps**0.75) ** 2
+            rmin = (
+                lmin[ftri] * (1.0 - np.finfo(float).eps ** 0.75) ** 2
+            )  # min. insert radii
             new2[:, 2] = np.maximum((orad[ftri] * near) ** 2, rmin)
 
             tcpu["offc"] += time.time() - ttic
 
-        #------------------------------------- inter.-ball dist.
+        # ------------------------------------- inter.-ball dist.
         ttic = time.time()
-
+        # ------------------------------------- proximity filters
         vp, vi, _ = findball(new2, new2[:, 0:2])
 
         keep = np.ones(new2.shape[0], dtype=bool)
@@ -663,17 +959,17 @@ def cdtref2(vert, conn, tria, tnum,
                     keep[ii] = False
                     break
         new2 = new2[keep, :]
-        
-        #------------------------------------- test encroachment
-        bal1[:, 2] = (1.0 - np.finfo(float).eps**0.75) * bal1[:, 2]
+
+        # ------------------------------------- test encroachment
+        bal1[:, 2] = (1.0 - np.finfo(float).eps ** 0.75) * bal1[:, 2]
         vp, vi, _ = findball(bal1, new2[:, 0:2])
         keep = np.ones(new2.shape[0], dtype=bool)
         for ii in range(vp.shape[0]):
-            for ip in range(vp[ii, 0], vp[ii, 1]+1):                                  #for ip in range(vp[ii, 0], vp[ii, 1] + 1):
+            for ip in range(vp[ii, 0], vp[ii, 1] + 1):
                 jj = vi[ip]
                 ref1[jj] = True
                 keep[ii] = False
-        
+        # ------------------------------------- leave sharp edges
         ebnd = np.zeros(edge.shape[0], dtype=bool)
         ebnd[tria[stri, 3:6].ravel()] = True
 
@@ -681,32 +977,38 @@ def cdtref2(vert, conn, tria, tnum,
 
         ref1[enot] = False
 
-        #------------------------------------- preserve boundary
+        # ------------------------------------- preserve boundary
         if opts["ref1"].lower() == "preserve":
             ref1[:] = False
-        new2 = new2[keep, :]
-        #------------------------------------- refinement points
-        new1 = bal1[ref1, :]
 
+        # ------------------------------------- refinement points
+        new2 = new2[keep, :]
+        new1 = bal1[ref1, :]
+        # ------------------------------------- split constraints
         idx1 = np.arange(new1.shape[0]) + vert.shape[0]
         idx2 = np.arange(new2.shape[0]) + new1.shape[0] + vert.shape[0]
 
-        cnew = np.vstack([np.column_stack([conn[ref1, 0], idx1]),
-                          np.column_stack([conn[ref1, 1], idx1])])
+        cnew = np.vstack(
+            [
+                np.column_stack([conn[ref1, 0], idx1]),
+                np.column_stack([conn[ref1, 1], idx1]),
+            ]
+        )
         conn = np.vstack([conn[~ref1, :], cnew])
         vidx = np.concatenate([idx1, idx2])
-
+        # ------------------------------------- update vertex set
         nold = vert.shape[0]
         vert = np.vstack([vert, new1[:, 0:2], new2[:, 0:2]])
         nnew = vert.shape[0]
         if nnew == nold:
-            break
+            break  # we *must* be done
 
         tcpu["filt"] += time.time() - ttic
 
     tcpu["full"] += time.time() - tnow
 
     if not np.isinf(opts["disp"]):
+        # ------------------------------------- print final stats
         numc = conn.shape[0]
         numt = tria.shape[0]
         print(f"{iter:11d} {numc:18d} {numt:18d}")
@@ -718,12 +1020,9 @@ def cdtref2(vert, conn, tria, tnum,
     return vert, conn, tria, tnum, iter
 
 
-
-
 def makeopt(opts):
     """
-    MAKEOPT - configure the options dictionary for refine.
-    Traduction directe de makeopt.m
+    MAKEOPT setup the options structure for REFINE.
     """
 
     # dtri option
@@ -761,13 +1060,9 @@ def makeopt(opts):
         if not isinstance(opts["iter"], (int, float)):
             raise TypeError("refine:incorrectInputClass - Incorrect input class.")
         if not isinstance(opts["iter"], (int, float)):
-            raise ValueError(
-                "refine:incorrectDimensions - Incorrect input dimensions."
-            )
+            raise ValueError("refine:incorrectDimensions - Incorrect input dimensions.")
         if opts["iter"] <= 0:
-            raise ValueError(
-                "refine:invalidOptionValues - Invalid OPT.ITER selection."
-            )
+            raise ValueError("refine:invalidOptionValues - Invalid OPT.ITER selection.")
 
     # disp option
     if "disp" not in opts:
@@ -776,13 +1071,9 @@ def makeopt(opts):
         if not isinstance(opts["disp"], (int, float)):
             raise TypeError("refine:incorrectInputClass - Incorrect input class.")
         if not isinstance(opts["disp"], (int, float)):
-            raise ValueError(
-                "refine:incorrectDimensions - Incorrect input dimensions."
-            )
+            raise ValueError("refine:incorrectDimensions - Incorrect input dimensions.")
         if opts["disp"] <= 0:
-            raise ValueError(
-                "refine:invalidOptionValues - Invalid OPT.DISP selection."
-            )
+            raise ValueError("refine:invalidOptionValues - Invalid OPT.DISP selection.")
 
     # rho2 option
     if "rho2" not in opts:
@@ -791,13 +1082,9 @@ def makeopt(opts):
         if not isinstance(opts["rho2"], (int, float)):
             raise TypeError("refine:incorrectInputClass - Incorrect input class.")
         if not isinstance(opts["rho2"], (int, float)):
-            raise ValueError(
-                "refine:incorrectDimensions - Incorrect input dimensions."
-            )
+            raise ValueError("refine:incorrectDimensions - Incorrect input dimensions.")
         if opts["rho2"] < 1.0:
-            raise ValueError(
-                "refine:invalidOptionValues - Invalid OPT.RHO2 selection."
-            )
+            raise ValueError("refine:invalidOptionValues - Invalid OPT.RHO2 selection.")
 
     # off2 option
     if "off2" not in opts:
@@ -806,13 +1093,9 @@ def makeopt(opts):
         if not isinstance(opts["off2"], (int, float)):
             raise TypeError("refine:incorrectInputClass - Incorrect input class.")
         if not isinstance(opts["off2"], (int, float)):
-            raise ValueError(
-                "refine:incorrectDimensions - Incorrect input dimensions."
-            )
+            raise ValueError("refine:incorrectDimensions - Incorrect input dimensions.")
         if opts["off2"] < 0.7:
-            raise ValueError(
-                "refine:invalidOptionValues - Invalid OPT.OFF2 selection."
-            )
+            raise ValueError("refine:invalidOptionValues - Invalid OPT.OFF2 selection.")
 
     # siz1 option
     if "siz1" not in opts:
@@ -821,13 +1104,9 @@ def makeopt(opts):
         if not isinstance(opts["siz1"], (int, float)):
             raise TypeError("refine:incorrectInputClass - Incorrect input class.")
         if not isinstance(opts["siz1"], (int, float)):
-            raise ValueError(
-                "refine:incorrectDimensions - Incorrect input dimensions."
-            )
+            raise ValueError("refine:incorrectDimensions - Incorrect input dimensions.")
         if opts["siz1"] <= 0.0:
-            raise ValueError(
-                "refine:invalidOptionValues - Invalid OPT.SIZ1 selection."
-            )
+            raise ValueError("refine:invalidOptionValues - Invalid OPT.SIZ1 selection.")
 
     # siz2 option
     if "siz2" not in opts:
@@ -836,13 +1115,9 @@ def makeopt(opts):
         if not isinstance(opts["siz2"], (int, float)):
             raise TypeError("refine:incorrectInputClass - Incorrect input class.")
         if not isinstance(opts["siz2"], (int, float)):
-            raise ValueError(
-                "refine:incorrectDimensions - Incorrect input dimensions."
-            )
+            raise ValueError("refine:incorrectDimensions - Incorrect input dimensions.")
         if opts["siz2"] <= 0.0:
-            raise ValueError(
-                "refine:invalidOptionValues - Invalid OPT.SIZ2 selection."
-            )
+            raise ValueError("refine:invalidOptionValues - Invalid OPT.SIZ2 selection.")
 
     # dbug option
     if "dbug" not in opts:
@@ -851,8 +1126,6 @@ def makeopt(opts):
         if not isinstance(opts["dbug"], (bool, np.bool_)):
             raise TypeError("refine:incorrectInputClass - Incorrect input class.")
         if not isinstance(opts["dbug"], (bool, np.bool_)):
-            raise ValueError(
-                "refine:incorrectDimensions - Incorrect input dimensions."
-            )
+            raise ValueError("refine:incorrectDimensions - Incorrect input dimensions.")
 
     return opts

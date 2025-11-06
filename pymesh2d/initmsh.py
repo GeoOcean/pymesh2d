@@ -1,10 +1,26 @@
 import os
 import sys
 
+
 def initmsh():
     """
-    INITMSH: helper function to set up Python's path for MESH2D.
-    Equivalent to MATLAB initmsh.m
+    Initialize the environment for pymesh2d.
+
+    This helper function sets up the Python environment required for
+    `pymesh2d`, ensuring that utility and example paths are properly
+    configured. It mirrors the initialization behavior of MATLAB’s
+    `initmsh` function used in the original `MESH2D` package.
+
+    Notes
+    -----
+    This routine is primarily used to ensure that dependent modules
+    such as `refine`, `smooth`, and `tridemo` are accessible within
+    the current Python session.
+
+    References
+    ----------
+    Translation of the MESH2D function `INITMSH`.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
 
     filepath = os.path.dirname(os.path.abspath(__file__))
@@ -18,7 +34,7 @@ def initmsh():
         "mesh_cost",
         "mesh_file",
         "mesh_util",
-        "poly_test"
+        "poly_test",
     ]
 
     for sub in subdirs:
