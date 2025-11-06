@@ -1,99 +1,139 @@
-import numpy as np
 import time
+
+import numpy as np
 from scipy.sparse import csr_matrix
 
-from .mesh_util.tricon import tricon
-from .mesh_util.setset import setset
-from .mesh_util.deltri import deltri
-
 from .mesh_cost.triscr import triscr
+from .mesh_util.deltri import deltri
+from .mesh_util.setset import setset
+from .mesh_util.tricon import tricon
+
 
 def smooth(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg=()):
     """
-    smooth - "hill-climbing" mesh-smoothing for 2D 2-simplex triangulations.
+    Perform "hill-climbing" mesh smoothing for two-dimensional 2-simplex triangulations.
 
     [VERT, EDGE, TRIA, TNUM] = smooth(VERT, EDGE, TRIA, TNUM) returns a
-    "smoothed" triangulation {VERT,TRIA}, incorporating "optimised" vertex
+    "smoothed" triangulation {VERT, TRIA}, incorporating optimized vertex
     coordinates and mesh topology.
 
     Parameters
     ----------
-    vert : (V,2) ndarray
-        Array of XY coordinates in the triangulation
-    conn : (E,2) ndarray
-        Array of constrained edges
-    tria : (T,3) ndarray
-        Array of triangles
-    tnum : (T,1) ndarray
-        Array of part indices
-    opts : dict
-        Options with fields: vtol, iter, disp, etc.
-    hfun : callable or None
-        Mesh-size function
-    harg : tuple
-        Extra args passed to hfun
+    vert : ndarray of shape (V, 2)
+        XY coordinates of the vertices in the triangulation.
+    edge : ndarray of shape (E, 2)
+        Array of constrained edges.
+    tria : ndarray of shape (T, 3)
+        Array of triangles (vertex indices).
+    tnum : ndarray of shape (T, 1)
+        Array of part indices. Each row of TRIA and EDGE defines an element:
+        VERT[TRIA[ii, 0], :], VERT[TRIA[ii, 1], :], and VERT[TRIA[ii, 2], :]
+        are the coordinates of the ii-th triangle. The edges in EDGE are
+        defined similarly. TNUM[ii] gives the part index of the ii-th triangle.
+    opts : dict, optional
+        Dictionary containing user-defined parameters:
+        - 'vtol' : float, default = 1.0e-2
+          Relative vertex movement tolerance. Smoothing converges when
+          (VNEW - VERT) <= VTOL * VLEN, where VLEN is a local length scale.
+        - 'iter' : int, default = 32
+          Maximum number of smoothing iterations.
+        - 'disp' : int or float, default = 4
+          Display frequency for iteration progress. Set to `np.inf` for quiet execution.
+    hfun : callable, optional
+        Mesh-size function used for local edge-length control.
+    harg : tuple, optional
+        Additional arguments passed to the mesh-size function `hfun`.
 
     Returns
     -------
-    vert, conn, tria, tnum
+    vert : ndarray of shape (V, 2)
+        Updated vertex coordinates after smoothing.
+    edge : ndarray of shape (E, 2)
+        Updated constrained edges.
+    tria : ndarray of shape (T, 3)
+        Updated triangle connectivity.
+    tnum : ndarray of shape (T, 1)
+        Updated part indices.
+
+    Notes
+    -----
+    - This routine is loosely based on the DISTMESH algorithm,
+      employing a spring-based analogy to redistribute mesh vertices.
+    - The method introduces a modified spring-based update with
+      additional hill-climbing element quality guarantees and
+      vertex density control.
+    - See: P.-O. Persson and G. Strang (2004),
+      "A Simple Mesh Generator in MATLAB", *SIAM Review* 46(2): 329–345.
+
+    References
+    ----------
+    Translation of the MESH2D function `SMOOTH2` by Darren Engwirda.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
 
-    if vert is None: vert = np.empty((0, 2))
-    if conn is None: conn = np.empty((0, 2), dtype=int)
-    if tria is None: tria = np.empty((0, 3), dtype=int)
-    if tnum is None: tnum = np.empty((0, 1), dtype=int)
-    if opts is None: opts = {}
+    if vert is None:
+        vert = np.empty((0, 2))
+    if conn is None:
+        conn = np.empty((0, 2), dtype=int)
+    if tria is None:
+        tria = np.empty((0, 3), dtype=int)
+    if tnum is None:
+        tnum = np.empty((0, 1), dtype=int)
+    if opts is None:
+        opts = {}
 
     opts = makeopt(opts)
 
-    #---------------------------------------------- default CONN
+    # ---------------------------------------------- default CONN
     if conn.size == 0:
         edge, _ = tricon(tria)
         ebnd = edge[:, 3] < 1  # use boundary edge
         conn = edge[ebnd, 0:2]
 
-    #---------------------------------------------- default TNUM
+    # ---------------------------------------------- default TNUM
     if tnum.size == 0:
         tnum = np.ones((tria.shape[0], 1), dtype=int)
 
-    #---------------------------------------------- basic checks
-    if not (isinstance(vert, np.ndarray) and
-            isinstance(conn, np.ndarray) and
-            isinstance(tria, np.ndarray) and
-            isinstance(tnum, np.ndarray) and
-            isinstance(opts, dict)):
+    # ---------------------------------------------- basic checks
+    if not (
+        isinstance(vert, np.ndarray)
+        and isinstance(conn, np.ndarray)
+        and isinstance(tria, np.ndarray)
+        and isinstance(tnum, np.ndarray)
+        and isinstance(opts, dict)
+    ):
         raise TypeError("smooth:incorrectInputClass - Incorrect input class.")
 
     nvrt = vert.shape[0]
 
-    if (np.min(conn[:, :2]) < 0 or np.max(conn[:, :2]) > nvrt):
+    if np.min(conn[:, :2]) < 0 or np.max(conn[:, :2]) > nvrt:
         raise ValueError("smooth:invalidInputs - Invalid EDGE input array.")
 
-    if (np.min(tria[:, :3]) < 0 or np.max(tria[:, :3]) > nvrt):
+    if np.min(tria[:, :3]) < 0 or np.max(tria[:, :3]) > nvrt:
         raise ValueError("smooth:invalidInputs - Invalid TRIA input array.")
 
-    #---------------------------------------------- output title
+    # ---------------------------------------------- output title
     if not np.isinf(opts["disp"]):
         print("\n Smooth triangulation...\n")
         print(" -------------------------------------------------------")
         print("      |ITER.|          |MOVE(X)|          |DTRI(X)|     ")
         print(" -------------------------------------------------------")
 
-    #---------------------------------------------- polygon bounds
+    # ---------------------------------------------- polygon bounds
     node = vert.copy()
     PSLG = conn.copy()
     pmax = int(np.max(tnum))
     part = [None for _ in range(pmax)]
 
     for ppos in range(pmax):
-        tsel = (tnum.flatten() == (ppos + 1))
+        tsel = tnum.flatten() == (ppos + 1)
         tcur = tria[tsel, :]
         ecur, tcur = tricon(tcur)
-        ebnd = (ecur[:, 3] == -1)
+        ebnd = ecur[:, 3] == -1
         same, _ = setset(PSLG, ecur[ebnd, 0:2])
         part[ppos] = np.where(same)[0]
 
-    #---------------------------------------------- inflate bbox
+    # ---------------------------------------------- inflate bbox
     vmin = np.min(vert, axis=0)
     vmax = np.max(vert, axis=0)
 
@@ -101,73 +141,88 @@ def smooth(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, har
     vmin = vmin - 0.5 * vdel
     vmax = vmax + 0.5 * vdel
 
-    vbox = np.array([
-        [vmin[0], vmin[1]],
-        [vmax[0], vmin[1]],
-        [vmax[0], vmax[1]],
-        [vmin[0], vmax[1]],
-    ])
+    vbox = np.array(
+        [
+            [vmin[0], vmin[1]],
+            [vmax[0], vmin[1]],
+            [vmax[0], vmax[1]],
+            [vmin[0], vmax[1]],
+        ]
+    )
 
     vert = np.vstack((vert, vbox))
 
-    #---------------------------------------------- DO MESH ITER
+    # ---------------------------------------------- DO MESH ITER
     tnow = time.time()
-    tcpu = {"full": 0., "dtri": 0., "tcon": 0., "iter": 0., "undo": 0., "keep": 0.}
+    tcpu = {
+        "full": 0.0,
+        "dtri": 0.0,
+        "tcon": 0.0,
+        "iter": 0.0,
+        "undo": 0.0,
+        "keep": 0.0,
+    }
 
     for iter in range(int(opts["iter"])):
-
-        #------------------------------------------ inflate adj.
+        # ------------------------------------------ inflate adj.
         ttic = time.time()
         edge, tria = tricon(tria, conn)
         tcpu["tcon"] += time.time() - ttic
 
-        #------------------------------------------ compute scr.
+        # ------------------------------------------ compute scr.
         oscr = triscr(vert, tria)
 
-        #------------------------------------------ vert. iter's
+        # ------------------------------------------ vert. iter's
         ttic = time.time()
         nvrt = vert.shape[0]
         nedg = edge.shape[0]
 
-        IMAT = csr_matrix((np.ones(nedg), (edge[:, 0], np.arange(nedg))), shape=(nvrt, nedg))
-        JMAT = csr_matrix((np.ones(nedg), (edge[:, 1], np.arange(nedg))), shape=(nvrt, nedg))
+        IMAT = csr_matrix(
+            (np.ones(nedg), (edge[:, 0], np.arange(nedg))), shape=(nvrt, nedg)
+        )
+        JMAT = csr_matrix(
+            (np.ones(nedg), (edge[:, 1], np.arange(nedg))), shape=(nvrt, nedg)
+        )
 
         EMAT = IMAT + JMAT
-        vdeg = np.array(EMAT.sum(axis=1)).flatten()
-        free = (vdeg == 0)
+        vdeg = np.array(EMAT.sum(axis=1)).flatten()  # vertex |deg|
+        free = vdeg == 0
 
         vold = vert.copy()
 
         # Local iterations
         for isub in range(max(1, min(8, iter))):
+            # compute HFUN at vert/midpoints
             hvrt = evalhfn(vert, edge, EMAT, hfun, harg)
             hmid = 0.5 * (hvrt[edge[:, 0]] + hvrt[edge[:, 1]])
-
+            # calc. relative edge extensions
             evec = vert[edge[:, 1], :] - vert[edge[:, 0], :]
             elen = np.sqrt(np.sum(evec**2, axis=1))
 
             scal = 1.0 - elen / hmid
             scal = np.clip(scal, -1.0, 1.0)
-
+            # projected points from each end
             ipos = vert[edge[:, 0], :] - 0.67 * (scal[:, None] * evec)
             jpos = vert[edge[:, 1], :] + 0.67 * (scal[:, None] * evec)
-
-            scal = np.maximum(np.abs(scal)**1, np.finfo(float).eps**0.75)
-
+            # scal = ...                      nlin. weight
+            # scal = np.maximum(np.abs(scal) ** 5, np.finfo(float).eps ** 0.75)
+            scal = np.maximum(np.abs(scal) ** 1, np.finfo(float).eps ** 0.75)
+            # sum contributions edge-to-vert
             vnew = IMAT.dot(scal[:, None] * ipos) + JMAT.dot(scal[:, None] * jpos)
-            vsum = np.maximum(EMAT.dot(scal), np.finfo(float).eps**0.75)
+            vsum = np.maximum(EMAT.dot(scal), np.finfo(float).eps ** 0.75)
 
             vnew = vnew / vsum[:, None]
-
+            # fixed points. edge projection?
             vnew[conn.flatten(), :] = vert[conn.flatten(), :]
             vnew[vdeg == 0, :] = vert[vdeg == 0, :]
-
+            # reset for the next local iter.
             vert = vnew
 
         tcpu["iter"] += time.time() - ttic
-
+        # ------------------------------------------ hill-climber
         ttic = time.time()
 
+        # unwind vert. upadte if score lower
         nscr = np.ones(tria.shape[0])
         btri = np.ones(tria.shape[0], dtype=bool)
 
@@ -175,7 +230,7 @@ def smooth(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, har
         for undo in range(umax):
             nscr[btri] = triscr(vert, tria[btri, :])
 
-            #-- TRUE si le triangle doit être "défait"
+            # TRUE if tria needs "unwinding"
             smin = 0.70
             smax = 0.90
             sdel = 0.025
@@ -188,13 +243,13 @@ def smooth(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, har
             if not np.any(btri):
                 break
 
-            #-- relax vers les anciennes coordonnées
+            # relax toward old vert. coord's
             ivrt = np.unique(tria[btri, :3])
             bvrt = np.zeros(vert.shape[0], dtype=bool)
             bvrt[ivrt] = True
 
             if undo != umax:
-                bnew = 0.75 ** undo
+                bnew = 0.75**undo
                 bold = 1.0 - bnew
             else:
                 bnew = 0.0
@@ -207,13 +262,13 @@ def smooth(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, har
         oscr = nscr
         tcpu["undo"] += time.time() - ttic
 
-        #------------------------------------- test convergence!
+        # ------------------------------------- test convergence!
         ttic = time.time()
 
         vdel = np.sum((vert - vold) ** 2, axis=1)
 
         evec = vert[edge[:, 1], :] - vert[edge[:, 0], :]
-        elen = np.sqrt(np.sum(evec ** 2, axis=1))
+        elen = np.sqrt(np.sum(evec**2, axis=1))
 
         hvrt = evalhfn(vert, edge, EMAT, hfun, harg)
         hmid = 0.5 * (hvrt[edge[:, 0]] + hvrt[edge[:, 1]])
@@ -221,33 +276,34 @@ def smooth(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, har
 
         emid = 0.5 * (vert[edge[:, 0], :] + vert[edge[:, 1], :])
 
-        #------------------------------------- |deg|-based prune
+        # ------------------------------------- |deg|-based prune
         keep = np.zeros(vert.shape[0], dtype=bool)
         keep[vdeg > 4] = True
         keep[conn.flatten()] = True
         keep[free.flatten()] = True
 
-        #------------------------------------- 'density' control
+        # ------------------------------------- 'density' control
         lmax = 5.0 / 4.0
         lmin = 1.0 / lmax
 
-        less = (scal <= lmin)
-        more = (scal >= lmax)
+        less = scal <= lmin
+        more = scal >= lmax
 
         vbnd = np.zeros(vert.shape[0], dtype=bool)
         vbnd[conn[:, 0]] = True
         vbnd[conn[:, 1]] = True
 
-        ebad = vbnd[edge[:, 0]] | vbnd[edge[:, 1]]
+        ebad = vbnd[edge[:, 0]] | vbnd[edge[:, 1]]  # not at boundaries
 
         less[ebad] = False
         more[ebad] = False
 
-        #------------------------------------- force as disjoint
+        # ------------------------------------- force as disjoint
         lidx = np.where(less)[0]
         for epos in lidx:
             inod = edge[epos, 0]
             jnod = edge[epos, 1]
+            # --------------------------------- if still disjoint
             if keep[inod] and keep[jnod]:
                 keep[inod] = False
                 keep[jnod] = False
@@ -258,26 +314,26 @@ def smooth(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, har
         indices = np.flatnonzero(ebad)
         indices = indices[indices < more.size]
         more[indices] = False
-        #more[ebad] = False
+        # more[ebad] = False
 
-        #------------------------------------- reindex vert/tria
+        # ------------------------------------- reindex vert/tria
         redo = np.zeros(vert.shape[0], dtype=int)
         itop = np.count_nonzero(keep)
         iend = np.count_nonzero(less)
 
         redo[keep] = np.arange(itop)
-        redo[edge[less, 0]] = np.arange(itop, itop + iend)
+        redo[edge[less, 0]] = np.arange(itop, itop + iend)  # to new midpoints
         redo[edge[less, 1]] = np.arange(itop, itop + iend)
 
         vnew = np.vstack([vert[keep, :], emid[less, :]])
         tnew = redo[tria[:, 0:3]]
 
-        ttmp = np.sort(tnew, axis=1)
+        ttmp = np.sort(tnew, axis=1)  # filter collapsed
         okay = np.all(np.diff(ttmp, axis=1) != 0, axis=1)
         okay = okay & (ttmp[:, 0] > 0)
         tnew = tnew[okay, :]
 
-        #------------------------------------- quality preserver
+        # ------------------------------------- quality preserver
         nscr = triscr(vnew, tnew)
 
         stol = 0.80
@@ -286,14 +342,14 @@ def smooth(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, har
         vbad = np.zeros(vnew.shape[0], dtype=bool)
         vbad[tnew[tbad, :]] = True
 
-        #------------------------------------- filter edge merge
+        # ------------------------------------- filter edge merge
         lidx = np.where(less)[0]
         ebad = vbad[redo[edge[lidx, 0]]] | vbad[redo[edge[lidx, 1]]]
 
         less[lidx[ebad]] = False
         keep[edge[lidx[ebad], 0:2].flatten()] = True
 
-        #------------------------------------- reindex vert/conn
+        # ------------------------------------- reindex vert/conn
         redo = np.zeros(vert.shape[0], dtype=int)
         itop = np.count_nonzero(keep)
         iend = np.count_nonzero(less)
@@ -307,12 +363,12 @@ def smooth(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, har
 
         tcpu["keep"] += time.time() - ttic
 
-        #------------------------------------- build current CDT
+        # ------------------------------------- build current CDT
         ttic = time.time()
         vert, conn, tria, tnum = deltri(vert, conn, node, PSLG, part)
         tcpu["dtri"] += time.time() - ttic
 
-        #------------------------------------- dump-out progress
+        # ------------------------------------- dump-out progress
         vdel = vdel / (hvrt.flatten() ** 2)
         move = vdel > opts["vtol"] ** 2
 
@@ -323,13 +379,13 @@ def smooth(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, har
         if iter % opts["disp"] == 0:
             print(f"{iter:11d} {nmov:18d} {ntri:18d}")
 
-        #------------------------------------- loop convergence!
+        # ------------------------------------- loop convergence!
         if nmov == 0:
             break
 
     tria = tria[:, 0:3]
 
-    #----------------------------------------- prune unused vert
+    # ----------------------------------------- prune unused vert
     keep = np.zeros(vert.shape[0], dtype=bool)
     keep[tria.flatten()] = True
     keep[conn.flatten()] = True
@@ -361,38 +417,45 @@ def smooth(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, har
 
 def evalhfn(vert, edge, EMAT, hfun=None, *harg):
     """
-    EVALHFN : évalue la fonction de maillage (spacing-function) aux sommets du maillage.
+    Evaluate the mesh spacing function (spacing-function) at mesh vertices.
 
     Parameters
     ----------
-    vert : ndarray (N,2)
-        Coordonnées des sommets.
-    edge : ndarray (E,2)
-        Connexions des arêtes.
-    EMAT : ndarray ou scipy.sparse
-        Matrice d’incidence sommet-arête.
-    hfun : float | callable | None
-        Fonction de maillage ou valeur constante.
+    vert : ndarray of shape (N, 2)
+        XY coordinates of the mesh vertices.
+    edge : ndarray of shape (E, 2)
+        Array of edge connections.
+    EMAT : ndarray or scipy.sparse matrix
+        Vertex–edge incidence matrix.
+    hfun : float, callable, or None
+        Mesh-size function or constant spacing value.
     harg : tuple
-        Arguments supplémentaires pour la fonction hfun.
+        Additional arguments passed to the mesh-size function `hfun`.
 
     Returns
     -------
-    hvrt : ndarray (N,)
-        Valeurs de la fonction de taille au niveau des sommets.
+    hvrt : ndarray of shape (N,)
+        Mesh-size function values evaluated at the vertices.
+
+    References
+    ----------
+    Translation of the MESH2D function `EVALHFN` by Darren Engwirda.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
 
     if hfun is not None and (np.isscalar(hfun) or callable(hfun)):
-        if np.isscalar(hfun):  # hfun constant
+        if np.isscalar(hfun):
             hvrt = hfun * np.ones(vert.shape[0])
-        else:  # hfun est une fonction
+        else:
             hvrt = hfun(vert, *harg)
     else:
-        # Pas de HFUN : HVRT = longueur moyenne des arêtes incidentes
+        # no HFUN - HVRT is mean edge-len. at vertices!
         evec = vert[edge[:, 1], :] - vert[edge[:, 0], :]
-        elen = np.sqrt(np.sum(evec ** 2, axis=1))
+        elen = np.sqrt(np.sum(evec**2, axis=1))
 
-        hvrt = np.ravel(EMAT @ elen) / np.maximum(np.ravel(np.sum(EMAT, axis=1)), np.finfo(float).eps)
+        hvrt = np.ravel(EMAT @ elen) / np.maximum(
+            np.ravel(np.sum(EMAT, axis=1)), np.finfo(float).eps
+        )
 
         free = np.ones(vert.shape[0], dtype=bool)
         free[edge[:, 0]] = False
@@ -402,19 +465,25 @@ def evalhfn(vert, edge, EMAT, hfun=None, *harg):
 
     return hvrt
 
+
 def makeopt(opts=None):
     """
-    MAKEOPT : initialise la structure d'options pour smooth.
+    Initialize the options structure for the `smooth` function.
 
     Parameters
     ----------
     opts : dict or None
-        Dictionnaire d'options utilisateur.
+        User-defined options dictionary. If None, a new dictionary is created.
 
     Returns
     -------
     opts : dict
-        Dictionnaire d'options complété avec valeurs par défaut.
+        Options dictionary completed with default values for missing parameters.
+
+    References
+    ----------
+    Translation of the MESH2D function `MAKEOPT` by Darren Engwirda.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
 
     if opts is None:
@@ -426,7 +495,10 @@ def makeopt(opts=None):
     else:
         if not isinstance(opts["iter"], (int, float)):
             raise TypeError("smooth:incorrectInputClass - Incorrect input class.")
-        if not (isinstance(opts["iter"], (int, float)) and not isinstance(opts["iter"], bool)):
+        if not (
+            isinstance(opts["iter"], (int, float))
+            and not isinstance(opts["iter"], bool)
+        ):
             raise TypeError("smooth:incorrectInputClass - Incorrect input class.")
         if isinstance(opts["iter"], (list, tuple)) or hasattr(opts["iter"], "__len__"):
             raise ValueError("smooth:incorrectDimensions - Incorrect input dimensions.")

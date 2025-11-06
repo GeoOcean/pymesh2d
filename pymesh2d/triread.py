@@ -1,30 +1,44 @@
 from .mesh_file.loadmsh import loadmsh
 
+
 def triread(name):
     """
-    TRIREAD : lire des données de triangulation 2D à partir d’un fichier.
-    
+    Read two-dimensional triangulation data from a file.
+
+    This function loads a 2-simplex triangulation {VERT, TRIA} from
+    the specified mesh file.
+
     Parameters
     ----------
     name : str
-        Nom du fichier contenant la triangulation.
-    
+        Name of the mesh file to read.
+
     Returns
     -------
-    vert : ndarray (V,2)
-        Coordonnées XY des sommets.
-    edge : ndarray (E,2)
-        Arêtes contraintes.
-    tria : ndarray (T,3)
-        Triangles (indices des sommets).
-    tnum : ndarray (T,1)
-        Indices des parties.
-    
+    vert : ndarray of shape (V, 2)
+        XY coordinates of the triangulation vertices.
+    edge : ndarray of shape (E, 2)
+        Array of constrained edges.
+    tria : ndarray of shape (T, 3)
+        Array of triangles (vertex indices).
+    tnum : ndarray of shape (T, 1)
+        Array of part indices, such that `tnum[ii]` gives the index
+        of the part containing the ii-th triangle.
+
     Notes
     -----
-    - Les données sont renvoyées non vides si elles sont présentes dans le fichier.
-    - Cette routine reprend des fonctionnalités du package JIGSAW : 
-      github.com/dengwirda/jigsaw-matlab
+    - Data is returned as non-empty arrays if available in the file.
+    - Each row of `tria` and `edge` defines an element:
+      `vert[tria[ii, 0], :]`, `vert[tria[ii, 1], :]`, and
+      `vert[tria[ii, 2], :]` are the coordinates of the ii-th triangle.
+      The edges in `edge` are defined in a similar way.
+    - This routine borrows functionality from the JIGSAW package:
+      https://github.com/dengwirda/jigsaw-matlab
+
+    References
+    ----------
+    Translation of the MESH2D function `TRIREAD` by Darren Engwirda.
+    Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
 
     import numpy as np
@@ -36,7 +50,7 @@ def triread(name):
         raise TypeError("triread:incorrectInputClass - Incorrect input class.")
 
     # ----------------------------------- borrow JIGSAW I/O func!
-    mesh = loadmsh(name)   # ⚠️ nécessite une fonction loadmsh() équivalente en Python
+    mesh = loadmsh(name)
 
     # ----------------------------------- extract data if present
     if "point" in mesh and "coord" in mesh["point"]:
