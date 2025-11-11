@@ -1,15 +1,12 @@
 import numpy as np
 
+from pymesh2d.aabb_tree.findball import findball
+from pymesh2d.aabb_tree.findline import findline
+from pymesh2d.aabb_tree.lineline import lineline
+from pymesh2d.aabb_tree.linenear import linenear
 
-def fixgeo(
-    node=None,
-    PSLG=None,
-    part=None,
-    findball=None,
-    findline=None,
-    lineline=None,
-    linenear=None,
-):
+
+def fixgeo(node, edge, part):
     """
     Attempt to repair issues in polygonal geometry definitions.
 
@@ -64,37 +61,37 @@ def fixgeo(
         return None, None, []
     # ---------------------------------------------- extract ARGS
     node = np.asarray(node)
-    if PSLG is None:
+    if edge is None:
         nnum = node.shape[0]
-        PSLG = np.vstack(
+        edge = np.vstack(
             [
                 np.column_stack([np.arange(0, nnum - 1), np.arange(1, nnum)]),
                 [nnum - 1, 0],
             ]
         )
     else:
-        PSLG = np.asarray(PSLG, dtype=int)
+        edge = np.asarray(edge, dtype=int)
     # ---------------------------------------------- default PART
     if part is None:
-        enum = PSLG.shape[0]
+        enum = edge.shape[0]
         part = [np.arange(enum)]
 
     # ---------------------------------------------- basic checks
     if not (
         isinstance(node, np.ndarray)
-        and isinstance(PSLG, np.ndarray)
+        and isinstance(edge, np.ndarray)
         and isinstance(part, (list, tuple))
     ):
         raise TypeError("fixgeo: incorrect input class")
 
-    if node.ndim != 2 or PSLG.ndim != 2:
+    if node.ndim != 2 or edge.ndim != 2:
         raise ValueError("fixgeo: incorrect dimensions")
-    if node.shape[1] != 2 or PSLG.shape[1] != 2:
+    if node.shape[1] != 2 or edge.shape[1] != 2:
         raise ValueError("fixgeo: incorrect dimensions")
 
     nnum = node.shape[0]
-    enum = PSLG.shape[0]
-    if PSLG.min() < 0 or PSLG.max() >= nnum:
+    enum = edge.shape[0]
+    if edge.min() < 0 or edge.max() >= nnum:
         raise ValueError("fixgeo: invalid EDGE input array")
 
     pmin = [np.min(p) for p in part]
@@ -105,27 +102,27 @@ def fixgeo(
     # ------------------------------------ try to "fix" geometry
     while True:
         nnum = node.shape[0]
-        enum = PSLG.shape[0]
+        enum = edge.shape[0]
         # --------------------------------- prune redundant nodes
-        node, PSLG, part = prunenode(node, PSLG, part, findball)
+        node, edge, part = prunenode(node, edge, part)
         # -------------------------------- prune redundant edges
-        node, PSLG, part = pruneedge(node, PSLG, part)
+        node, edge, part = pruneedge(node, edge, part)
         # --------------------------------- node//edge intersect!
         done = False
         while not done:
-            node, PSLG, part, done = splitnode(node, PSLG, part, findline)
+            node, edge, part, done = splitnode(node, edge, part)
         # -------------------------------- edge//edge intersect!
         done = False
         while not done:
-            node, PSLG, part, done = splitedge(node, PSLG, part, lineline, linenear)
+            node, edge, part, done = splitedge(node, edge, part)
         # --------------------------------- iterate if any change
-        if node.shape[0] == nnum and PSLG.shape[0] == enum:
+        if node.shape[0] == nnum and edge.shape[0] == enum:
             break
 
-    return node, PSLG, part
+    return node, edge, part
 
 
-def prunenode(node, PSLG, part, findball):
+def prunenode(node, edge, part):
     """
     PRUNENODE "prune" redundant nodes by "zipping" those within tolerance of each other.
 
@@ -139,8 +136,6 @@ def prunenode(node, PSLG, part, findball):
     PART : list of lists or list of ndarrays
         Geometry partitions, where each element contains indices into `EDGE`
         defining one polygonal region.
-    findball : function
-        Function to find neighboring nodes within a specified tolerance.
 
     Returns
     -------
@@ -166,7 +161,7 @@ def prunenode(node, PSLG, part, findball):
     zlen = ztol * np.max(ndel)
     # ------------------------------------- index clustered nodes
     ball = np.column_stack([node, np.full(node.shape[0], zlen**2)])
-    vp, vi = findball(ball, node)
+    vp, vi, _ = findball(ball, node)
     # ------------------------------------- "zip" clustered nodes
     iv = np.argsort(vp[:, 1] - vp[:, 0])
     izip = np.zeros(node.shape[0], dtype=int)
@@ -180,20 +175,20 @@ def prunenode(node, PSLG, part, findball):
                 # ----------------------------- "zip" node JJ into II
                 izip[jj] = ii
     # ------------------------------------- re-index nodes//edges
-    next_id = 1
+    next_id = 0
     for kk in range(vp.shape[0]):
         if izip[kk] == 0:
             imap[kk] = next_id
             next_id += 1
 
     imap[izip != 0] = imap[izip[izip != 0]]
-    PSLG = imap[PSLG]
+    edge = imap[edge]
     node = node[izip == 0, :]
 
-    return node, PSLG, part
+    return node, edge, part
 
 
-def pruneedge(node, PSLG, part):
+def pruneedge(node, edge, part):
     """
     PRUNEEDGE "prune" redundant topology.
 
@@ -223,32 +218,34 @@ def pruneedge(node, PSLG, part):
     Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
 
-    PSLG_sorted = np.sort(PSLG, axis=1)
+    edge_sorted = np.sort(edge, axis=1)
     # ------------------------------------- prune redundant topo.
     _, ivec, jvec = np.unique(
-        PSLG_sorted, axis=0, return_index=True, return_inverse=True
+        edge_sorted, axis=0, return_index=True, return_inverse=True
     )
-    PSLG = PSLG[ivec, :]
+    edge = edge[ivec, :]
 
     for i, p in enumerate(part):
         # --------------------------------- re-index part labels!
         part[i] = np.unique(jvec[p])
 
     # ------------------------------------ prune collapsed topo.
-    keep = PSLG[:, 0] != PSLG[:, 1]
-    jvec = np.zeros(PSLG.shape[0], dtype=int)
+    keep = edge[:, 0] != edge[:, 1]
+    jvec = np.zeros(edge.shape[0], dtype=int)
     jvec[keep] = 1
     jvec = np.cumsum(jvec)
-    PSLG = PSLG[keep, :]
+    # Adjust for 0-indexed Python: subtract 1 from non-zero values
+    jvec[jvec > 0] = jvec[jvec > 0] - 1
+    edge = edge[keep, :]
 
     for i, p in enumerate(part):
         # --------------------------------- re-index part labels!
         part[i] = np.unique(jvec[p])
 
-    return node, PSLG, part
+    return node, edge, part
 
 
-def splitnode(node, PSLG, part, findline):
+def splitnode(node, edge, part):
     """
     SPLITNODE "split" PSLG about intersecting nodes.
 
@@ -262,8 +259,6 @@ def splitnode(node, PSLG, part, findline):
     PART : list of lists or list of ndarrays
         Geometry partitions, where each element contains indices into `EDGE`
         defining one polygonal region.
-    FINDLINE : callable
-        Function to find line intersections.
 
     Returns
     -------
@@ -283,16 +278,16 @@ def splitnode(node, PSLG, part, findline):
     """
 
     done = True
-    mark = np.zeros(PSLG.shape[0], dtype=bool)
-    ediv = np.zeros(PSLG.shape[0], dtype=int)
+    mark = np.zeros(edge.shape[0], dtype=bool)
+    ediv = np.zeros(edge.shape[0], dtype=int)
     pair = []
     # ------------------------------------- node//edge intersect!
-    lp, li = findline(node[PSLG[:, 0], :], node[PSLG[:, 1], :], node)
+    lp, li, _ = findline(node[edge[:, 0], :], node[edge[:, 1], :], node)
     # ------------------------------------- node//edge splitting!
     for ii in range(lp.shape[0]):
         for ip in range(lp[ii, 0], lp[ii, 1] + 1):
             jj = li[ip]
-            ni, nj = PSLG[jj]
+            ni, nj = edge[jj]
             if ni != ii and nj != ii and not mark[jj]:
                 done = False
                 # ----------------------------- mark seen, descendent
@@ -300,26 +295,26 @@ def splitnode(node, PSLG, part, findline):
                 pair.append([jj, ii])
 
     if not pair:
-        return node, PSLG, part, done
+        return node, edge, part, done
     # ------------------------------------- re-index intersection
     pair = np.array(pair)
-    inod = PSLG[pair[:, 0], 0]
-    jnod = PSLG[pair[:, 0], 1]
+    inod = edge[pair[:, 0], 0]
+    jnod = edge[pair[:, 0], 1]
     xnod = pair[:, 1]
 
-    ediv[pair[:, 0]] = np.arange(1, pair.shape[0] + 1) + PSLG.shape[0]
-    PSLG[pair[:, 0], 0] = inod
-    PSLG[pair[:, 0], 1] = xnod
-    PSLG = np.vstack([PSLG, np.column_stack([xnod, jnod])])
+    ediv[pair[:, 0]] = np.arange(pair.shape[0]) + edge.shape[0]
+    edge[pair[:, 0], 0] = inod
+    edge[pair[:, 0], 1] = xnod
+    edge = np.vstack([edge, np.column_stack([xnod, jnod])])
     # ------------------------------------- re-index edge in part
     for i, p in enumerate(part):
         enew = ediv[p]
         part[i] = np.hstack([p, enew[enew != 0]])
 
-    return node, PSLG, part, done
+    return node, edge, part, done
 
 
-def splitedge(node, PSLG, part, lineline, linenear):
+def splitedge(node, edge, part):
     """
     SPLITEDGE "split" PSLG about intersecting edges.
 
@@ -333,10 +328,6 @@ def splitedge(node, PSLG, part, lineline, linenear):
     PART : list of lists or list of ndarrays
         Geometry partitions, where each element contains indices into `EDGE`
         defining one polygonal region.
-    LINELINE : callable
-        Function to find line intersections.
-    LINENEAR : callable
-        Function to find linear intersections.
 
     Returns
     -------
@@ -356,58 +347,96 @@ def splitedge(node, PSLG, part, lineline, linenear):
     """
 
     done = True
-    mark = np.zeros(PSLG.shape[0], dtype=int)
+    mark = np.zeros(edge.shape[0], dtype=int)
     pair = []
-    ediv = np.zeros(PSLG.shape[0], dtype=int)
+    ediv = np.zeros(edge.shape[0], dtype=int)
+    flag = np.zeros(node.shape[0], dtype=int)
     # ------------------------------------- edge//edge intersect!
     lp, li = lineline(
-        node[PSLG[:, 0], :],
-        node[PSLG[:, 1], :],
-        node[PSLG[:, 0], :],
-        node[PSLG[:, 1], :],
+        node[edge[:, 0], :],
+        node[edge[:, 1], :],
+        node[edge[:, 0], :],
+        node[edge[:, 1], :],
     )
     # ---------------------------------- parse NaN delimited data
     for ii in range(lp.shape[0]):
+        # Mark nodes belonging to edge ii
+        flag[edge[ii, 0]] = ii
+        flag[edge[ii, 1]] = ii
+
         for ip in range(lp[ii, 0], lp[ii, 1] + 1):
             jj = li[ip]
             if mark[ii] == 0 and mark[jj] == 0 and ii != jj:
-                done = False
-                # ------------------------- mark seen, edge-pairs
-                mark[ii] = 1
-                mark[jj] = 1
-                pair.append([ii, jj])
+                ni = edge[jj, 0]
+                nj = edge[jj, 1]
+                # Check if nodes of edge jj are not endpoints of edge ii
+                if flag[ni] != ii and flag[nj] != ii:
+                    done = False
+                    # ------------------------- mark seen, edge-pairs
+                    mark[ii] = 1
+                    mark[jj] = 1
+                    pair.append([ii, jj])
 
     if not pair:
-        return node, PSLG, part, done
+        return node, edge, part, done
     # ------------------------------------- re-index intersection
     pair = np.array(pair)
     okay, tval, sval = linenear(
-        node[PSLG[pair[:, 0], 0], :],
-        node[PSLG[pair[:, 0], 1], :],
-        node[PSLG[pair[:, 1], 0], :],
-        node[PSLG[pair[:, 1], 1], :],
+        node[edge[pair[:, 0], 0], :],
+        node[edge[pair[:, 0], 1], :],
+        node[edge[pair[:, 1], 0], :],
+        node[edge[pair[:, 1], 1], :],
     )
 
-    pmid = 0.5 * (node[PSLG[pair[:, 0], 1], :] + node[PSLG[pair[:, 0], 0], :])
-    pdel = 0.5 * (node[PSLG[pair[:, 0], 1], :] - node[PSLG[pair[:, 0], 0], :])
+    pmid = 0.5 * (node[edge[pair[:, 0], 1], :] + node[edge[pair[:, 0], 0], :])
+    pdel = 0.5 * (node[edge[pair[:, 0], 1], :] - node[edge[pair[:, 0], 0], :])
     ppos = pmid + np.column_stack([tval, tval]) * pdel
 
-    qmid = 0.5 * (node[PSLG[pair[:, 1], 1], :] + node[PSLG[pair[:, 1], 0], :])
-    qdel = 0.5 * (node[PSLG[pair[:, 1], 1], :] - node[PSLG[pair[:, 1], 0], :])
+    qmid = 0.5 * (node[edge[pair[:, 1], 1], :] + node[edge[pair[:, 1], 0], :])
+    qdel = 0.5 * (node[edge[pair[:, 1], 1], :] - node[edge[pair[:, 1], 0], :])
     qpos = qmid + np.column_stack([sval, sval]) * qdel
 
-    xnod = np.arange(1, pair.shape[0] + 1) + node.shape[0]
-    PSLG = np.vstack(
-        [
-            PSLG,
-            np.column_stack([xnod, PSLG[pair[:, 0], 1]]),
-            np.column_stack([xnod, PSLG[pair[:, 1], 1]]),
-        ]
-    )
+    # Save original edge endpoints before modification
+    inod = edge[pair[:, 0], 0].copy()
+    jnod = edge[pair[:, 0], 1].copy()
+    anod = edge[pair[:, 1], 0].copy()
+    bnod = edge[pair[:, 1], 1].copy()
+
+    # Compute new node indices (before adding nodes to array)
+    nn = pair.shape[0]
+    xnod = node.shape[0] + np.arange(nn)  # 0-indexed for Python
+
+    # Compute new edge indices (before modifying edge array)
+    # MATLAB: iedg = (1:nn)' + size(PSLG,1) + 0 * size(pair,1)
+    # MATLAB: jedg = (1:nn)' + size(PSLG,1) + 1 * size(pair,1)
+    # Python: convert to 0-indexed
+    base_idx = edge.shape[0]
+    iedg = base_idx + np.arange(nn)  # 0-indexed for Python
+    jedg = base_idx + nn + np.arange(nn)  # 0-indexed for Python
+
+    # Set ediv mapping
+    ediv[pair[:, 0]] = iedg
+    ediv[pair[:, 1]] = jedg
+
+    # Update first edges in pairs: [inod, xnod]
+    edge[pair[:, 0], 0] = inod
+    edge[pair[:, 0], 1] = xnod
+
+    # Update second edges in pairs: [anod, xnod]
+    edge[pair[:, 1], 0] = anod
+    edge[pair[:, 1], 1] = xnod
+
+    # Add new edges: [xnod, jnod] and [xnod, bnod]
+    edge = np.vstack([edge, np.column_stack([xnod, jnod])])
+    edge = np.vstack([edge, np.column_stack([xnod, bnod])])
+
+    # Add new nodes (must be done last, after computing all indices)
     node = np.vstack([node, 0.5 * (ppos + qpos)])
+
     # ------------------------------------ re-index edge in part
     for i, p in enumerate(part):
         enew = ediv[p]
-        part[i] = np.hstack([p, enew[enew != 0]])
+        enew = enew[enew != 0]
+        part[i] = np.hstack([p, enew])
 
-    return node, PSLG, part, done
+    return node, edge, part, done

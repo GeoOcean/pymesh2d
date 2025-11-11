@@ -102,7 +102,7 @@ def lineline(pa, pb, pc, pd, tree=None, options=None):
     for ax in range(nd):  #  compute aabb's
         ab[:, ax] = np.minimum(pc[:, ax], pd[:, ax])
         ab[:, nd + ax] = np.maximum(pc[:, ax], pd[:, ax])
-    tm = maprect(tree, ab)
+    tm, _ = maprect(tree, ab)
 
     # ----------------------------- compute line-to-line queries
     li, ip, lj = queryset(tree, tm, linekernel, pc, pd, pa, pb)

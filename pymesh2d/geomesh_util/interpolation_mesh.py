@@ -1,13 +1,19 @@
 import numpy as np
 import pyproj
 import rasterio
-
-from scipy.interpolate import LinearNDInterpolator
+from scipy.interpolate import LinearNDInterpolator, RBFInterpolator
 from scipy.ndimage import map_coordinates
 from scipy.spatial import cKDTree
-from scipy.interpolate import RBFInterpolator
 
-def interpolate_from_xyz(dat_path, vert, method="rbf", delimiter=None, rbf_function="multiquadric", epsilon=None):
+
+def interpolate_from_xyz(
+    dat_path,
+    vert,
+    method="rbf",
+    delimiter=None,
+    rbf_function="multiquadric",
+    epsilon=None,
+):
     """
     Interpolation of values from scattered (x, y, z, value) points at arbitrary 3D nodes.
 
@@ -39,7 +45,9 @@ def interpolate_from_xyz(dat_path, vert, method="rbf", delimiter=None, rbf_funct
     # --- Load data
     data = np.loadtxt(dat_path, delimiter=delimiter)
     if data.shape[1] < 4:
-        raise ValueError("The .dat file must contain at least four columns: x y z value")
+        raise ValueError(
+            "The .dat file must contain at least four columns: x y z value"
+        )
 
     x, y, z, val = data[:, 0], data[:, 1], data[:, 2], data[:, 3]
 
@@ -72,14 +80,8 @@ def interpolate_from_xyz(dat_path, vert, method="rbf", delimiter=None, rbf_funct
     return values_interp
 
 
-
 def interpolate_from_tiff(
-    tiff_path,
-    vert,
-    input_crs=None,
-    order=3,
-    mode="constant",
-    cval=np.nan
+    tiff_path, vert, input_crs=None, order=3, mode="constant", cval=np.nan
 ):
     """
     Fast interpolation of GeoTIFF values at mesh nodes (bicubic/bilinear).
@@ -110,7 +112,10 @@ def interpolate_from_tiff(
         nodata = src.nodata
         raster_crs = src.crs
 
-        if input_crs is not None and pyproj.CRS.from_user_input(input_crs) != raster_crs:
+        if (
+            input_crs is not None
+            and pyproj.CRS.from_user_input(input_crs) != raster_crs
+        ):
             transformer = pyproj.Transformer.from_crs(
                 input_crs, raster_crs, always_xy=True
             ).transform
@@ -128,3 +133,69 @@ def interpolate_from_tiff(
 
         return z
 
+
+def interpolate_from_xr(
+    ds,
+    vert,
+    input_crs=None,
+    order=3,
+    mode="constant",
+    cval=np.nan,
+    var_name="elevation",
+):
+    """
+    Fast interpolation of bathymetry values from an xarray.Dataset (e.g. GEBCO)
+    at given mesh nodes (bicubic/bilinear).
+
+    Parameters
+    ----------
+    ds : xarray.Dataset
+        Dataset with coordinates 'lat' and 'lon' and variable `var_name`.
+    vert : (N, 2) array
+        Node coordinates (x, y) in input CRS (e.g., UTM).
+    input_crs : str or pyproj.CRS, optional
+        CRS of input mesh. If None, assumes same as dataset CRS (EPSG:4326).
+    order : int, optional
+        Interpolation order (0=nearest, 1=bilinear, 3=bicubic). Default 3.
+    mode : str, optional
+        Boundary handling mode for map_coordinates. Default "constant".
+    cval : float, optional
+        Constant value outside domain if mode="constant". Default np.nan.
+    var_name : str, optional
+        Name of the variable in `ds` containing elevation values.
+
+    Returns
+    -------
+    z : (N,) array
+        Interpolated depth values at mesh nodes (positive for ocean depth).
+    """
+
+    # -----------------------extract coordinates and data
+    lon = ds["lon"].values
+    lat = ds["lat"].values
+    band = np.asarray(ds[var_name].values).astype(float)
+
+    # -----------------------prepare transformer (input CRS -> dataset CRS)
+    ds_crs = pyproj.CRS.from_user_input("EPSG:4326")
+    if input_crs is not None:
+        input_crs = pyproj.CRS.from_user_input(input_crs)
+    else:
+        input_crs = ds_crs
+
+    if input_crs != ds_crs:
+        transformer = pyproj.Transformer.from_crs(
+            input_crs, ds_crs, always_xy=True
+        ).transform
+        xs, ys = transformer(vert[:, 0], vert[:, 1])
+    else:
+        xs, ys = vert[:, 0], vert[:, 1]
+
+    # -----------------------compute pixel indices
+    # assuming regular lon/lat grid (sorted)
+    lon_idx = np.interp(xs, lon, np.arange(len(lon)))
+    lat_idx = np.interp(ys, lat, np.arange(len(lat)))
+
+    # -----------------------map_coordinates expects row (y) then col (x)
+    z = -map_coordinates(band, [lat_idx, lon_idx], order=order, mode=mode, cval=cval)
+
+    return z

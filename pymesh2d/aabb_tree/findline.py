@@ -100,7 +100,7 @@ def findline(pa, pb, pp, tree=None, options=None):
         tree = maketree(ab, options)
 
     # ---------------------  compute tree-to-vert mapping
-    tm = mapvert(tree, pp)
+    tm, _ = mapvert(tree, pp)
 
     # --------------------- compute intersection rel-tol
     p0 = np.min(np.vstack([pa, pb]), axis=0)

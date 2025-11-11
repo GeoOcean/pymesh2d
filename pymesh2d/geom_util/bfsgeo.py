@@ -1,7 +1,12 @@
 import numpy as np
 
+from pymesh2d.aabb_tree.findtria import findtria
+from pymesh2d.mesh_util.bfstri import bfstri
+from pymesh2d.mesh_util.deltri import deltri
+from pymesh2d.mesh_util.setset import setset
 
-def bfsgeo(node, PSLG, seed, deltri, findtria, bfstri, setset):
+
+def bfsgeo(node, edge, seed):
     """
     Partition polygonal geometry into regions using a breadth-first search.
 
@@ -56,26 +61,26 @@ def bfsgeo(node, PSLG, seed, deltri, findtria, bfstri, setset):
     # ---------------- basic checks
     if not (
         isinstance(node, np.ndarray)
-        and isinstance(PSLG, np.ndarray)
+        and isinstance(edge, np.ndarray)
         and isinstance(seed, np.ndarray)
     ):
         raise TypeError("bfsgeo: incorrect input class")
 
-    if node.ndim != 2 or PSLG.ndim != 2 or seed.ndim != 2:
+    if node.ndim != 2 or edge.ndim != 2 or seed.ndim != 2:
         raise ValueError("bfsgeo: incorrect dimensions")
 
-    if node.shape[1] != 2 or PSLG.shape[1] != 2 or seed.shape[1] != 2:
+    if node.shape[1] != 2 or edge.shape[1] != 2 or seed.shape[1] != 2:
         raise ValueError("bfsgeo: incorrect dimensions")
 
     nnod = node.shape[0]
-    _nedg = PSLG.shape[0]
+    _nedg = edge.shape[0]
 
     # ---------------- basic checks on indices
-    if PSLG.min() < 1 or PSLG.max() > nnod:
+    if edge.min() < 0 or edge.max() > nnod:
         raise ValueError("bfsgeo: invalid EDGE input array")
 
     # ---------------- assemble full CDT
-    node, PSLG, tria = deltri(node, PSLG)
+    node, edge, tria = deltri(node, edge)
 
     # ---------------- find seeds in CDT
     sptr, stri = findtria(node, tria, seed)
@@ -88,7 +93,7 @@ def bfsgeo(node, PSLG, seed, deltri, findtria, bfstri, setset):
 
     for ipos in range(itri.shape[0]):
         # --- BFS about current tria
-        mark = bfstri(PSLG, tria, itri[ipos])
+        mark = bfstri(edge, tria, itri[ipos])
 
         # --- match tria/poly edges
         edge = np.vstack(
@@ -96,7 +101,7 @@ def bfsgeo(node, PSLG, seed, deltri, findtria, bfstri, setset):
         )
 
         edge = np.sort(edge, axis=1)
-        PSLG_sorted = np.sort(PSLG, axis=1)
+        PSLG_sorted = np.sort(edge, axis=1)
 
         same, epos = setset(edge[:, :2], PSLG_sorted)
 
@@ -115,4 +120,4 @@ def bfsgeo(node, PSLG, seed, deltri, findtria, bfstri, setset):
         # --- select singly-matched edges
         part.append(epos[eptr[:-1][enum == 1]])
 
-    return node, PSLG, part
+    return node, edge, part
