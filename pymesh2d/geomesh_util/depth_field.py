@@ -1,11 +1,11 @@
-from scipy.interpolate import NearestNDInterpolator, LinearNDInterpolator
-from rasterio.transform import rowcol
 import numpy as np
 import pyproj
 import rasterio
+from rasterio.transform import rowcol
+from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 
 
-def make_depth_field_from_dat(dat_path, interp_method="linear", delimiter=None):
+def depth_field_from_dat(dat_path, interp_method="linear", delimiter=None):
     """
     Create a callable depth field from a .dat file containing x y z points.
     No projection handling — assumes all coordinates are in the same system.
@@ -63,7 +63,7 @@ def make_depth_field_from_dat(dat_path, interp_method="linear", delimiter=None):
     return depth_field
 
 
-def make_depth_field_from_tif(tiff_path, input_crs):
+def depth_field_from_tif(tiff_path, input_crs):
     """
     Create a callable depth field from a GeoTIFF bathymetry file,
     automatically reprojecting UTM coordinates to the raster CRS.
@@ -120,6 +120,65 @@ def make_depth_field_from_tif(tiff_path, input_crs):
         # Sample depths
         depth = -band[rows, cols]
         depth = np.where(depth == nodata, np.nan, depth)
+        return depth
+
+    return depth_field
+
+
+def depth_field_from_xr(ds, input_crs, output_crs, var_name="elevation"):
+    """
+    Create a callable depth field from an xarray.Dataset (bathymetry grid),
+    reprojecting coordinates from dataset CRS to the desired output CRS.
+
+    Parameters
+    ----------
+    ds : xarray.Dataset
+        Dataset containing bathymetry (e.g. GEBCO subset) with coordinates (lat, lon).
+    input_crs : str or pyproj.CRS
+        CRS of the dataset coordinates (e.g. 'EPSG:4326' for lat/lon).
+    output_crs : str or pyproj.CRS
+        CRS in which the depth field will be queried (e.g. 'EPSG:32630' for UTM zone 30N).
+    var_name : str, optional
+        Name of the variable in the dataset containing elevation data (default 'elevation').
+
+    Returns
+    -------
+    depth_field : function
+        Callable: depth_field(xy) -> depth values (m)
+        where xy is an array of shape (N, 2) with [x, y] coordinates in `output_crs`.
+    """
+
+    # -----------------------extract lon/lat grid and data
+    lon = ds["lon"].values
+    lat = ds["lat"].values
+    z = np.asarray(ds[var_name].values)
+
+    # -----------------------prepare transformers
+    input_crs = pyproj.CRS.from_user_input(input_crs)
+    output_crs = pyproj.CRS.from_user_input(output_crs)
+    to_ds = pyproj.Transformer.from_crs(output_crs, input_crs, always_xy=True)
+
+    # -----------------------closure function
+    def depth_field(xy):
+        """
+        Returns interpolated depth (nearest neighbor) at given coordinates.
+        xy : (N, 2) array in output_crs (e.g., UTM)
+        """
+        xs, ys = xy[:, 0], xy[:, 1]
+
+        # -----------------------reproject query points to dataset CRS
+        lon_q, lat_q = to_ds.transform(xs, ys)
+
+        # -----------------------find nearest indices
+        lon_idx = np.searchsorted(lon, lon_q, side="left")
+        lat_idx = np.searchsorted(lat, lat_q, side="left")
+
+        lon_idx = np.clip(lon_idx, 0, len(lon) - 1)
+        lat_idx = np.clip(lat_idx, 0, len(lat) - 1)
+
+        # -----------------------sample depth (depth = -elevation)
+        depth = z[lat_idx, lon_idx]
+
         return depth
 
     return depth_field

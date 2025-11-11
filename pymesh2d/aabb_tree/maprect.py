@@ -102,13 +102,20 @@ def partrect(pr, b1, b2):
     j1 = np.ones(pr.shape[0], dtype=bool)
     j2 = np.ones(pr.shape[0], dtype=bool)
 
-    nd = b1.shape[1] // 2
-
-    for ax in range(nd):
-        # -------------- remains TRUE if inside bounds along axis AX
-        j1 = j1 & (pr[:, ax + nd] >= b1[ax]) & (pr[:, ax] <= b1[ax + nd])
-
-        # -------------- remains TRUE if inside bounds along axis AX
-        j2 = j2 & (pr[:, ax + nd] >= b2[ax]) & (pr[:, ax] <= b2[ax + nd])
+    # Handle both 1D and 2D arrays for b1 and b2
+    # In MATLAB, b1 and b2 are row vectors (1D), but indexing works the same
+    if b1.ndim == 1:
+        nd = b1.shape[0] // 2
+        for ax in range(nd):
+            # -------------- remains TRUE if inside bounds along axis AX
+            # MATLAB: b1(ax+nd*0) and b1(ax+nd*1)
+            j1 = j1 & (pr[:, ax + nd] >= b1[ax]) & (pr[:, ax] <= b1[ax + nd])
+            j2 = j2 & (pr[:, ax + nd] >= b2[ax]) & (pr[:, ax] <= b2[ax + nd])
+    else:
+        nd = b1.shape[1] // 2
+        for ax in range(nd):
+            # -------------- remains TRUE if inside bounds along axis AX
+            j1 = j1 & (pr[:, ax + nd] >= b1[0, ax]) & (pr[:, ax] <= b1[0, ax + nd])
+            j2 = j2 & (pr[:, ax + nd] >= b2[0, ax]) & (pr[:, ax] <= b2[0, ax + nd])
 
     return j1, j2
