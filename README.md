@@ -1,6 +1,19 @@
-## `pymesh2D: Delaunay-based mesh generation in Python`
+<table style="border: none; border-collapse: collapse; width: 100%;">
+<tr style="border: none;">
+<td style="border: none; width: 180px; vertical-align: middle; text-align: center;">
+  <img src="assets/mesh_geocean.webp" alt="pymesh2D logo" width="160">
+</td>
+<td style="border: none; vertical-align: middle; padding-left: 20px;">
 
-`pymesh2D` is a `Python`-based unstructured mesh-generator for two-dimensional polygonal geometries, providing a range of relatively simple, yet effective two-dimensional meshing algorithms. `pymesh2D` includes variations on the "classical" Delaunay refinement technique, a new "Frontal"-Delaunay refinement scheme, a non-linear mesh optimisation method, and auxiliary mesh and geometry pre- and post-processing facilities. 
+<h2><code>pymesh2D: Delaunay-based mesh generation in Python</code></h2>
+
+<p>
+<b>pymesh2D</b> is a <code>Python</code>-based unstructured mesh generator for two-dimensional polygonal geometries, providing a range of relatively simple, yet effective two-dimensional meshing algorithms. It includes variations on the "classical" Delaunay refinement technique, a new "Frontal"-Delaunay refinement scheme, a non-linear mesh optimisation method, and auxiliary mesh and geometry pre- and post-processing facilities.
+</p>
+
+</td>
+</tr>
+</table>
 
 ### This code is a translation of <a href="https://github.com/dengwirda/mesh2d">`MESH2D`</a>, a `MATLAB` / `OCTAVE`-based tool developed by Darren Engwirda.
 
@@ -16,6 +29,7 @@ Algorithms implemented in `pymesh2D` are "provably-good" - ensuring convergence,
     ├── pymesh2d      --      core pymesh2D library functions. See refine, smooth, tridemo etc.
     ├── pymesh2d/aabb_tree -- support for fast spatial indexing, via tree-based data-structures.
     ├── pymesh2d/geom_util -- geometry processing, repair, etc.
+    ├── pymesh2d/geomesh_util mesh gestion, export interpolation, etc.
     ├── pymesh2d/hfun_util -- mesh-spacing definitions, limiters, etc.
     ├── pymesh2d/hjac_util -- solver for Hamilton-Jacobi eqn's.
     ├── pymesh2d/mesh_ball -- circumscribing balls, orthogonal balls etc.
