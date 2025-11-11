@@ -1,9 +1,9 @@
-<table>
-<tr>
-<td width="180" align="center">
+<table style="border: none; border-collapse: collapse; width: 100%;">
+<tr style="border: none;">
+<td style="border: none; width: 180px; vertical-align: middle; text-align: center;">
   <img src="assets/mesh_geocean.webp" alt="pymesh2D logo" width="160">
 </td>
-<td>
+<td style="border: none; vertical-align: middle; padding-left: 20px;">
 
 <h2><code>pymesh2D: Delaunay-based mesh generation in Python</code></h2>
 
