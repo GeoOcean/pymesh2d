@@ -57,6 +57,7 @@ to install the package in **developer mode**. Remember to change the name of `py
     python -m pymesh2d.tridemo  9; % larger-scale problem, mesh refinement + optimisation. 
     python -m pymesh2d.tridemo 10; % medium-scale problem, mesh refinement + optimisation. 
 
+More examples available in [`examples/`](examples).
 
 ### `References`
 
