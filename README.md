@@ -1,19 +1,10 @@
-<table style="border: none; border-collapse: collapse; width: 100%;">
-<tr style="border: none;">
-<td style="border: none; width: 180px; vertical-align: middle; text-align: center;">
-  <img src="assets/mesh_geocean.webp" alt="pymesh2D logo" width="160">
-</td>
-<td style="border: none; vertical-align: middle; padding-left: 20px;">
-
-<h2><code>pymesh2D: Delaunay-based mesh generation in Python</code></h2>
-
-<p>
-<b>pymesh2D</b> is a <code>Python</code>-based unstructured mesh generator for two-dimensional polygonal geometries, providing a range of relatively simple, yet effective two-dimensional meshing algorithms. It includes variations on the "classical" Delaunay refinement technique, a new "Frontal"-Delaunay refinement scheme, a non-linear mesh optimisation method, and auxiliary mesh and geometry pre- and post-processing facilities.
+<p align="center">
+  <img src="assets/mesh_geocean.webp" alt="pymesh2D logo" width="120">
 </p>
 
-</td>
-</tr>
-</table>
+## `pymesh2D: Delaunay-based mesh generation in Python`
+
+`pymesh2D` is a `Python`-based unstructured mesh-generator for two-dimensional polygonal geometries, providing a range of relatively simple, yet effective two-dimensional meshing algorithms. `pymesh2D` includes variations on the "classical" Delaunay refinement technique, a new "Frontal"-Delaunay refinement scheme, a non-linear mesh optimisation method, and auxiliary mesh and geometry pre- and post-processing facilities. 
 
 ### This code is a translation of <a href="https://github.com/dengwirda/mesh2d">`MESH2D`</a>, a `MATLAB` / `OCTAVE`-based tool developed by Darren Engwirda.
 
