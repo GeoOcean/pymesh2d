@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/mesh_geocean.webp" alt="pymesh2D logo" width="80">
+  <img src="assets/mesh_geocean.webp" alt="pymesh2D logo" width="120">
 </p>
 
 ## `pymesh2D: Delaunay-based mesh generation in Python`
