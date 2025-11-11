@@ -38,23 +38,10 @@ Algorithms implemented in `pymesh2D` are "provably-good" - ensuring convergence,
 You can install **`pymesh2d`** using **pip**:
 
 ```bash
-pip install pymesh2d
-```
-
-Or using **conda**:
-
-```bash
-conda install -c conda-forge pymesh2d
-```
-
-Alternatively, after downloading and unzipping the current <a href="https://github.com/GeoOcean/pymesh2d/archive/master.zip">repository</a>,  
-navigate to the installation directory and run:
-
-```bash
 pip install -e .
 ```
 
-to install the package in **developer mode**.
+to install the package in **developer mode**. Remember to change the name of `pyproject.toml` to `pyproject.toml.bak`.
 
 ### Examples
 

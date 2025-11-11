@@ -34,14 +34,10 @@ dependencies = [
     "numpy",
     "scipy",
     "matplotlib",
-    "os",
-    "typing",
-    "sys",
-    "math",
-    "time",
     "netCDF4",
     "rasterio",
     "mpl_toolkits",
+    "xarray",
 ]
 
 [project.optional-dependencies]
