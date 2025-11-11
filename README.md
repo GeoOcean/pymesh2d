@@ -1,8 +1,7 @@
-<p align="center">
-  <img src="assets/mesh_geocean.webp" alt="pymesh2D logo" width="180">
-</p>
-
-## `pymesh2D: Delaunay-based mesh generation in Python`
+<h2>
+  <img src="assets/mesh_geocean.webp" alt="pymesh2D logo" width="60" style="vertical-align: middle; margin-right: 10px;">
+  `pymesh2D: Delaunay-based mesh generation in Python`
+</h2>
 
 `pymesh2D` is a `Python`-based unstructured mesh-generator for two-dimensional polygonal geometries, providing a range of relatively simple, yet effective two-dimensional meshing algorithms. `pymesh2D` includes variations on the "classical" Delaunay refinement technique, a new "Frontal"-Delaunay refinement scheme, a non-linear mesh optimisation method, and auxiliary mesh and geometry pre- and post-processing facilities. 
 
