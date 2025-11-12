@@ -9,7 +9,7 @@ from .mesh_util.setset import setset
 from .mesh_util.tricon import tricon
 
 
-def smooth(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg=()):
+def smooth(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg=[]):
     """
     Perform "hill-climbing" mesh smoothing for two-dimensional 2-simplex triangulations.
 
@@ -415,7 +415,7 @@ def smooth(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, har
     return vert, conn, tria, tnum
 
 
-def evalhfn(vert, edge, EMAT, hfun=None, *harg):
+def evalhfn(vert, edge, EMAT, hfun=None, harg=[]):
     """
     Evaluate the mesh spacing function (spacing-function) at mesh vertices.
 

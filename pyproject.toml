@@ -38,6 +38,7 @@ dependencies = [
     "rasterio",
     "mpl_toolkits",
     "xarray",
+    "shapely",
 ]
 
 [project.optional-dependencies]

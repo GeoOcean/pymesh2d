@@ -26,6 +26,7 @@ setup(
         "rasterio",
         "mpl_toolkits",
         "xarray",
+        "shapely",
     ],
     classifiers=["Programming Language :: Python :: 3.3.7"],
     python_requires=">=3.7",  # Specify the Python version required
