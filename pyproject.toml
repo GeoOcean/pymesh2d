@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 [project]
 
 name = "pymesh2d"
-description = "Module collection..."
+description = "pymesh2D is a Python-based unstructured mesh-generator for two-dimensional polygonal geometries, providing a range of relatively simple, yet effective two-dimensional meshing algorithms."
 readme = "README.md"
 keywords = ["mesh"]
 license = { file = "LICENSE" }
