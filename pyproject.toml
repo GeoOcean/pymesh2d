@@ -35,7 +35,6 @@ dependencies = [
     "matplotlib",
     "netCDF4",
     "rasterio",
-    "mpl_toolkits",
     "xarray",
     "shapely",
 ]
