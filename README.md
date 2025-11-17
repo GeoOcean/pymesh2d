@@ -8,7 +8,7 @@
 
 ### This code is a translation of <a href="https://github.com/dengwirda/mesh2d">`MESH2D`</a>, a `MATLAB` / `OCTAVE`-based tool developed by Darren Engwirda.
 
-Algorithms implemented in `pymesh2D` are "provably-good" - ensuring convergence, geometrical and topological correctness, and providing guarantees on algorithm termination and worst-case element quality bounds. Support for user-defined "mesh-spacing" functions and "multi-part" geometry definitions is also provided, allowing `pymesh2D` to handle a wide range of complex domain types and user-defined constraints. `pymesh2D` typically generates very high-quality output, appropriate for a variety of finite-volume/element type applications.
+Algorithms implemented in `pymesh2D` are "probably-good" - ensuring convergence, geometrical and topological correctness, and providing guarantees on algorithm termination and worst-case element quality bounds. Support for user-defined "mesh-spacing" functions and "multi-part" geometry definitions is also provided, allowing `pymesh2D` to handle a wide range of complex domain types and user-defined constraints. `pymesh2D` typically generates very high-quality output, appropriate for a variety of finite-volume/element type applications.
 
 `pymesh2D` is a simplified version of my <a href="https://github.com/dengwirda/jigsaw-matlab/">`JIGSAW`</a> mesh-generation algorithm (a `C++` code). `pymesh2D` aims to provide a straightforward `Python` implementation of these Delaunay-based triangulation and mesh optimisation techniques. 
 
