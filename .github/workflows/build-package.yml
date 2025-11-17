@@ -31,7 +31,9 @@ jobs:
           GITHUB_ENV: ${{ github.env }}
 
       - name: Build Python Package
-        run: python -m build
+        run: |
+          rm -rf assets
+          python -m build
 
       - name: Publish to PyPI
         run: python -m twine upload dist/* --verbose
