@@ -17,18 +17,18 @@ Algorithms implemented in `pymesh2D` are "provably-good" - ensuring convergence,
 `pymesh2D` is a pure `Python` package, consisting of a core library + associated utilities:
 
     pymesh2D::
-    ├── pymesh2d      --      core pymesh2D library functions. See refine, smooth, tridemo etc.
-    ├── pymesh2d/aabb_tree -- support for fast spatial indexing, via tree-based data-structures.
-    ├── pymesh2d/geom_util -- geometry processing, repair, etc.
-    ├── pymesh2d/geomesh_util mesh gestion, export interpolation, etc.
-    ├── pymesh2d/hfun_util -- mesh-spacing definitions, limiters, etc.
-    ├── pymesh2d/hjac_util -- solver for Hamilton-Jacobi eqn's.
-    ├── pymesh2d/mesh_ball -- circumscribing balls, orthogonal balls etc.
-    ├── pymesh2d/mesh_cost -- mesh cost/quality functions, etc.
-    ├── pymesh2d/mesh_file -- mesh i/o via ASCII serialisation.
-    ├── pymesh2d/mesh_util -- meshing/triangulation utility functions.
-    ├── pymesh2d/poly_data -- polygon definitions for demo problems, etc.
-    └── pymesh2d/poly_test -- fast inclusion test for polygons.
+    ├── pymesh2d              -- core pymesh2D library functions. See refine, smooth, tridemo etc.
+    ├── pymesh2d/aabb_tree    -- support for fast spatial indexing, via tree-based data-structures.
+    ├── pymesh2d/geom_util    -- geometry processing, repair, etc.
+    ├── pymesh2d/geomesh_util -- mesh gestion, export interpolation, etc.
+    ├── pymesh2d/hfun_util    -- mesh-spacing definitions, limiters, etc.
+    ├── pymesh2d/hjac_util    -- solver for Hamilton-Jacobi eqn's.
+    ├── pymesh2d/mesh_ball    -- circumscribing balls, orthogonal balls etc.
+    ├── pymesh2d/mesh_cost    -- mesh cost/quality functions, etc.
+    ├── pymesh2d/mesh_file    -- mesh i/o via ASCII serialisation.
+    ├── pymesh2d/mesh_util    -- meshing/triangulation utility functions.
+    ├── pymesh2d/poly_data    -- polygon definitions for demo problems, etc.
+    └── pymesh2d/poly_test    -- fast inclusion test for polygons.
 
 
 ### `Quickstart`
@@ -40,8 +40,6 @@ You can install **`pymesh2d`** using **pip**:
 ```bash
 pip install -e .
 ```
-
-to install the package in **developer mode**. Remember to change the name of `pyproject.toml` to `pyproject.toml.bak`.
 
 ### Examples
 
@@ -57,7 +55,7 @@ to install the package in **developer mode**. Remember to change the name of `py
     python -m pymesh2d.tridemo  9; % larger-scale problem, mesh refinement + optimisation. 
     python -m pymesh2d.tridemo 10; % medium-scale problem, mesh refinement + optimisation. 
 
-More examples available in [`examples/`](examples).
+More examples available in [`BlueMath`]([examples](https://github.com/GeoOcean/BlueMath/tree/main/toolkit/mesh)).
 
 ### `References`
 
