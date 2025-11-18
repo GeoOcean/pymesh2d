@@ -1,8 +1,14 @@
+import warnings
+
 import numpy as np
 
 from ..mesh_ball.tribal2 import tribal2
 from ..mesh_cost.triarea import triarea
+from ..mesh_util.deltri import deltri
 from .tricon import tricon
+
+# Supprimer les RuntimeWarning
+warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 
 def circumcenters(vert, tria, edge, tria_6col):
@@ -296,7 +302,6 @@ def small_flow_links(vert, tria, edge, removesmalllinkstrsh=0.1, conn=None):
 
     if nlinktoosmall > 0:
         small_link_indices = internal_edge_indices[too_small]
-        print(f"\n{nlinktoosmall:5d} small flow links discarded")
     else:
         small_link_indices = np.array([], dtype=int)
 
@@ -373,3 +378,291 @@ def small_flow_centers(vert, tria, edge, removesmalllinkstrsh=0.1, conn=None):
     # ---------------------------------------------- return circumcenters
     # no exclusion of boundary triangles
     return xz[all_problem_triangles], nlinktoosmall
+
+
+def correct_small_flow_links(vert, tria, edge, small_link_indices, circumcenters_pos, 
+                              removesmalllinkstrsh=0.1, conn=None):
+    """
+    Compute vertex displacements and constrained triangle splits to correct small flow links.
+    
+    This function analyzes problematic flow links and determines:
+    1. Vertex displacements needed to separate circumcenters
+    2. Constrained triangles that need node insertion
+    
+    Parameters
+    ----------
+    VERT : ndarray of shape (V, 2)
+        XY coordinates of the vertices in the triangulation.
+    TRIA : ndarray of shape (T, 3)
+        Array of triangle vertex indices.
+    EDGE : ndarray of shape (E, 5)
+        Edge connectivity array from tricon: [V1, V2, T1, T2, CE].
+    SMALL_LINK_INDICES : ndarray
+        Array of edge indices that are too small.
+    CIRCUMCENTERS_POS : ndarray of shape (T, 2)
+        XY coordinates of circumcenters for each triangle.
+    REMOVESMALLLINKSTRSH : float, optional
+        Threshold for removing small links (default 0.1).
+    CONN : ndarray, optional
+        Constrained edges (vertices that cannot be moved).
+    
+    Returns
+    -------
+    VERTEX_DISPLACEMENTS : dict
+        Dictionary mapping vertex indices to displacement vectors.
+    VERTEX_COUNTS : dict
+        Dictionary mapping vertex indices to number of contributions.
+    CONSTRAINED_TRIANGLES_TO_SPLIT : set
+        Set of triangle indices that need node insertion.
+    NEW_VERTICES : list
+        List of new vertex coordinates to insert (barycenters of constrained triangles).
+    
+    Notes
+    -----
+    - For triangles with all constrained vertices, a new node is inserted at the barycenter.
+    - For triangles with free vertices, displacements are computed to separate circumcenters.
+    - Displacement magnitude is more aggressive when only one vertex is free.
+    """
+    from ..mesh_cost.triarea import triarea
+    
+    # Initialize outputs
+    vertex_displacements = {}
+    vertex_counts = {}
+    constrained_triangles_to_split = set()
+    
+    # Get constrained vertices
+    conn_flat = set(conn.flatten()) if conn is not None else set()
+    
+    # Compute triangle areas
+    tri_areas = np.abs(triarea(vert, tria))
+    
+    # Process each problematic link
+    problem_edges = edge[small_link_indices]
+    t1_indices = problem_edges[:, 2].astype(int)
+    t2_indices = problem_edges[:, 3].astype(int)
+    edge_vertices = problem_edges[:, 0:2].astype(int)
+    
+    valid_mask = (
+        (t1_indices >= 0) & (t1_indices < len(tria)) &
+        (t2_indices >= 0) & (t2_indices < len(tria))
+    )
+    
+    for idx in np.where(valid_mask)[0]:
+        t1_idx, t2_idx = t1_indices[idx], t2_indices[idx]
+        shared_v1, shared_v2 = edge_vertices[idx, 0], edge_vertices[idx, 1]
+        
+        # Identify opposite vertices
+        tri1_verts, tri2_verts = tria[t1_idx, :], tria[t2_idx, :]
+        opp1 = next((v for v in tri1_verts if v != shared_v1 and v != shared_v2), None)
+        opp2 = next((v for v in tri2_verts if v != shared_v1 and v != shared_v2), None)
+        
+        if opp1 is None or opp2 is None:
+            continue
+        
+        # Get circumcenters and compute link distance
+        cc1, cc2 = circumcenters_pos[t1_idx], circumcenters_pos[t2_idx]
+        cc_diff = cc2 - cc1
+        link_distance = max(np.linalg.norm(cc_diff), 1e-12)
+        
+        # Compute threshold
+        area1, area2 = max(tri_areas[t1_idx], 1e-12), max(tri_areas[t2_idx], 1e-12)
+        sqrt_ba = np.sqrt(area1) + np.sqrt(area2)
+        if sqrt_ba < 1e-12:
+            continue
+        
+        dxlim = 0.9 * removesmalllinkstrsh * 0.5 * sqrt_ba
+        if link_distance >= dxlim:
+            continue
+        
+        needed_distance = (dxlim - link_distance) * 5.0
+        
+        # Compute separation direction
+        if link_distance < 1e-12:
+            edge_vec = vert[shared_v2] - vert[shared_v1]
+            edge_len = np.linalg.norm(edge_vec)
+            if edge_len < 1e-12:
+                continue
+            cc_dir = np.array([-edge_vec[1], edge_vec[0]]) / edge_len
+        else:
+            cc_dir = cc_diff / link_distance
+        
+        # Check if vertices are free
+        opp1_free = opp1 not in conn_flat
+        opp2_free = opp2 not in conn_flat
+        
+        if not opp1_free and not opp2_free:
+            # All constrained: mark smaller triangle for node insertion
+            if area1 < area2:
+                constrained_triangles_to_split.add(t1_idx)
+            else:
+                constrained_triangles_to_split.add(t2_idx)
+            continue
+        
+        # Compute displacement magnitude (more aggressive if only one vertex is free)
+        displacement_magnitude = needed_distance * (10.0 if (opp1_free != opp2_free) else 1.0)
+        
+        # Accumulate displacements
+        if opp1_free:
+            if opp1 not in vertex_displacements:
+                vertex_displacements[opp1] = np.zeros(2)
+                vertex_counts[opp1] = 0
+            vertex_displacements[opp1] -= cc_dir * displacement_magnitude * 0.5
+            vertex_counts[opp1] += 1
+        
+        if opp2_free:
+            if opp2 not in vertex_displacements:
+                vertex_displacements[opp2] = np.zeros(2)
+                vertex_counts[opp2] = 0
+            vertex_displacements[opp2] += cc_dir * displacement_magnitude * 0.5
+            vertex_counts[opp2] += 1
+    
+    # Compute new vertices for constrained triangles
+    new_vertices = []
+    for tri_idx in constrained_triangles_to_split:
+        if 0 <= tri_idx < len(tria):
+            tri_verts = tria[tri_idx, :]
+            if np.all((0 <= tri_verts) & (tri_verts < len(vert))):
+                center = np.mean(vert[tri_verts, :], axis=0)
+                if np.all(np.isfinite(center)):
+                    new_vertices.append(center)
+    
+    return vertex_displacements, vertex_counts, constrained_triangles_to_split, new_vertices
+
+
+def fix_small_flow_links(vert, conn, tria, tnum, node, PSLG, part, opts):
+    """
+    Fix all small flow links in the mesh through iterative correction.
+    
+    This function iteratively identifies and corrects small flow links by:
+    1. Moving free vertices to separate circumcenters
+    2. Inserting nodes in constrained triangles
+    3. Deleting problematic triangles if stagnation occurs
+    
+    Parameters
+    ----------
+    VERT : ndarray of shape (V, 2)
+        XY coordinates of the vertices.
+    CONN : ndarray of shape (E, 2)
+        Constrained edges.
+    TRIA : ndarray of shape (T, 3)
+        Array of triangle vertex indices.
+    TNUM : ndarray of shape (T,)
+        Array of part indices.
+    NODE : ndarray
+        Node coordinates (for deltri).
+    PSLG : ndarray
+        Planar Straight Line Graph (for deltri).
+    PART : dict
+        Partition information (for deltri).
+    OPTS : dict
+        Options dictionary with 'removesmalllinkstrsh' and 'disp' keys.
+    
+    Returns
+    -------
+    VERT : ndarray
+        Modified vertex coordinates.
+    CONN : ndarray
+        Modified constrained edges.
+    TRIA : ndarray
+        Modified triangles.
+    TNUM : ndarray
+        Modified part indices.
+    """
+    from ..mesh_cost.triarea import triarea
+    from .tricon import tricon
+    
+    max_fix_iter = 100
+    removesmalllinkstrsh = opts.get("removesmalllinkstrsh", 0.1)
+    fix_iter = 0
+    stagnation_count = 0
+    
+    for fix_iter in range(max_fix_iter):
+        # Reconstruire la connectivité pour vérifier
+        edge_fix, tria_6col_fix = tricon(tria, conn)
+        
+        # Vérifier s'il y a des small flow links
+        nlinktoosmall, small_link_indices = small_flow_links(
+            vert, tria, edge_fix, removesmalllinkstrsh, conn
+        )
+        
+        if nlinktoosmall == 0:
+            break
+        
+        # Si on stagne trop, supprimer directement les triangles problématiques
+        if stagnation_count >= 3 or (nlinktoosmall <= 3 and fix_iter > 5):
+            problem_edges = edge_fix[small_link_indices]
+            t1_indices = problem_edges[:, 2].astype(int)
+            t2_indices = problem_edges[:, 3].astype(int)
+            
+            problem_triangles = set()
+            valid_mask = (
+                (t1_indices >= 0) & (t1_indices < len(tria)) &
+                (t2_indices >= 0) & (t2_indices < len(tria))
+            )
+            
+            tri_areas_simple = np.abs(triarea(vert, tria))
+            for idx in np.where(valid_mask)[0]:
+                t1_idx, t2_idx = t1_indices[idx], t2_indices[idx]
+                if tri_areas_simple[t1_idx] < tri_areas_simple[t2_idx]:
+                    problem_triangles.add(t1_idx)
+                else:
+                    problem_triangles.add(t2_idx)
+            
+            if len(problem_triangles) > 0:
+                problem_triangles = np.array(list(problem_triangles))
+                keep_triangles = np.ones(len(tria), dtype=bool)
+                keep_triangles[problem_triangles] = False
+                tria = tria[keep_triangles, :]
+                if len(tnum) == len(keep_triangles):
+                    tnum = tnum[keep_triangles]
+                vert, conn, tria, tnum = deltri(vert, conn, node, PSLG, part)
+                tria = tria[:, 0:3]
+                stagnation_count = 0
+                continue
+        
+        # Calculer les circumcenters
+        bb_fix = circumcenters(vert, tria, edge_fix, tria_6col_fix)
+        circumcenters_pos = bb_fix[:, 0:2]
+        if not np.all(np.isfinite(circumcenters_pos).all(axis=1)):
+            stagnation_count += 1
+            continue
+        
+        # Calculer les déplacements et les triangles à diviser
+        vertex_displacements, vertex_counts, constrained_triangles_to_split, new_vertices = \
+            correct_small_flow_links(
+                vert, tria, edge_fix, small_link_indices, circumcenters_pos,
+                removesmalllinkstrsh, conn
+            )
+        
+        # Insérer des nœuds au centre des triangles entièrement contraints
+        if len(new_vertices) > 0:
+            vert = np.vstack([vert, np.array(new_vertices)])
+            vert, conn, tria, tnum = deltri(vert, conn, node, PSLG, part)
+            tria = tria[:, 0:3]
+            stagnation_count = 0
+            continue
+        
+        # Appliquer les déplacements
+        if len(vertex_displacements) > 0:
+            conn_flat = set(conn.flatten())
+            for v_idx, disp in vertex_displacements.items():
+                if v_idx not in conn_flat and 0 <= v_idx < len(vert):
+                    count = max(vertex_counts.get(v_idx, 1), 1)
+                    relaxation = min(2.0 + 0.1 * fix_iter, 10.0)
+                    vert[v_idx] += (disp / count) * relaxation
+            
+            vert, conn, tria, tnum = deltri(vert, conn, node, PSLG, part)
+            tria = tria[:, 0:3]
+            stagnation_count = 0
+        else:
+            stagnation_count += 1
+            if stagnation_count >= 2:
+                continue
+    
+    # Vérification finale
+    edge_final, _ = tricon(tria, conn)
+    nlinktoosmall_final, _ = small_flow_links(
+        vert, tria, edge_final, removesmalllinkstrsh, conn
+    )
+    
+    return vert, conn, tria, tnum
