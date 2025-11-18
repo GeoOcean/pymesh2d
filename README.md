@@ -35,7 +35,13 @@ Algorithms implemented in `pymesh2D` are "probably-good" - ensuring convergence,
 
 ### Installation
 
-You can install **`pymesh2d`** using **pip**:
+You can install **`pymesh2d`** directly from PyPI:
+
+```bash
+pip install pymesh2d
+```
+
+If you want to install it in *developer mode* (for local development and contribution):
 
 ```bash
 pip install -e .
@@ -55,7 +61,7 @@ pip install -e .
     python -m pymesh2d.tridemo  9; % larger-scale problem, mesh refinement + optimisation. 
     python -m pymesh2d.tridemo 10; % medium-scale problem, mesh refinement + optimisation. 
 
-More examples available in [`BlueMath`]([examples](https://github.com/GeoOcean/BlueMath/tree/main/toolkit/mesh)).
+More examples available in [`BlueMath`](https://github.com/GeoOcean/BlueMath/tree/main/toolkit/mesh).
 
 ### `References`
 
