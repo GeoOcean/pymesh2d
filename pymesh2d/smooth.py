@@ -1,12 +1,16 @@
 import time
+import warnings
 
 import numpy as np
 from scipy.sparse import csr_matrix
 
 from .mesh_cost.triscr import triscr
 from .mesh_util.deltri import deltri
+from .mesh_util.circo import fix_small_flow_links
 from .mesh_util.setset import setset
 from .mesh_util.tricon import tricon
+
+warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 
 def smooth(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg=[]):
@@ -367,6 +371,12 @@ def smooth(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, har
         ttic = time.time()
         vert, conn, tria, tnum = deltri(vert, conn, node, PSLG, part)
         tcpu["dtri"] += time.time() - ttic
+
+        # ------------------------------------- fix small flow links
+        if "removesmalllinkstrsh" in opts:
+            vert, conn, tria, tnum = fix_small_flow_links(
+                vert, conn, tria, tnum, node, PSLG, part, opts
+            )
 
         # ------------------------------------- dump-out progress
         vdel = vdel / (hvrt.flatten() ** 2)
