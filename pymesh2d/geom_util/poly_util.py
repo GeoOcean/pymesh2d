@@ -25,19 +25,39 @@ def resample_polygon(polygon, spacing: float):
         # keep largest polygon only
         polygon = max(polygon.geoms, key=lambda p: p.area)
 
-    # -----------------------resample exterior ring
+    def resample_line(coords, spacing):
+        coords = np.asarray(coords)
+        if not np.allclose(coords[0], coords[-1]):
+            coords = np.vstack([coords, coords[0]])  # close ring if open
+        dists = np.cumsum(np.r_[0, np.sqrt(((coords[1:] - coords[:-1]) ** 2).sum(1))])
+        if dists[-1] == 0:
+            return coords
+        new_d = np.arange(0, dists[-1], spacing)
+        x = np.interp(new_d, dists, coords[:, 0])
+        y = np.interp(new_d, dists, coords[:, 1])
+        return np.c_[x, y]
+
+    # ---- Exterior ----
     exterior = np.asarray(polygon.exterior.coords)
-    exterior_resampled = _resample_closed_line(exterior, spacing)
+    exterior_resampled = resample_line(exterior, spacing)
 
-    # -----------------------resample interior rings (holes)
+    if len(exterior_resampled) < 4:
+        raise ValueError("Exterior ring too short to form a polygon")
+
+    # ---- Interiors ----
     interiors_resampled = []
-    for hole in polygon.interiors:
-        coords = np.asarray(hole.coords)
-        hole_resampled = _resample_closed_line(coords, spacing)
-        interiors_resampled.append(hole_resampled)
+    for interior in polygon.interiors:
+        ring = np.asarray(interior.coords)
+        ring_resampled = resample_line(ring, spacing)
+        if len(ring_resampled) >= 4:
+            interiors_resampled.append(ring_resampled)
 
-    # -----------------------build new polygon
+    # ---- Construct polygon safely ----
     poly_new = Polygon(exterior_resampled, interiors_resampled)
+
+    # ---- Fix geometry if invalid (self-intersection, etc.) ----
+    if not poly_new.is_valid:
+        poly_new = poly_new.buffer(0)
 
     return poly_new
 

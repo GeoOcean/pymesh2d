@@ -177,7 +177,7 @@ def depth_field_from_xr(ds, input_crs, output_crs, var_name="elevation"):
         lat_idx = np.clip(lat_idx, 0, len(lat) - 1)
 
         # -----------------------sample depth (depth = -elevation)
-        depth = z[lat_idx, lon_idx]
+        depth = -z[lat_idx, lon_idx]
 
         return depth
 
