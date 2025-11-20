@@ -63,7 +63,7 @@ def depth_field_from_dat(dat_path, interp_method="linear", delimiter=None):
     return depth_field
 
 
-def depth_field_from_tif(tiff_path, input_crs):
+def depth_field_from_tif(tiff_path, output_crs):
     """
     Create a callable depth field from a GeoTIFF bathymetry file,
     automatically reprojecting UTM coordinates to the raster CRS.
@@ -90,10 +90,10 @@ def depth_field_from_tif(tiff_path, input_crs):
     raster_crs = dataset.crs
 
     # --- Prepare coordinate transformer (UTM -> raster CRS)
-    input_crs = pyproj.CRS.from_user_input(input_crs)
-    if raster_crs != input_crs:
+    output_crs = pyproj.CRS.from_user_input(output_crs)
+    if raster_crs != output_crs:
         transformer = pyproj.Transformer.from_crs(
-            input_crs, raster_crs, always_xy=True
+            output_crs, raster_crs, always_xy=True
         ).transform
     else:
         transformer = None
@@ -102,7 +102,7 @@ def depth_field_from_tif(tiff_path, input_crs):
     def depth_field(xy):
         """
         Returns interpolated depth (nearest) at given coordinates.
-        xy : (N, 2) array in input_crs (e.g., UTM)
+        xy : (N, 2) array in output_crs (e.g., UTM)
         """
         xs, ys = xy[:, 0], xy[:, 1]
 
