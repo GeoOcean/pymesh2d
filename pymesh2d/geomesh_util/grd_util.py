@@ -487,15 +487,17 @@ def plot_grd(filename, ax=None, show_boundaries=True):
         fig, ax = plt.subplots(figsize=(9, 8))
 
     facecolors = np.mean(vert[:, 2][tria], axis=1)
-    ax.tripcolor(
+    pm = ax.tripcolor(
         vert[:, 0],
         vert[:, 1],
         tria,
         facecolors=facecolors,
         edgecolors="k",
         lw=0.2,
-        cmap="viridis",
+        cmap="summer",
     )
+    plt.colorbar(pm, ax=ax, label="Depth/Elevation")
+
 
     for i, b in enumerate(open_boundaries):
         ax.plot(
@@ -517,5 +519,4 @@ def plot_grd(filename, ax=None, show_boundaries=True):
     ax.set_xlabel("Longitude [°]")
     ax.set_ylabel("Latitude [°]")
     ax.set_title(f"Mesh preview: {filename}")
-    ax.grid(True, ls="--", lw=0.3)
     ax.legend(loc="best", frameon=True)

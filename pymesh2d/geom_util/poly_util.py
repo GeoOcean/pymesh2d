@@ -1,5 +1,5 @@
 import numpy as np
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, LineString
 
 
 def resample_polygon(polygon, spacing: float):
@@ -61,34 +61,87 @@ def resample_polygon(polygon, spacing: float):
 
     return poly_new
 
+def resample_polygon_iterate(polygon: Polygon, spacing: float) -> Polygon:
+    if spacing <= 0:
+        raise ValueError("spacing must be positive")
+    
+    if polygon.geom_type == "MultiPolygon":
+        polygon = max(polygon.geoms, key=lambda p: p.area)
+    
+    def resample_ring_optimal(ring_coords, min_spacing):
+        coords = np.asarray(ring_coords, dtype=np.float64)
+        
+        if len(coords) > 1 and np.allclose(coords[0], coords[-1], rtol=1e-10):
+            coords = coords[:-1]
+        
+        if len(coords) < 2:
+            return coords
+        
+        line = LineString(coords)
+        total_length = line.length
+        
+        # if total_length < min_spacing:
+        #     if len(coords) >= 4:
+        #         return coords
+        #     else:
+        #         return np.vstack([coords, coords[0]])
+        
+        max_segments = int(np.floor(total_length / min_spacing))
+        
+        if max_segments < 1:
+            max_segments = 1
+        
+        actual_spacing = total_length / max_segments
+        
+        n_points = max_segments + 1
+        distances = np.linspace(0, total_length, n_points, endpoint=True)
+        
+        new_coords = np.array([line.interpolate(d).coords[0] for d in distances])
+        
+        if not np.allclose(new_coords[0], new_coords[-1], rtol=1e-10):
+            new_coords[-1] = new_coords[0]
+        
+        diffs = np.diff(new_coords, axis=0)
+        segment_lengths = np.linalg.norm(diffs, axis=1)
+        
+        if len(segment_lengths) > 0:
+            min_seg_length = np.min(segment_lengths)
+            
+            if min_seg_length < min_spacing * 0.999:
+                max_segments = int(np.floor(total_length / min_spacing)) - 1
+                if max_segments < 1:
+                    max_segments = 1
+                actual_spacing = total_length / max_segments
+                distances = np.linspace(0, total_length, max_segments + 1, endpoint=True)
+                new_coords = np.array([line.interpolate(d).coords[0] for d in distances])
+                if not np.allclose(new_coords[0], new_coords[-1], rtol=1e-10):
+                    new_coords[-1] = new_coords[0]
+        
+        return new_coords
+    
+    exterior_coords = np.asarray(polygon.exterior.coords)
+    exterior_resampled = resample_ring_optimal(exterior_coords, spacing)
+    
+    if len(exterior_resampled) < 4:
+        raise ValueError("Exterior ring too short after resampling")
+    
+    interiors_resampled = []
+    for interior in polygon.interiors:
+        ring_coords = np.asarray(interior.coords)
+        ring_resampled = resample_ring_optimal(ring_coords, spacing)
+        
+        if len(ring_resampled) >= 4:
+            interiors_resampled.append(ring_resampled)
+    
+    poly_new = Polygon(exterior_resampled, interiors_resampled)
+    
+    if not poly_new.is_valid:
+        poly_new = poly_new.buffer(0)
+    
+    return poly_new
 
-# -----------------------helper: resample a closed line
-def _resample_closed_line(line, spacing):
-    # ensure ring is closed
-    if not np.allclose(line[0], line[-1]):
-        line = np.vstack([line, line[0]])
 
-    # cumulative distances
-    seglen = np.hypot(np.diff(line[:, 0]), np.diff(line[:, 1]))
-    dist = np.insert(np.cumsum(seglen), 0, 0)
-    total = dist[-1]
-    if total == 0:
-        return line
-
-    # uniformly spaced distances
-    new_d = np.arange(0, total, spacing)
-    x_new = np.interp(new_d, dist, line[:, 0])
-    y_new = np.interp(new_d, dist, line[:, 1])
-
-    # close explicitly
-    resampled = np.column_stack((x_new, y_new))
-    if not np.allclose(resampled[0], resampled[-1]):
-        resampled = np.vstack([resampled, resampled[0]])
-
-    return resampled
-
-
-def buffer_area_for_polygon(polygon: Polygon, area_factor: float) -> Polygon:
+def buffer_area(polygon: Polygon, area_factor: float) -> Polygon:
     """
     Buffer the polygon by a factor of its area divided by its length.
     This is a heuristic to ensure that the buffer is proportional to the size of the polygon.
