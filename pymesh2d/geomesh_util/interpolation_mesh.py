@@ -2,7 +2,7 @@ import numpy as np
 import pyproj
 import rasterio
 from scipy.interpolate import LinearNDInterpolator, RBFInterpolator
-from scipy.ndimage import map_coordinates
+from scipy.ndimage import map_coordinates, distance_transform_edt
 from scipy.spatial import cKDTree
 
 
@@ -107,10 +107,22 @@ def interpolate_from_tiff(
         Interpolated raster values at mesh nodes.
     """
     with rasterio.open(tiff_path) as src:
-        band = src.read(1).astype(float)
+        band = src.read(1).astype(np.float64)
         transform = src.transform
-        nodata = src.nodata
         raster_crs = src.crs
+        nodata = src.nodata
+
+        if nodata is not None:
+            band = np.where(band == nodata, np.nan, band)
+        else:
+            band = np.where(~np.isfinite(band), np.nan, band)
+
+        if np.isnan(band).any():
+            mask = np.isnan(band)
+            _, indices = distance_transform_edt(mask, return_indices=True)
+            band_filled = band[tuple(indices)]
+        else:
+            band_filled = band
 
         if (
             input_crs is not None
@@ -126,10 +138,28 @@ def interpolate_from_tiff(
         inv_transform = ~transform
         cols, rows = inv_transform * (xs, ys)
 
-        z = -map_coordinates(band, [rows, cols], order=order, mode=mode, cval=cval)
+        mask_inside = (
+            (cols >= 0) & (cols < band.shape[1]) &
+            (rows >= 0) & (rows < band.shape[0])
+        )
 
-        if nodata is not None:
-            z[z == nodata] = cval
+        z = np.full_like(xs, np.nan, dtype=float)
+
+        if np.any(mask_inside):
+            z[mask_inside] = -map_coordinates(
+                band_filled,
+                [rows[mask_inside], cols[mask_inside]],
+                order=order,
+                mode=mode,
+                cval=cval,
+                prefilter=False,
+            )
+
+        if np.any(~mask_inside):
+            rows_clip = np.clip(rows, 0, band.shape[0] - 1)
+            cols_clip = np.clip(cols, 0, band.shape[1] - 1)
+            z[~mask_inside] = -band_filled[rows_clip[~mask_inside].astype(int),
+                                          cols_clip[~mask_inside].astype(int)]
 
         return z
 
