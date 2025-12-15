@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 import numpy as np
 from shapely.geometry import Polygon
+from scipy.interpolate import griddata
 
 
 def getiso(xpos, ypos, zdat, ilev, filt=0.0):
@@ -90,7 +91,7 @@ def getiso(xpos, ypos, zdat, ilev, filt=0.0):
     return node, edge
 
 
-def getiso_polygone(x, y, z, zmax=None) -> Polygon:
+def getiso_polygone(x, y, z, zmax=None, grid_res=200) -> Polygon:
     """
     Extract a MultiPolygon from a 2D scalar field by thresholding (similar to getiso logic).
 
@@ -111,8 +112,13 @@ def getiso_polygone(x, y, z, zmax=None) -> Polygon:
     """
 
     # -----------------------ensure arrays are 2D and consistent
-    if x.ndim == 1 and y.ndim == 1:
-        X, Y = np.meshgrid(x, y)
+    if x.ndim == 1 and y.ndim == 1 and z.ndim == 1:
+        xi = np.linspace(np.min(x), np.max(x), grid_res)
+        yi = np.linspace(np.min(y), np.max(y), grid_res)
+        X, Y = np.meshgrid(xi, yi)
+        Z = griddata((x, y), z, (X, Y), method='linear')
+
+        z = np.nan_to_num(Z, nan=np.nanmedian(z))
     else:
         X, Y = x, y
 

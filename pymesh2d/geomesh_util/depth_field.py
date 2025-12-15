@@ -5,7 +5,7 @@ from rasterio.transform import rowcol
 from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 
 
-def depth_field_from_dat(dat_path, interp_method="linear", delimiter=None):
+def depth_field_from_dat(x, y ,z,input_crs, output_crs, interp_method="linear"):
     """
     Create a callable depth field from a .dat file containing x y z points.
     No projection handling — assumes all coordinates are in the same system.
@@ -26,17 +26,6 @@ def depth_field_from_dat(dat_path, interp_method="linear", delimiter=None):
         where xy is an array of shape (N, 2) with [x, y] coordinates.
     """
 
-    # --- Load file
-    try:
-        data = np.loadtxt(dat_path, delimiter=delimiter)
-    except Exception as e:
-        raise ValueError(f"Error reading file '{dat_path}': {e}")
-
-    if data.shape[1] < 3:
-        raise ValueError("The .dat file must contain at least three columns: x y z")
-
-    x, y, z = data[:, 0], data[:, 1], data[:, 2]
-
     # --- Clean invalid values
     mask = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
     x, y, z = x[mask], y[mask], z[mask]
@@ -48,6 +37,10 @@ def depth_field_from_dat(dat_path, interp_method="linear", delimiter=None):
         interp = NearestNDInterpolator(list(zip(x, y)), z)
     else:
         raise ValueError("interp_method must be 'linear' or 'nearest'")
+    
+    input_crs = pyproj.CRS.from_user_input(input_crs)
+    output_crs = pyproj.CRS.from_user_input(output_crs)
+    transfo = pyproj.Transformer.from_crs(output_crs, input_crs, always_xy=True)
 
     # --- Closure function
     def depth_field(xy):
@@ -56,7 +49,8 @@ def depth_field_from_dat(dat_path, interp_method="linear", delimiter=None):
         xy : (N, 2) array
         """
         xs, ys = xy[:, 0], xy[:, 1]
-        depth = interp(xs, ys)
+        xs, ys = transfo.transform(xs, ys)
+        depth = - interp(xs, ys)
         depth[np.isnan(depth)] = 0.0
         return np.asarray(depth, dtype=float)
 
