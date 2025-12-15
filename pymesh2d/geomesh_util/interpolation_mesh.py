@@ -7,11 +7,10 @@ from scipy.spatial import cKDTree
 
 
 def interpolate_from_xyz(
-    dat_path,
+    x, y, z,
     vert,
     method="rbf",
-    delimiter=None,
-    rbf_function="multiquadric",
+    rbf_function="cubic",
     epsilon=None,
 ):
     """
@@ -19,8 +18,8 @@ def interpolate_from_xyz(
 
     Parameters
     ----------
-    dat_path : str
-        Path to a .dat file containing at least 4 columns: x, y, z, value.
+    x, y, z : (N,) ndarray
+        Coordinates of the scattered data points.
     vert : (N, 3) ndarray
         Target coordinates (x, y, z) where interpolation is evaluated.
     method : {'linear', 'nearest', 'rbf'}, optional
@@ -42,39 +41,30 @@ def interpolate_from_xyz(
         Interpolated values at the target 3D points.
     """
 
-    # --- Load data
-    data = np.loadtxt(dat_path, delimiter=delimiter)
-    if data.shape[1] < 4:
-        raise ValueError(
-            "The .dat file must contain at least four columns: x y z value"
-        )
-
-    x, y, z, val = data[:, 0], data[:, 1], data[:, 2], data[:, 3]
-
     # --- Remove invalid points
-    mask = np.isfinite(x) & np.isfinite(y) & np.isfinite(z) & np.isfinite(val)
-    x, y, z, val = x[mask], y[mask], z[mask], val[mask]
-    points = np.column_stack((x, y, z))
+    mask = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+    x, y, z = x[mask], y[mask], z[mask]
+    points = np.column_stack((x, y))
 
     # --- Interpolation method
     if method == "linear":
-        interp = LinearNDInterpolator(points, val, fill_value=np.nan)
+        interp = LinearNDInterpolator(points, z, fill_value=np.nan)
         values_interp = interp(vert[:, 0], vert[:, 1], vert[:, 2])
 
     elif method == "nearest":
         tree = cKDTree(points)
         _, idx = tree.query(vert)
-        values_interp = val[idx]
+        values_interp = z[idx]
 
     elif method == "rbf":
-        interp = RBFInterpolator(points, val, kernel=rbf_function, epsilon=epsilon)
+        interp = RBFInterpolator(points, z, kernel=rbf_function, epsilon=epsilon)
         values_interp = interp(vert)
 
     else:
         raise ValueError("method must be 'linear', 'nearest', or 'rbf'")
 
     # --- Handle NaNs
-    values_interp = np.asarray(values_interp, dtype=float)
+    values_interp = - np.asarray(values_interp, dtype=float)
     values_interp[np.isnan(values_interp)] = 0
 
     return values_interp
