@@ -5,6 +5,20 @@ from rasterio.transform import rowcol
 from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 
 
+import numpy as np
+import pyproj
+import rasterio
+from scipy.interpolate import LinearNDInterpolator, RBFInterpolator
+from scipy.ndimage import map_coordinates, distance_transform_edt
+from scipy.spatial import cKDTree
+
+
+import numpy as np
+import pyproj
+import rasterio
+from rasterio.transform import rowcol
+from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
+
 def depth_field_from_dat(x, y ,z,input_crs, output_crs, interp_method="linear"):
     """
     Create a callable depth field from a .dat file containing x y z points.
@@ -40,7 +54,7 @@ def depth_field_from_dat(x, y ,z,input_crs, output_crs, interp_method="linear"):
     
     input_crs = pyproj.CRS.from_user_input(input_crs)
     output_crs = pyproj.CRS.from_user_input(output_crs)
-    transfo = pyproj.Transformer.from_crs(output_crs, input_crs, always_xy=True)
+    transformer = pyproj.Transformer.from_crs(output_crs, input_crs, always_xy=True)
 
     # --- Closure function
     def depth_field(xy):
@@ -49,7 +63,7 @@ def depth_field_from_dat(x, y ,z,input_crs, output_crs, interp_method="linear"):
         xy : (N, 2) array
         """
         xs, ys = xy[:, 0], xy[:, 1]
-        xs, ys = transfo.transform(xs, ys)
+        xs, ys = transformer.transform(xs, ys)
         depth = - interp(xs, ys)
         depth[np.isnan(depth)] = 0.0
         return np.asarray(depth, dtype=float)
