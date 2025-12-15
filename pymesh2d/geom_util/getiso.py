@@ -91,7 +91,7 @@ def getiso(xpos, ypos, zdat, ilev, filt=0.0):
     return node, edge
 
 
-def getiso_polygone(x, y, z, zmax=None, grid_res=200) -> Polygon:
+def getiso_polygone(x, y, z, zmax=None, grid_res=None) -> Polygon:
     """
     Extract a MultiPolygon from a 2D scalar field by thresholding (similar to getiso logic).
 
@@ -104,6 +104,8 @@ def getiso_polygone(x, y, z, zmax=None, grid_res=200) -> Polygon:
     zmax : float, optional
         Threshold value. Polygons will enclose regions where z <= zmax.
         If None, the 0-level is used.
+    grid_res : int, optional
+        If x and y are 1D arrays, this defines the grid resolution for interpolation. If None, it is inferred from the length of z.
 
     Returns
     -------
@@ -113,9 +115,17 @@ def getiso_polygone(x, y, z, zmax=None, grid_res=200) -> Polygon:
 
     # -----------------------ensure arrays are 2D and consistent
     if x.ndim == 1 and y.ndim == 1 and z.ndim == 1:
-        xi = np.linspace(np.min(x), np.max(x), grid_res)
-        yi = np.linspace(np.min(y), np.max(y), grid_res)
+        if grid_res is None:
+            grid_res = int(np.sqrt(len(z)))
+
+        dx = (np.max(x) - np.min(x)) / (grid_res - 1)
+        dy = (np.max(y) - np.min(y)) / (grid_res - 1)
+
+        xi = np.arange(np.min(x) - dx/2, np.max(x) + dx/2 + dx, dx)
+        yi = np.arange(np.min(y) - dy/2, np.max(y) + dy/2 + dy, dy)
+
         X, Y = np.meshgrid(xi, yi)
+
         Z = griddata((x, y), z, (X, Y), method='linear')
 
         z = np.nan_to_num(Z, nan=np.nanmedian(z))

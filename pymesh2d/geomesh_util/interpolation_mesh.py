@@ -18,8 +18,8 @@ def interpolate_from_xyz(
 
     Parameters
     ----------
-    dat_path : str
-        Path to a .dat file containing at least 4 columns: x, y, z, value.
+    x, y, z : (N,) ndarray
+        Coordinates of the scattered data points.
     vert : (N, 3) ndarray
         Target coordinates (x, y, z) where interpolation is evaluated.
     method : {'linear', 'nearest', 'rbf'}, optional

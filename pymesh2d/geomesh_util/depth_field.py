@@ -26,8 +26,12 @@ def depth_field_from_dat(x, y ,z,input_crs, output_crs, interp_method="linear"):
 
     Parameters
     ----------
-    dat_path : str
-        Path to the .dat file containing three columns: x y z
+    x, y, z : ndarray
+        1D arrays of point coordinates and depth values.
+    input_crs : str or pyproj.CRS
+        CRS of the input coordinates (e.g. UTM zone). Default 'EPSG:32630'.
+    output_crs : str or pyproj.CRS
+        CRS in which the depth field will be queried (e.g. 'EPSG:32630' for UTM zone 30N).
     interp_method : {'linear', 'nearest'}, optional
         Interpolation method to use (default 'linear')
     delimiter : str, optional
