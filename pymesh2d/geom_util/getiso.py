@@ -131,6 +131,9 @@ def getiso_polygone(x, y, z, zmax=None, grid_res=None) -> Polygon:
         z = np.nan_to_num(Z, nan=np.nanmedian(z))
     else:
         X, Y = x, y
+        
+    if z.ndim == 2 and X.shape == 1 and  Y.shape == 1:
+        X, Y = np.meshgrid(X, Y)
 
     if X.shape != Y.shape or X.shape != z.shape:
         raise ValueError("Inconsistent array shapes between x, y, z.")
