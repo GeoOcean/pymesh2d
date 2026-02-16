@@ -32,6 +32,7 @@ classifiers = [
 dependencies = [
     "numpy",
     "scipy",
+    "triangle",
     "matplotlib",
     "netCDF4",
     "rasterio",
@@ -57,3 +58,6 @@ package = "pymesh2d"
 
 version_file = "pymesh2d/_version.py"
 local_scheme = "no-local-version"
+
+[tool.setuptools.packages.find]
+exclude = ["assets", "assets.*"]
