@@ -204,7 +204,7 @@ def _segment_intersection(p1, p2, p3, p4):
     return None
 
 
-def small_flow_links(vert, tria, edge, removesmalllinkstrsh, conn=None):
+def small_flow_links(vert, tria, edge, removesmalllinkstrsh, conn=None, tria_6col=None, return_circumcenters=False):
     """
     Identify and report small flow links between adjacent triangles.
 
@@ -226,6 +226,11 @@ def small_flow_links(vert, tria, edge, removesmalllinkstrsh, conn=None):
         Matches the Removesmalllinkstrsh parameter in Delft3D-FM.
     CONN : ndarray, optional
         Constrained edges (used for tricon if tria is 3-column format).
+    TRIA_6COL : ndarray, optional
+        Precomputed 6-column triangle connectivity from tricon. If provided,
+        avoids a second call to tricon when tria has 3 columns.
+    RETURN_CIRCUMCENTERS : bool, optional
+        If True, return circumcenters positions (V, 2) as third output for reuse.
 
     Returns
     -------
@@ -233,6 +238,8 @@ def small_flow_links(vert, tria, edge, removesmalllinkstrsh, conn=None):
         Number of small flow links identified.
     SMALL_LINK_INDICES : ndarray
         Array of edge indices that are too small.
+    XZ : ndarray, optional
+        Circumcenter positions (T, 2), only if return_circumcenters=True.
 
     Notes
     -----
@@ -249,10 +256,14 @@ def small_flow_links(vert, tria, edge, removesmalllinkstrsh, conn=None):
     """
     # -------------------------------- basic checks
     if tria.size == 0 or edge.size == 0:
+        if return_circumcenters:
+            return 0, np.array([], dtype=int), np.empty((0, 2))
         return 0, np.array([], dtype=int)
 
-    # -------------------------------- get tria in 6-column format
-    if tria.shape[1] == 3:
+    # -------------------------------- get tria in 6-column format (reuse if provided)
+    if tria_6col is not None:
+        pass  # use caller's tria_6col
+    elif tria.shape[1] == 3:
         _, tria_6col = tricon(tria, conn if conn is not None else np.empty((0, 2), dtype=int))
     else:
         tria_6col = tria
@@ -269,6 +280,8 @@ def small_flow_links(vert, tria, edge, removesmalllinkstrsh, conn=None):
     internal_mask = (edge[:, 2] >= 0) & (edge[:, 3] >= 0)
 
     if np.sum(internal_mask) == 0:
+        if return_circumcenters:
+            return 0, np.array([], dtype=int), xz
         return 0, np.array([], dtype=int)
 
     t1_indices = edge[internal_mask, 2].astype(int)
@@ -283,6 +296,8 @@ def small_flow_links(vert, tria, edge, removesmalllinkstrsh, conn=None):
     )
 
     if not np.any(valid_mask):
+        if return_circumcenters:
+            return 0, np.array([], dtype=int), xz
         return 0, np.array([], dtype=int)
 
     t1_indices = t1_indices[valid_mask]
@@ -305,6 +320,8 @@ def small_flow_links(vert, tria, edge, removesmalllinkstrsh, conn=None):
     else:
         small_link_indices = np.array([], dtype=int)
 
+    if return_circumcenters:
+        return nlinktoosmall, small_link_indices, xz
     return nlinktoosmall, small_link_indices
 
 
@@ -380,8 +397,82 @@ def small_flow_centers(vert, tria, edge, removesmalllinkstrsh, conn=None):
     return xz[all_problem_triangles], nlinktoosmall
 
 
+def _is_edge_constrained(conn, va, vb):
+    """Return True if edge (va, vb) or (vb, va) is in conn."""
+    if conn is None or conn.size == 0:
+        return False
+    c = conn[:, :2]
+    return np.any(((c[:, 0] == va) & (c[:, 1] == vb)) | ((c[:, 0] == vb) & (c[:, 1] == va)))
+
+
+def _signed_area_one(vert, a, b, c):
+    """Signed area of triangle (a, b, c); positive = CCW."""
+    ev12 = vert[b] - vert[a]
+    ev13 = vert[c] - vert[a]
+    return 0.5 * (ev12[0] * ev13[1] - ev12[1] * ev13[0])
+
+
+def try_flip_small_flow_edges(vert, tria, conn, edge, small_link_indices):
+    """
+    Try to fix small flow links by flipping the shared edge (swap diagonal of the quad).
+    Merges the two triangles into a different pair without adding/removing vertices,
+    often increasing the flow link length. Only flips if the quad is strictly convex
+    and the shared edge is not constrained.
+
+    Returns
+    -------
+    n_flipped : int
+        Number of edges that were flipped (tria is modified in place).
+    """
+    if small_link_indices.size == 0:
+        return 0
+    problem_edges = edge[small_link_indices]
+    t1_indices = problem_edges[:, 2].astype(int)
+    t2_indices = problem_edges[:, 3].astype(int)
+    edge_vertices = problem_edges[:, 0:2].astype(int)
+    n_vert = vert.shape[0]
+    n_tria = tria.shape[0]
+    n_flipped = 0
+    for idx in range(len(small_link_indices)):
+        t1_idx, t2_idx = t1_indices[idx], t2_indices[idx]
+        if t1_idx < 0 or t1_idx >= n_tria or t2_idx < 0 or t2_idx >= n_tria:
+            continue
+        shared_v1, shared_v2 = edge_vertices[idx, 0], edge_vertices[idx, 1]
+        if _is_edge_constrained(conn, shared_v1, shared_v2):
+            continue
+        tri1_verts = tria[t1_idx, :]
+        tri2_verts = tria[t2_idx, :]
+        opp1 = None
+        for v in tri1_verts:
+            if v != shared_v1 and v != shared_v2:
+                opp1 = v
+                break
+        opp2 = None
+        for v in tri2_verts:
+            if v != shared_v1 and v != shared_v2:
+                opp2 = v
+                break
+        if opp1 is None or opp2 is None or opp1 == opp2:
+            continue
+        # Convex quad: shared_v1 and shared_v2 on opposite sides of line (opp1, opp2)
+        sa1 = _signed_area_one(vert, opp1, opp2, shared_v1)
+        sa2 = _signed_area_one(vert, opp1, opp2, shared_v2)
+        if sa1 * sa2 >= 0:
+            continue
+        # Both new triangles must have positive area (CCW)
+        if sa1 <= 0:
+            continue
+        # New triangles: (opp1, opp2, shared_v1) and (opp2, opp1, shared_v2)
+        tria[t1_idx, :] = [opp1, opp2, shared_v1]
+        tria[t2_idx, :] = [opp2, opp1, shared_v2]
+        n_flipped += 1
+        # One flip per call so connectivity stays consistent; next iteration will re-run tricon
+        break
+    return n_flipped
+
+
 def correct_small_flow_links(vert, tria, edge, small_link_indices, circumcenters_pos, 
-                              removesmalllinkstrsh, conn=None):
+                              removesmalllinkstrsh, conn=None, aggressive_mode=False):
     """
     Compute vertex displacements and constrained triangle splits to correct small flow links.
     
@@ -405,6 +496,11 @@ def correct_small_flow_links(vert, tria, edge, small_link_indices, circumcenters
         Threshold for removing small links (default 0.1).
     CONN : ndarray, optional
         Constrained edges (vertices that cannot be moved).
+    AGGRESSIVE_MODE : int, optional
+        Aggressive mode level:
+        - 0: Normal mode (default)
+        - 1: Aggressive mode (5x displacement) when few links remain
+        - 2: Very aggressive mode (10x displacement) for single remaining link
     
     Returns
     -------
@@ -442,26 +538,75 @@ def correct_small_flow_links(vert, tria, edge, small_link_indices, circumcenters
     tri_areas = np.abs(triarea(vert, tria))
     
     # -------------------------------- process each problematic link
-    problem_edges = edge[small_link_indices]
+    # CRITICAL: Verify edge indices are valid FIRST
+    if len(small_link_indices) == 0:
+        return vertex_displacements, vertex_counts, constrained_triangles_to_split, []
+    
+    valid_edge_mask = (
+        (small_link_indices >= 0) & (small_link_indices < len(edge))
+    )
+    if not np.any(valid_edge_mask):
+        # No valid edge indices - skip processing
+        return vertex_displacements, vertex_counts, constrained_triangles_to_split, []
+    
+    # Filter to only valid edge indices
+    valid_small_link_indices = small_link_indices[valid_edge_mask]
+    problem_edges = edge[valid_small_link_indices]
     t1_indices = problem_edges[:, 2].astype(int)
     t2_indices = problem_edges[:, 3].astype(int)
     edge_vertices = problem_edges[:, 0:2].astype(int)
     
     valid_mask = (
         (t1_indices >= 0) & (t1_indices < len(tria)) &
-        (t2_indices >= 0) & (t2_indices < len(tria))
+        (t2_indices >= 0) & (t2_indices < len(tria)) &
+        (edge_vertices[:, 0] >= 0) & (edge_vertices[:, 0] < len(vert)) &
+        (edge_vertices[:, 1] >= 0) & (edge_vertices[:, 1] < len(vert))
     )
+    
+    if not np.any(valid_mask):
+        # No valid triangles to process
+        return vertex_displacements, vertex_counts, constrained_triangles_to_split, []
     
     for idx in np.where(valid_mask)[0]:
         t1_idx, t2_idx = t1_indices[idx], t2_indices[idx]
         shared_v1, shared_v2 = edge_vertices[idx, 0], edge_vertices[idx, 1]
         
-        # Identify opposite vertices
+        # CRITICAL: Verify triangle indices are still valid
+        if t1_idx >= len(tria) or t2_idx >= len(tria) or t1_idx < 0 or t2_idx < 0:
+            continue
+        
+        # CRITICAL: Verify circumcenters array matches triangle count
+        if t1_idx >= circumcenters_pos.shape[0] or t2_idx >= circumcenters_pos.shape[0]:
+            continue
+        
+        # Identify opposite vertices (vertices not on the shared edge)
         tri1_verts, tri2_verts = tria[t1_idx, :], tria[t2_idx, :]
-        opp1 = next((v for v in tri1_verts if v != shared_v1 and v != shared_v2), None)
-        opp2 = next((v for v in tri2_verts if v != shared_v1 and v != shared_v2), None)
+        
+        # CRITICAL: Verify shared vertices are actually in both triangles
+        if shared_v1 not in tri1_verts or shared_v2 not in tri1_verts:
+            continue
+        if shared_v1 not in tri2_verts or shared_v2 not in tri2_verts:
+            continue
+        
+        # Find opposite vertex in triangle 1 (vertex not on the shared edge)
+        opp1 = None
+        for v in tri1_verts:
+            if v != shared_v1 and v != shared_v2:
+                opp1 = v
+                break
+        
+        # Find opposite vertex in triangle 2 (vertex not on the shared edge)
+        opp2 = None
+        for v in tri2_verts:
+            if v != shared_v1 and v != shared_v2:
+                opp2 = v
+                break
         
         if opp1 is None or opp2 is None:
+            continue
+        
+        # CRITICAL: Verify vertex indices are valid
+        if opp1 >= len(vert) or opp2 >= len(vert) or opp1 < 0 or opp2 < 0:
             continue
         
         # Get circumcenters and compute link distance
@@ -479,10 +624,29 @@ def correct_small_flow_links(vert, tria, edge, small_link_indices, circumcenters
         if link_distance >= dxlim:
             continue
         
-        needed_distance = (dxlim - link_distance) * 5.0
+        # Compute how much distance we need to add
+        needed_distance = max(dxlim - link_distance, 0.0)
         
-        # Compute separation direction
+        # -------------------------------- check if vertices are free
+        opp1_free = not conn_array[opp1]
+        opp2_free = not conn_array[opp2]
+        
+        if not opp1_free and not opp2_free:
+            # -------------------------------- all opposite vertices constrained
+            # Mark smaller triangle for node insertion (simpler, more reliable)
+            if area1 < area2:
+                constrained_triangles_to_split.add(t1_idx)
+            else:
+                constrained_triangles_to_split.add(t2_idx)
+            continue
+        
+        # -------------------------------- IMPROVED STRATEGY: Targeted displacement
+        # Focus on moving ONLY the vertices directly involved in the problematic link
+        # Strategy: Move opposite vertices away from each other along the circumcenter separation line
+        
+        # Compute separation direction (from cc1 to cc2)
         if link_distance < 1e-12:
+            # Circumcenters coincide - use perpendicular to shared edge
             edge_vec = vert[shared_v2] - vert[shared_v1]
             edge_len = np.linalg.norm(edge_vec)
             if edge_len < 1e-12:
@@ -491,36 +655,56 @@ def correct_small_flow_links(vert, tria, edge, small_link_indices, circumcenters
         else:
             cc_dir = cc_diff / link_distance
         
-        # -------------------------------- check if vertices are free
-        opp1_free = not conn_array[opp1]
-        opp2_free = not conn_array[opp2]
+        # Compute displacement magnitude - conservative and targeted
+        if aggressive_mode:
+            # More aggressive for few/single links, but controlled to avoid affecting other triangles
+            aggressive_factor = 6.0 if aggressive_mode == 2 else 3.0  # Reduced from 8.0/4.0
+        else:
+            aggressive_factor = 1.0
         
-        if not opp1_free and not opp2_free:
-            # -------------------------------- all constrained: mark smaller triangle for node insertion
-            if area1 < area2:
-                constrained_triangles_to_split.add(t1_idx)
-            else:
-                constrained_triangles_to_split.add(t2_idx)
+        # Base magnitude: enough to achieve the needed separation
+        # Limit to reasonable fraction of triangle size to avoid affecting neighbors
+        max_displacement = min(np.sqrt(area1), np.sqrt(area2)) * 0.5
+        base_magnitude = min(needed_distance * aggressive_factor, max_displacement)
+        
+        # Apply displacements ONLY to opposite vertices (not edge vertices)
+        # This keeps modifications localized to the problematic triangles
+        if opp1_free and opp2_free:
+            # Both free: move them apart symmetrically along separation line
+            displacement_magnitude = base_magnitude
+            disp_vec1 = -cc_dir * displacement_magnitude * 0.5  # Move opp1 away from cc2
+            disp_vec2 = cc_dir * displacement_magnitude * 0.5   # Move opp2 away from cc1
+        elif opp1_free:
+            # Only opp1 free: move it more aggressively
+            displacement_magnitude = base_magnitude * 1.5
+            disp_vec1 = -cc_dir * displacement_magnitude
+            disp_vec2 = np.zeros(2)
+        elif opp2_free:
+            # Only opp2 free: move it more aggressively
+            displacement_magnitude = base_magnitude * 1.5
+            disp_vec1 = np.zeros(2)
+            disp_vec2 = cc_dir * displacement_magnitude
+        else:
+            # Should not happen (already handled above)
             continue
         
-        # -------------------------------- compute displacement magnitude
-        displacement_magnitude = needed_distance * (10.0 if (opp1_free != opp2_free) else 1.0)
-        disp_vec = cc_dir * displacement_magnitude * 0.5
-        
         # -------------------------------- accumulate displacements
-        if opp1_free:
-            vertex_displacements[opp1] -= disp_vec
+        # CRITICAL: Verify vertex indices are within bounds before accessing
+        if opp1_free and 0 <= opp1 < len(vertex_displacements):
+            vertex_displacements[opp1] += disp_vec1
             vertex_counts[opp1] += 1
         
-        if opp2_free:
-            vertex_displacements[opp2] += disp_vec
+        if opp2_free and 0 <= opp2 < len(vertex_displacements):
+            vertex_displacements[opp2] += disp_vec2
             vertex_counts[opp2] += 1
     
     # -------------------------------- compute new vertices for constrained triangles
     new_vertices = []
     for tri_idx in constrained_triangles_to_split:
+        # CRITICAL: Verify triangle index is valid
         if 0 <= tri_idx < len(tria):
             tri_verts = tria[tri_idx, :]
+            # CRITICAL: Verify all vertex indices are valid
             if np.all((0 <= tri_verts) & (tri_verts < len(vert))):
                 center = np.mean(vert[tri_verts, :], axis=0)
                 if np.all(np.isfinite(center)):
@@ -571,28 +755,97 @@ def fix_small_flow_links(vert, conn, tria, tnum, node, PSLG, part, opts):
     from ..mesh_cost.triarea import triarea
     from .tricon import tricon
     
-    max_fix_iter = 100
+    max_fix_iter = opts.get("max_fix_iter", 100)
     removesmalllinkstrsh = opts.get("removesmalllinkstrsh")
     fix_iter = 0
     stagnation_count = 0
     
-    for fix_iter in range(max_fix_iter):
-        # -------------------------------- rebuild connectivity
+    # Adaptive strategy: be more aggressive when there are few small links remaining
+    initial_nlinks = None
+    
+    # Optimize: reduce max iterations when few links remain
+    adaptive_max_iter = max_fix_iter
+    
+    for fix_iter in range(adaptive_max_iter):
+        # -------------------------------- rebuild connectivity (single tricon)
+        # CRITICAL: Always rebuild connectivity to ensure indices are current
         edge_fix, tria_6col_fix = tricon(tria, conn)
-        
-        # -------------------------------- check for small flow links
-        nlinktoosmall, small_link_indices = small_flow_links(
-            vert, tria, edge_fix, removesmalllinkstrsh, conn
+
+        # -------------------------------- check for small flow links (reuse tria_6col, get circumcenters)
+        # CRITICAL: Always recalculate to ensure circumcenters match current mesh
+        nlinktoosmall, small_link_indices, circumcenters_pos = small_flow_links(
+            vert, tria, edge_fix, removesmalllinkstrsh, conn,
+            tria_6col=tria_6col_fix, return_circumcenters=True
         )
-        
+
         if nlinktoosmall == 0:
             break
         
+        # Track initial number for adaptive strategy
+        if initial_nlinks is None:
+            initial_nlinks = nlinktoosmall
+            # Reduce max iterations if starting with few links
+            if initial_nlinks <= 5:
+                adaptive_max_iter = min(max_fix_iter, 30)
+        
+        # Adaptive strategy: more aggressive when few links remain
+        few_links_remaining = nlinktoosmall <= max(3, initial_nlinks * 0.1)
+        single_link_remaining = nlinktoosmall == 1  # Very aggressive for last link
+        
+        # Don't exit early if single link remains - keep trying
+        if few_links_remaining and not single_link_remaining and fix_iter > 10 and stagnation_count >= 2:
+            # Try one more aggressive pass, then exit (but not for single link)
+            if fix_iter < adaptive_max_iter - 1:
+                continue
+            else:
+                break
+        
+        # -------------------------------- Verify indices are valid before processing
+        if len(small_link_indices) > 0:
+            valid_edge_mask = (
+                (small_link_indices >= 0) & 
+                (small_link_indices < len(edge_fix))
+            )
+            if not np.all(valid_edge_mask):
+                # Some edge indices are invalid - skip this iteration
+                stagnation_count += 1
+                continue
+
+        # -------------------------------- try to merge by edge flip (unify pair without creating small elements)
+        n_flipped = try_flip_small_flow_edges(vert, tria, conn, edge_fix, small_link_indices)
+        if n_flipped > 0:
+            stagnation_count = 0
+            continue
+
         # -------------------------------- delete problematic triangles if stagnation
-        if stagnation_count >= 3 or (nlinktoosmall <= 3 and fix_iter > 5):
+        # IMPROVED STRATEGY: Only delete triangles that are actually problematic
+        # More aggressive deletion when few links remain, very aggressive for single link
+        if single_link_remaining:
+            stagnation_threshold = 1  # Delete immediately if stagnation with single link
+            early_delete_threshold = 1  # Delete after 1 iteration if single link
+        elif few_links_remaining:
+            stagnation_threshold = 2
+            early_delete_threshold = 3
+        else:
+            stagnation_threshold = 3
+            early_delete_threshold = 5
+        
+        if stagnation_count >= stagnation_threshold or (nlinktoosmall <= 3 and fix_iter > early_delete_threshold):
             problem_edges = edge_fix[small_link_indices]
             t1_indices = problem_edges[:, 2].astype(int)
             t2_indices = problem_edges[:, 3].astype(int)
+            
+            # Verify edge indices are valid
+            valid_edge_idx = (
+                (small_link_indices >= 0) & (small_link_indices < len(edge_fix))
+            )
+            if not np.any(valid_edge_idx):
+                stagnation_count += 1
+                continue
+            
+            problem_edges_valid = problem_edges[valid_edge_idx]
+            t1_indices = problem_edges_valid[:, 2].astype(int)
+            t2_indices = problem_edges_valid[:, 3].astype(int)
             
             problem_triangles = set()
             valid_mask = (
@@ -600,38 +853,102 @@ def fix_small_flow_links(vert, conn, tria, tnum, node, PSLG, part, opts):
                 (t2_indices >= 0) & (t2_indices < len(tria))
             )
             
+            if not np.any(valid_mask):
+                stagnation_count += 1
+                continue
+            
+            # Compute triangle areas and link distances to identify truly problematic triangles
             tri_areas_simple = np.abs(triarea(vert, tria))
+            
+            # Recompute link distances for problematic edges to verify they're still small
             for idx in np.where(valid_mask)[0]:
                 t1_idx, t2_idx = t1_indices[idx], t2_indices[idx]
-                if tri_areas_simple[t1_idx] < tri_areas_simple[t2_idx]:
-                    problem_triangles.add(t1_idx)
-                else:
-                    problem_triangles.add(t2_idx)
+                
+                # Verify triangle indices
+                if t1_idx >= len(circumcenters_pos) or t2_idx >= len(circumcenters_pos):
+                    continue
+                
+                # Check if link is still too small
+                cc1, cc2 = circumcenters_pos[t1_idx], circumcenters_pos[t2_idx]
+                link_dist = np.linalg.norm(cc2 - cc1)
+                area1, area2 = tri_areas_simple[t1_idx], tri_areas_simple[t2_idx]
+                sqrt_ba = np.sqrt(max(area1, 1e-12)) + np.sqrt(max(area2, 1e-12))
+                dxlim = 0.9 * removesmalllinkstrsh * 0.5 * sqrt_ba
+                
+                # Only mark as problematic if link is still too small
+                if link_dist < dxlim:
+                    # For single link remaining, be more aggressive - delete both triangles if needed
+                    if single_link_remaining:
+                        # Delete the smaller triangle, or both if areas are similar
+                        if area1 < area2 * 0.8:  # t1 significantly smaller
+                            problem_triangles.add(t1_idx)
+                        elif area2 < area1 * 0.8:  # t2 significantly smaller
+                            problem_triangles.add(t2_idx)
+                        else:
+                            # Similar areas - delete both to force retriangulation
+                            problem_triangles.add(t1_idx)
+                            problem_triangles.add(t2_idx)
+                    else:
+                        # Normal strategy: prefer deleting the smaller triangle
+                        if area1 < area2:
+                            problem_triangles.add(t1_idx)
+                        elif area2 < area1:
+                            problem_triangles.add(t2_idx)
+                        else:
+                            # Equal areas - delete the one with smaller link distance contribution
+                            problem_triangles.add(t1_idx if link_dist < dxlim * 0.5 else t2_idx)
             
             if len(problem_triangles) > 0:
                 problem_triangles = np.array(list(problem_triangles))
-                keep_triangles = np.ones(len(tria), dtype=bool)
-                keep_triangles[problem_triangles] = False
-                tria = tria[keep_triangles, :]
-                if len(tnum) == len(keep_triangles):
-                    tnum = tnum[keep_triangles]
-                vert, conn, tria, tnum = deltri(vert, conn, node, PSLG, part)
-                tria = tria[:, 0:3]
-                stagnation_count = 0
-                continue
-        
-        # -------------------------------- compute circumcenters
-        bb_fix = circumcenters(vert, tria, edge_fix, tria_6col_fix)
-        circumcenters_pos = bb_fix[:, 0:2]
+                # Only delete if we have a reasonable number (not too many at once)
+                if len(problem_triangles) <= max(5, nlinktoosmall * 2):
+                    keep_triangles = np.ones(len(tria), dtype=bool)
+                    keep_triangles[problem_triangles] = False
+                    tria = tria[keep_triangles, :]
+                    if len(tnum) == len(keep_triangles):
+                        tnum = tnum[keep_triangles]
+                    vert, conn, tria, tnum = deltri(vert, conn, node, PSLG, part)
+                    tria = tria[:, 0:3]
+                    stagnation_count = 0
+                    continue
+                else:
+                    # Too many triangles to delete - be more selective
+                    # Delete only the smallest ones
+                    problem_areas = tri_areas_simple[problem_triangles]
+                    sorted_idx = np.argsort(problem_areas)
+                    n_to_delete = min(len(problem_triangles), max(3, nlinktoosmall))
+                    triangles_to_delete = problem_triangles[sorted_idx[:n_to_delete]]
+                    
+                    keep_triangles = np.ones(len(tria), dtype=bool)
+                    keep_triangles[triangles_to_delete] = False
+                    tria = tria[keep_triangles, :]
+                    if len(tnum) == len(keep_triangles):
+                        tnum = tnum[keep_triangles]
+                    vert, conn, tria, tnum = deltri(vert, conn, node, PSLG, part)
+                    tria = tria[:, 0:3]
+                    stagnation_count = 0
+                    continue
+
+        # -------------------------------- circumcenters already from small_flow_links
         if not np.all(np.isfinite(circumcenters_pos).all(axis=1)):
             stagnation_count += 1
             continue
-        
+
         # -------------------------------- compute displacements and triangles to split
+        # CRITICAL: Ensure circumcenters_pos matches current tria size
+        if circumcenters_pos.shape[0] != len(tria):
+            # Circumcenters don't match current triangle count - recalculate
+            _, _, circumcenters_pos = small_flow_links(
+                vert, tria, edge_fix, removesmalllinkstrsh, conn,
+                tria_6col=tria_6col_fix, return_circumcenters=True
+            )
+        
+        # Pass aggressive mode: 2 for single link, 1 for few links, 0 otherwise
+        aggressive_mode_value = 2 if single_link_remaining else (1 if few_links_remaining else 0)
         vertex_displacements, vertex_counts, constrained_triangles_to_split, new_vertices = \
             correct_small_flow_links(
                 vert, tria, edge_fix, small_link_indices, circumcenters_pos,
-                removesmalllinkstrsh, conn
+                removesmalllinkstrsh, conn, aggressive_mode=aggressive_mode_value
             )
         
         # -------------------------------- insert nodes at center of fully constrained triangles
@@ -643,6 +960,7 @@ def fix_small_flow_links(vert, conn, tria, tnum, node, PSLG, part, opts):
             continue
         
         # -------------------------------- apply displacements
+        # IMPROVED STRATEGY: More conservative and targeted displacement application
         has_displacement = vertex_counts > 0
         if np.any(has_displacement):
             # -------------------------------- create conn_array for this iteration
@@ -654,17 +972,50 @@ def fix_small_flow_links(vert, conn, tria, tnum, node, PSLG, part, opts):
                 conn_array[conn_indices[valid_conn]] = True
             
             # -------------------------------- filter unconstrained vertices
+            # Only apply to vertices that have displacements AND are free
             free_mask = has_displacement[:n_vert] & ~conn_array
             v_indices = np.where(free_mask)[0]
             
             if len(v_indices) > 0:
-                # -------------------------------- compute relaxation factor
-                relaxation = min(2.0 + 0.1 * fix_iter, 10.0)
+                # -------------------------------- IMPROVED: Adaptive relaxation factor
+                # More aggressive when few links remain, very aggressive for single link
+                if single_link_remaining:
+                    base_relaxation = 2.0 + 0.3 * fix_iter
+                    relaxation = min(base_relaxation, 5.0)  # Very high cap for single link
+                elif few_links_remaining:
+                    base_relaxation = 1.0 + 0.2 * fix_iter
+                    relaxation = min(base_relaxation, 3.0)  # Higher cap for few links
+                else:
+                    base_relaxation = 0.5 + 0.1 * fix_iter
+                    relaxation = min(base_relaxation, 2.0)  # Cap at 2.0 for stability
                 
                 # -------------------------------- apply displacements (vectorized)
+                # Average multiple contributions if vertex is involved in multiple small links
                 counts = vertex_counts[v_indices]
                 counts = np.maximum(counts, 1)
-                vert[v_indices] += (vertex_displacements[v_indices] / counts[:, None]) * relaxation
+                
+                # Normalize displacements by count and apply relaxation
+                normalized_displacements = vertex_displacements[v_indices] / counts[:, None]
+                
+                # Limit displacement magnitude to avoid creating new problems
+                # Use a conservative cap based on displacement magnitudes
+                disp_magnitudes = np.linalg.norm(normalized_displacements, axis=1)
+                
+                # Conservative cap: use median of non-zero displacements as reference
+                # This prevents outliers from causing excessive modifications
+                if np.any(disp_magnitudes > 0):
+                    median_disp = np.median(disp_magnitudes[disp_magnitudes > 0])
+                    # Cap at 2x median to allow some variation but prevent extreme values
+                    max_allowed_disp = max(median_disp * 2.0, 1e-6)
+                else:
+                    max_allowed_disp = 1e-6
+                
+                # Clip displacements that are too large relative to typical displacement
+                scale_factor = np.minimum(1.0, max_allowed_disp / (disp_magnitudes + 1e-12))
+                normalized_displacements = normalized_displacements * scale_factor[:, None]
+                
+                # Apply with relaxation
+                vert[v_indices] += normalized_displacements * relaxation
             
             vert, conn, tria, tnum = deltri(vert, conn, node, PSLG, part)
             tria = tria[:, 0:3]

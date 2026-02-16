@@ -4,6 +4,8 @@ from ..mesh_cost.triarea import triarea
 from ..poly_test.inpoly import inpoly
 from .cfmtri import cfmtri
 
+import triangle as tr
+
 
 def deltri(vert=None, conn=None, node=None, PSLG=None, part=None, kind="constrained"):
     """
@@ -79,8 +81,25 @@ def deltri(vert=None, conn=None, node=None, PSLG=None, part=None, kind="constrai
             if np.min(p) < 0 or np.max(p) >= PSLG.shape[0]:
                 raise ValueError("deltri:invalidInputs (invalid PART indices)")
 
-    # -------------------------------- compute constrained triangulation
-    vert, conn, tria = cfmtri(vert, conn)
+    # -------------------------------- compute Delaunay triangulation
+    # Match MATLAB's deltri2 behavior exactly:
+    # - 'constrained': use delaunayTriangulation (triangle library in Python)
+    # - 'conforming': use cfmtri (bisection algorithm)
+    if kind == "constrained":
+        tri_input = {
+            'vertices': vert,
+            'segments': conn
+        }
+        # 'p' = triangulate PSLG (planar straight line graph)
+        tri_output = tr.triangulate(tri_input, 'p')
+        vert = tri_output['vertices']
+        tria = tri_output['triangles']
+    elif kind == "conforming":
+        # "conforming" Delaunay - use cfmtri (bisection algorithm)
+        vert, conn, tria = cfmtri(vert, conn)
+    
+    else:
+        raise ValueError(f"deltri: invalid KIND selection '{kind}'")
 
     # -------------------------------- compute "inside" status
     tnum = np.zeros(tria.shape[0], dtype=int)
