@@ -69,9 +69,10 @@ def smood(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg
           to improve orthogonality. Vertices at junctions (on multiple constraint lines) remain fixed
           unless allow_constraint_sliding_junctions=True.
         - 'allow_constraint_sliding_junctions' : bool, default = False
-          If True and allow_constraint_sliding=True, also allow vertices at junctions (on multiple
-          constraint lines) to slide along constraint lines. If False, only vertices on exactly one
-          constraint line can slide.
+          If True, automatically enables allow_constraint_sliding and also allows vertices at junctions
+          (on multiple constraint lines) to slide along constraint lines. For junctions, the vertex is
+          projected onto the closest constraint line. If False, only vertices on exactly one constraint
+          line can slide (if allow_constraint_sliding=True).
         - 'max_final_smalllink_iter' : int, default = 10
           Maximum number of iterations for final small link correction phase.
         - 'smalllink_iter_start' : int, optional
@@ -223,19 +224,28 @@ def smood(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg
         EMAT = IMAT + JMAT
         vdeg = np.array(EMAT.sum(axis=1)).flatten()
 
-        free_vertices = compute_free_vertices(nvrt, conn, part)
+        allow_constraint_sliding = opts.get("allow_constraint_sliding", False)
+        allow_junctions = opts.get("allow_constraint_sliding_junctions", False)
+        
+        # If allow_constraint_sliding_junctions is True, automatically enable allow_constraint_sliding
+        if allow_junctions:
+            allow_constraint_sliding = True
+        
+        free_vertices = compute_free_vertices(nvrt, conn, part, allow_constraint_sliding)
         vold = vert.copy()
         oscr = triscr(vert, tria)
 
         # ---------------------------------------------- compute weights
+        # Evaluate hfun first (needed for both orthogonalization and smoothing)
+        hvrt = evalhfn(vert, edge, EMAT, hfun, harg)
+        
         ttic_ortho = time.time()
         ortho_weights, ortho_rhs = compute_orthogonalization_weights(
-            vert, edge, tria, tria_6col, free_vertices, part, conn
+            vert, edge, tria, tria_6col, free_vertices, part, conn, hvrt
         )
         tcpu["ortho"] += time.time() - ttic_ortho
 
         ttic_smooth = time.time()
-        hvrt = evalhfn(vert, edge, EMAT, hfun, harg)
         smooth_weights = compute_smoothing_weights(
             vert, edge, EMAT, vdeg, hvrt
         )
@@ -264,9 +274,6 @@ def smood(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg
             vnew = relaxation * vnew + (1.0 - relaxation) * vert
 
             # Project vertices on constraint lines
-            allow_constraint_sliding = opts.get("allow_constraint_sliding", False)
-            allow_junctions = opts.get("allow_constraint_sliding_junctions", False)
-            
             if allow_constraint_sliding and conn is not None and len(conn) > 0 and part is not None:
                 external_vertex_set = set()
                 for p in part:
@@ -310,9 +317,11 @@ def smood(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg
                                 v_idx, vnew[v_idx, :], conn, part, vert, allow_junctions
                             )
             else:
+                # Fix all constrained vertices if sliding is not allowed
                 if conn is not None and len(conn) > 0:
                     vnew[conn.flatten(), :] = vert[conn.flatten(), :]
             
+            # Only fix vertices that are truly fixed (external boundaries or constrained without sliding)
             vnew[~free_vertices, :] = vert[~free_vertices, :]
 
             vert = vnew
@@ -351,16 +360,17 @@ def smood(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg
                     )
                     EMAT = IMAT + JMAT
                     vdeg = np.array(EMAT.sum(axis=1)).flatten()
-                    free_vertices = compute_free_vertices(nvrt, conn, part)
+                    free_vertices = compute_free_vertices(nvrt, conn, part, allow_constraint_sliding)
                     
+                    # Recalculate hvrt after mesh modification
                     ttic_ortho_recomp = time.time()
+                    hvrt = evalhfn(vert, edge, EMAT, hfun, harg)
                     ortho_weights, ortho_rhs = compute_orthogonalization_weights(
-                        vert, edge, tria, tria_6col, free_vertices, part, conn
+                        vert, edge, tria, tria_6col, free_vertices, part, conn, hvrt
                     )
                     tcpu["ortho"] += time.time() - ttic_ortho_recomp
                     
                     ttic_smooth_recomp = time.time()
-                    hvrt = evalhfn(vert, edge, EMAT, hfun, harg)
                     smooth_weights = compute_smoothing_weights(
                         vert, edge, EMAT, vdeg, hvrt
                     )
@@ -404,6 +414,10 @@ def smood(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg
                 n_poor_ortho = -1
 
         # ---------------------------------------------- test convergence
+        # Recalculate hvrt if mesh was modified (vertex count changed)
+        if hvrt.shape[0] != vert.shape[0]:
+            hvrt = evalhfn(vert, edge, EMAT, hfun, harg)
+        
         if vert.shape[0] == vold.shape[0]:
             vdel = np.sum((vert - vold) ** 2, axis=1)
         else:
@@ -414,7 +428,14 @@ def smood(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg
             elif vold.shape[0] > vert.shape[0]:
                 vdel = np.concatenate([vdel, np.zeros(vold.shape[0] - vert.shape[0])])
 
-        vdel_norm = vdel / (hvrt.flatten() ** 2 + np.finfo(float).eps)
+        # Ensure hvrt matches vdel shape
+        hvrt_flat = hvrt.flatten()
+        if hvrt_flat.shape[0] != vdel.shape[0]:
+            # Recalculate if still mismatched
+            hvrt = evalhfn(vert, edge, EMAT, hfun, harg)
+            hvrt_flat = hvrt.flatten()
+        
+        vdel_norm = vdel / (hvrt_flat ** 2 + np.finfo(float).eps)
 
         move = vdel_norm > opts["vtol"] ** 2
         nmov = np.count_nonzero(move)
@@ -452,12 +473,13 @@ def smood(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg
                     )
                     EMAT = IMAT + JMAT
                     vdeg = np.array(EMAT.sum(axis=1)).flatten()
-                    free_vertices = compute_free_vertices(nvrt, conn, part)
+                    free_vertices = compute_free_vertices(nvrt, conn, part, allow_constraint_sliding)
                     
-                    ortho_weights, ortho_rhs = compute_orthogonalization_weights(
-                        vert, edge, tria, tria_6col, free_vertices, part, conn
-                    )
+                    # Recalculate hvrt after mesh modification
                     hvrt = evalhfn(vert, edge, EMAT, hfun, harg)
+                    ortho_weights, ortho_rhs = compute_orthogonalization_weights(
+                        vert, edge, tria, tria_6col, free_vertices, part, conn, hvrt
+                    )
                     smooth_weights = compute_smoothing_weights(
                         vert, edge, EMAT, vdeg, hvrt
                     )
@@ -552,12 +574,12 @@ def smood(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg
     return vert, conn, tria, tnum
 
 
-def compute_free_vertices(nvrt, conn, part):
+def compute_free_vertices(nvrt, conn, part, allow_constraint_sliding=False):
     """
     Compute which vertices are free to move.
     
-    Vertices on external boundaries (part) are fixed.
-    Vertices on internal constrained edges can move for orthogonalization.
+    Vertices on external boundaries (part) are always fixed.
+    Vertices on internal constrained edges are free if allow_constraint_sliding=True.
     
     Parameters
     ----------
@@ -567,6 +589,9 @@ def compute_free_vertices(nvrt, conn, part):
         All constrained edges (PSLG).
     part : list of ndarray
         List of edge indices in conn that define external boundaries.
+    allow_constraint_sliding : bool, default = False
+        If True, vertices on internal constrained edges are considered free (can slide along lines).
+        If False, all constrained vertices are fixed.
     
     Returns
     -------
@@ -575,6 +600,7 @@ def compute_free_vertices(nvrt, conn, part):
     """
     free_vertices = np.ones(nvrt, dtype=bool)
     if part is not None and conn is not None and len(conn) > 0:
+        # Always fix vertices on external boundaries
         external_vertex_set = set()
         for p in part:
             if p is not None and len(p) > 0:
@@ -585,8 +611,32 @@ def compute_free_vertices(nvrt, conn, part):
         external_vertex_array = np.array(list(external_vertex_set))
         if len(external_vertex_array) > 0:
             free_vertices[external_vertex_array] = False
+        
+        # Handle internal constrained vertices based on allow_constraint_sliding
+        if not allow_constraint_sliding:
+            # Fix all constrained vertices if sliding is not allowed
+            external_edge_set = set()
+            for p in part:
+                if p is not None and len(p) > 0:
+                    part_edges = conn[p, :]
+                    part_edges_sorted = np.sort(part_edges, axis=1)
+                    for e in part_edges_sorted:
+                        external_edge_set.add(tuple(e))
+            
+            conn_sorted = np.sort(conn, axis=1)
+            internal_constrained_vertices = set()
+            for e in conn_sorted:
+                edge_tuple = tuple(e)
+                if edge_tuple not in external_edge_set:
+                    internal_constrained_vertices.add(int(e[0]))
+                    internal_constrained_vertices.add(int(e[1]))
+            
+            internal_vertex_array = np.array(list(internal_constrained_vertices))
+            if len(internal_vertex_array) > 0:
+                free_vertices[internal_vertex_array] = False
     else:
-        if conn is not None and len(conn) > 0:
+        # If no part info, fix all constrained vertices if sliding is not allowed
+        if not allow_constraint_sliding and conn is not None and len(conn) > 0:
             free_vertices[conn.flatten()] = False
     return free_vertices
 
@@ -697,13 +747,14 @@ def check_internal_constrained_orthogonality(vert, edge, tria, conn, part, ortho
     return n_poor_ortho
 
 
-def compute_orthogonalization_weights(vert, edge, tria, tria_6col, free_vertices, part=None, conn=None):
+def compute_orthogonalization_weights(vert, edge, tria, tria_6col, free_vertices, part=None, conn=None, hvrt=None):
     """
     Compute orthogonalization weights based on edge aspect ratios.
 
     This function computes weights that encourage orthogonal edges by
     optimizing aspect ratios, similar to Delft3D's orthogonalizer.
     Uses a simplified but efficient approach for performance.
+    Weights are normalized by mesh-size function to respect hfun constraints.
 
     Parameters
     ----------
@@ -723,6 +774,9 @@ def compute_orthogonalization_weights(vert, edge, tria, tria_6col, free_vertices
     conn : ndarray of shape (E_conn, 2), optional
         Array of all constrained edges (PSLG). Used to identify external
         boundary edges when part is provided.
+    hvrt : ndarray of shape (V,), optional
+        Mesh-size function values at vertices. If provided, weights are
+        normalized to respect mesh-size constraints.
 
     Returns
     -------
@@ -740,6 +794,19 @@ def compute_orthogonalization_weights(vert, edge, tria, tria_6col, free_vertices
 
     evec_norm = evec / elen[:, None]
     aspect_ratios = np.ones(nedg, dtype=np.float64)
+    
+    # Normalize weights by mesh-size function if provided
+    h_weights = np.ones(nedg, dtype=np.float64)
+    if hvrt is not None:
+        hmid = 0.5 * (hvrt[edge[:, 0]] + hvrt[edge[:, 1]])
+        hmid = np.maximum(hmid, np.finfo(float).eps)
+        hmid = np.where(np.isfinite(hmid), hmid, np.finfo(float).eps)
+        # Weight inversely proportional to target edge length
+        # Longer target edges get lower weight (less orthogonalization)
+        h_weights = 1.0 / (hmid + np.finfo(float).eps)
+        h_weights = np.where(np.isfinite(h_weights), h_weights, 1.0)
+        # Normalize to avoid scaling issues
+        h_weights = h_weights / (np.mean(h_weights) + np.finfo(float).eps)
 
     has_two_tri = edge[:, 3] > 0
     if np.any(has_two_tri):
@@ -788,6 +855,8 @@ def compute_orthogonalization_weights(vert, edge, tria, tria_6col, free_vertices
             aspect_ratios[has_two_tri], 
             1.0
         )
+        # Apply mesh-size function weighting
+        aspect_ratios[has_two_tri] = aspect_ratios[has_two_tri] * h_weights[has_two_tri]
 
     is_external_boundary = np.zeros(nedg, dtype=bool)
     if part is not None and conn is not None and len(conn) > 0:
@@ -867,9 +936,10 @@ def compute_smoothing_weights(vert, edge, EMAT, vdeg, hvrt):
 
 def project_vertex_on_constraint_line(vertex_idx, new_pos, conn, part, vert, allow_junctions=False):
     """
-    Project a vertex position onto its constraint line if it's on an internal constrained edge.
+    Project a vertex position onto its constraint line(s) if it's on an internal constrained edge.
     
-    Vertices at junctions (on multiple constraint lines) are excluded unless allow_junctions=True.
+    For vertices at junctions (on multiple constraint lines), projects onto the closest line
+    or the intersection if allow_junctions=True.
     
     Parameters
     ----------
@@ -885,6 +955,7 @@ def project_vertex_on_constraint_line(vertex_idx, new_pos, conn, part, vert, all
         Current vertex coordinates.
     allow_junctions : bool, default = False
         If True, allow projection for vertices at junctions (on multiple constraint lines).
+        For junctions, projects onto the closest constraint line.
         If False, only project vertices on exactly one constraint line (not at junctions).
     
     Returns
@@ -917,6 +988,33 @@ def project_vertex_on_constraint_line(vertex_idx, new_pos, conn, part, vert, all
     if not allow_junctions and len(constraint_lines) > 1:
         return vert[vertex_idx, :]
     
+    # For junctions with allow_junctions=True, project onto the closest line
+    if len(constraint_lines) > 1:
+        min_dist_sq = np.inf
+        best_projected = new_pos
+        
+        for v1_idx, v2_idx in constraint_lines:
+            v1 = vert[v1_idx, :]
+            v2 = vert[v2_idx, :]
+            
+            line_dir = v2 - v1
+            line_len_sq = np.sum(line_dir**2)
+            
+            if line_len_sq < np.finfo(float).eps:
+                continue
+            
+            to_point = new_pos - v1
+            t = np.dot(to_point, line_dir) / line_len_sq
+            projected = v1 + t * line_dir
+            
+            dist_sq = np.sum((new_pos - projected)**2)
+            if dist_sq < min_dist_sq:
+                min_dist_sq = dist_sq
+                best_projected = projected
+        
+        return best_projected
+    
+    # Single constraint line
     v1_idx, v2_idx = constraint_lines[0]
     v1 = vert[v1_idx, :]
     v2 = vert[v2_idx, :]
@@ -1062,34 +1160,38 @@ def evalhfn(vert, edge, EMAT, hfun=None, harg=[]):
     hvrt : ndarray of shape (N,)
         Mesh-size function values evaluated at the vertices.
     """
+    # Fast path for scalar hfun
+    if hfun is not None and np.isscalar(hfun):
+        return hfun * np.ones(vert.shape[0], dtype=np.float64)
+    
+    # Compute default (mean edge length) only if needed
     evec = vert[edge[:, 1], :] - vert[edge[:, 0], :]
     elen = np.sqrt(np.sum(evec**2, axis=1))
-    default_hvrt = np.ravel(EMAT @ elen) / np.maximum(
-        np.ravel(np.sum(EMAT, axis=1)), np.finfo(float).eps
+    elen = np.where(np.isfinite(elen), elen, 0.0)
+    
+    # Use sparse matrix multiplication (more efficient)
+    default_hvrt = np.ravel(EMAT.dot(elen))
+    vdeg_sum = np.ravel(EMAT.sum(axis=1))
+    default_hvrt = np.where(
+        vdeg_sum > np.finfo(float).eps,
+        default_hvrt / np.maximum(vdeg_sum, np.finfo(float).eps),
+        np.inf
     )
-    free = np.ones(vert.shape[0], dtype=bool)
-    free[edge[:, 0]] = False
-    free[edge[:, 1]] = False
-    default_hvrt[free] = np.inf
     default_hvrt = np.where(np.isfinite(default_hvrt), default_hvrt, np.inf)
 
-    if hfun is not None and (np.isscalar(hfun) or callable(hfun)):
-        if np.isscalar(hfun):
-            hvrt = hfun * np.ones(vert.shape[0])
-        else:
-            try:
-                hvrt = np.asarray(hfun(vert, *harg)).flatten()
-            except Exception:
-                hvrt = default_hvrt.copy()
-            else:
-                if hvrt.size != vert.shape[0]:
-                    raise ValueError(
-                        "smood:evalhfn - hfun must return one value per vertex, "
-                        f"got size {hvrt.size} for {vert.shape[0]} vertices."
-                    )
-                bad = ~np.isfinite(hvrt) | (hvrt <= 0)
-                hvrt[bad] = default_hvrt[bad]
-                hvrt = np.where(np.isfinite(hvrt), hvrt, default_hvrt)
+    if hfun is not None and callable(hfun):
+        try:
+            hvrt = np.asarray(hfun(vert, *harg)).flatten()
+            if hvrt.size != vert.shape[0]:
+                raise ValueError(
+                    "smood:evalhfn - hfun must return one value per vertex, "
+                    f"got size {hvrt.size} for {vert.shape[0]} vertices."
+                )
+            bad = ~np.isfinite(hvrt) | (hvrt <= 0)
+            hvrt = np.where(bad, default_hvrt, hvrt)
+            hvrt = np.where(np.isfinite(hvrt), hvrt, default_hvrt)
+        except Exception:
+            hvrt = default_hvrt.copy()
     else:
         hvrt = default_hvrt.copy()
 
@@ -1204,6 +1306,13 @@ def makeopt_smood(opts=None):
         if not (0.0 <= opts["orthogonality_threshold"] <= 1.0):
             raise ValueError("smood:invalidOptionValues - ORTHOGONALITY_THRESHOLD must be in [0, 1].")
     
+    # --------------------------- ALLOW_CONSTRAINT_SLIDING_JUNCTIONS (check first)
+    if "allow_constraint_sliding_junctions" not in opts:
+        opts["allow_constraint_sliding_junctions"] = False  # Don't allow sliding at junctions by default
+    else:
+        if not isinstance(opts["allow_constraint_sliding_junctions"], bool):
+            raise TypeError("smood:incorrectInputClass - Incorrect input class.")
+    
     # --------------------------- ALLOW_CONSTRAINT_SLIDING
     if "allow_constraint_sliding" not in opts:
         opts["allow_constraint_sliding"] = False  # Allow vertices on constraint lines to slide along lines
@@ -1211,12 +1320,9 @@ def makeopt_smood(opts=None):
         if not isinstance(opts["allow_constraint_sliding"], bool):
             raise TypeError("smood:incorrectInputClass - Incorrect input class.")
     
-    # --------------------------- ALLOW_CONSTRAINT_SLIDING_JUNCTIONS
-    if "allow_constraint_sliding_junctions" not in opts:
-        opts["allow_constraint_sliding_junctions"] = False  # Don't allow sliding at junctions by default
-    else:
-        if not isinstance(opts["allow_constraint_sliding_junctions"], bool):
-            raise TypeError("smood:incorrectInputClass - Incorrect input class.")
+    # If allow_constraint_sliding_junctions is True, automatically enable allow_constraint_sliding
+    if opts["allow_constraint_sliding_junctions"]:
+        opts["allow_constraint_sliding"] = True
 
     # --------------------------- MAX_FINAL_SMALLLINK_ITER
     if "max_final_smalllink_iter" not in opts:

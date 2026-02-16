@@ -132,7 +132,7 @@ def getiso_polygone(x, y, z, zmax=None, grid_res=None) -> Polygon:
     else:
         X, Y = x, y
         
-    if z.ndim == 2 and X.shape == 1 and  Y.shape == 1:
+    if z.ndim == 2 and X.ndim == 1 and  Y.ndim == 1:
         X, Y = np.meshgrid(X, Y)
 
     if X.shape != Y.shape or X.shape != z.shape:
