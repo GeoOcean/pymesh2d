@@ -64,7 +64,7 @@ def smood(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg
           Maximum acceptable orthogonality value (|cos(angle)|) for internal constrained edges.
           Lower values are better (0.0 = perfect orthogonality, 1.0 = parallel).
           Edges with orthogonality > threshold are considered "poor" and prevent convergence.
-        - 'allow_constraint_sliding' : bool, default = True
+        - 'allow_constraint_sliding' : bool, default = False
           If True, allow vertices on internal constrained edges to slide along their constraint lines
           to improve orthogonality. Vertices at junctions (on multiple constraint lines) remain fixed
           unless allow_constraint_sliding_junctions=True.
@@ -264,7 +264,7 @@ def smood(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg
             vnew = relaxation * vnew + (1.0 - relaxation) * vert
 
             # Project vertices on constraint lines
-            allow_constraint_sliding = opts.get("allow_constraint_sliding", True)
+            allow_constraint_sliding = opts.get("allow_constraint_sliding", False)
             allow_junctions = opts.get("allow_constraint_sliding_junctions", False)
             
             if allow_constraint_sliding and conn is not None and len(conn) > 0 and part is not None:
@@ -1206,7 +1206,7 @@ def makeopt_smood(opts=None):
     
     # --------------------------- ALLOW_CONSTRAINT_SLIDING
     if "allow_constraint_sliding" not in opts:
-        opts["allow_constraint_sliding"] = True  # Allow vertices on constraint lines to slide along lines
+        opts["allow_constraint_sliding"] = False  # Allow vertices on constraint lines to slide along lines
     else:
         if not isinstance(opts["allow_constraint_sliding"], bool):
             raise TypeError("smood:incorrectInputClass - Incorrect input class.")
