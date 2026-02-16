@@ -1,6 +1,161 @@
 import numpy as np
 from shapely.geometry import Polygon, LineString
 
+try:
+    from scipy.spatial import cKDTree
+except ImportError:
+    cKDTree = None
+
+
+def resample_polygon_hfun(polygon, hfun, harg=()):
+    """
+    Resample a closed polygon so that consecutive vertices are spaced by
+    approximately h(p) along the contour, where h is given by the mesh-size
+    function (same contract as in pymesh2d). The input vertex density has
+    minimal influence on the result. NaN values from hfun are replaced by the
+    h-value at the nearest polygon vertex.
+
+    Parameters
+    ----------
+    polygon : shapely.geometry.Polygon or ndarray of shape (N, 2)
+        Polygon to resample. Either a Shapely Polygon (exterior ring is used)
+        or an array of vertices (x, y) in order along the boundary.
+    hfun : float or callable
+        Mesh-size function. If callable, must have signature hfun(pts, *harg)
+        with pts of shape (M, 2), returning mesh-size values (M,) or scalar.
+        If float, a constant spacing is used.
+    harg : tuple, optional
+        Extra arguments passed to hfun when callable.
+
+    Returns
+    -------
+    shapely.geometry.Polygon
+        Resampled polygon (exterior only; no holes). Invalid geometries are
+        fixed with buffer(0).
+
+    Raises
+    ------
+    ValueError
+        If polygon is not a Shapely Polygon or an (N, 2) array.
+    ImportError
+        If scipy is not available (required for nearest-neighbor NaN fill).
+    """
+    if cKDTree is None:
+        raise ImportError("resample_polygon_hfun requires scipy (scipy.spatial.cKDTree)")
+
+    # Extract (N, 2) vertex array from Shapely Polygon or array input
+    if hasattr(polygon, "exterior") and hasattr(polygon.exterior, "coords"):
+        coords = np.array(polygon.exterior.coords)
+        if len(coords) > 1 and np.allclose(coords[0], coords[-1]):
+            coords = coords[:-1]
+        polygon = np.asarray(coords, dtype=float)
+    else:
+        polygon = np.asarray(polygon, dtype=float)
+
+    if polygon.ndim != 2 or polygon.shape[1] != 2:
+        raise ValueError("polygon must be a Shapely Polygon or an (N, 2) array")
+    n = polygon.shape[0]
+    if n < 2:
+        if n == 0:
+            return Polygon()
+        if n == 1:
+            return Polygon([polygon[0], polygon[0], polygon[0], polygon[0]])
+        # Two points: close ring for Shapely
+        return Polygon(np.vstack([polygon, polygon[0:1]]))
+
+    # Build segment list and cumulative arc length for closed contour
+    segs = [(polygon[i], polygon[(i + 1) % n]) for i in range(n)]
+    nseg = len(segs)
+    seg_len = np.array([np.linalg.norm(segs[i][1] - segs[i][0]) for i in range(nseg)])
+    eps = np.finfo(float).eps
+    seg_len = np.maximum(seg_len, eps)
+    s_cum = np.concatenate([[0], np.cumsum(seg_len)])
+    s_total = s_cum[-1]
+    if s_total <= 0:
+        return Polygon(polygon[:1])
+
+    def s_to_xy(s):
+        """Map arc length s in [0, s_total) to (x, y) on the contour."""
+        s = np.clip(float(s), 0.0, s_total - 1e-12)
+        i = int(np.searchsorted(s_cum[1:], s, side="right"))
+        if i >= nseg:
+            i = nseg - 1
+        t = (s - s_cum[i]) / seg_len[i]
+        a, b = np.asarray(segs[i][0]), np.asarray(segs[i][1])
+        return (1 - t) * a + t * b
+
+    def eval_h_raw(pts):
+        """Evaluate hfun at pts; may contain NaN."""
+        pts = np.atleast_2d(pts)
+        if np.isscalar(hfun) or isinstance(hfun, (int, float, np.number)):
+            return np.full(pts.shape[0], float(hfun))
+        return np.asarray(hfun(pts, *harg)).ravel()[: pts.shape[0]]
+
+    # Evaluate h at polygon vertices and replace NaN with nearest-vertex value
+    h_verts = eval_h_raw(polygon).astype(float)
+    nan_mask = np.isnan(h_verts)
+    if np.any(nan_mask):
+        tree = cKDTree(polygon)
+        ok = np.where(~nan_mask)[0]
+        if len(ok) == 0:
+            h_verts[:] = 1.0
+        else:
+            for i in np.where(nan_mask)[0]:
+                _, j = tree.query(polygon[i], k=1)
+                j = j if np.isscalar(j) else j[0]
+                if nan_mask[j]:
+                    h_verts[i] = (
+                        np.nanmean(h_verts[~nan_mask])
+                        if np.any(~nan_mask)
+                        else 1.0
+                    )
+                else:
+                    h_verts[i] = h_verts[j]
+    tree_poly = cKDTree(polygon)
+
+    def eval_h(pts):
+        """Evaluate h at pts; NaN replaced by h at nearest polygon vertex."""
+        pts = np.atleast_2d(pts)
+        h = eval_h_raw(pts).astype(float)
+        nan_pts = np.isnan(h)
+        if np.any(nan_pts):
+            idx_nan = np.where(nan_pts)[0]
+            _, nearest = tree_poly.query(pts[idx_nan], k=1)
+            if np.ndim(nearest) == 0:
+                nearest = np.array([nearest])
+            h[idx_nan] = h_verts[nearest]
+        return h
+
+    # March along contour with step size h(s)
+    out = [np.asarray(polygon[0], dtype=float)]
+    s_current = 0.0
+    h_min = np.nanmin(eval_h(polygon))
+    if not np.isfinite(h_min) or h_min <= 0:
+        h_min = max(s_total * 0.01, eps)
+    max_pts = int(np.ceil(s_total / h_min)) + 20
+    max_pts = max(max_pts, 4)
+
+    for _ in range(max_pts):
+        pt = s_to_xy(s_current)
+        h_val = float(eval_h(pt.reshape(1, -1))[0])
+        if not np.isfinite(h_val) or h_val <= 0:
+            h_val = h_min
+        step = max(h_val, s_total * 1e-10)
+        s_next = s_current + step
+        if s_next >= s_total:
+            break
+        next_pt = s_to_xy(s_next)
+        out.append(next_pt)
+        s_current = s_next
+
+    node = np.array(out)
+    # Close ring for Shapely: first point repeated at end
+    exterior_ring = np.vstack([node, node[0:1]])
+    poly_resampled = Polygon(exterior_ring)
+    if not poly_resampled.is_valid:
+        poly_resampled = poly_resampled.buffer(0)
+    return poly_resampled
+
 
 def resample_polygon(polygon, spacing: float):
     """
