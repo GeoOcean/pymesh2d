@@ -6,7 +6,6 @@ from scipy.sparse import csr_matrix
 
 from .mesh_cost.triscr import triscr
 from .mesh_util.deltri import deltri
-from .mesh_util.circo import fix_small_flow_links
 from .mesh_util.setset import setset
 from .mesh_util.tricon import tricon
 
@@ -208,18 +207,14 @@ def smooth(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, har
             # projected points from each end
             ipos = vert[edge[:, 0], :] - 0.67 * (scal[:, None] * evec)
             jpos = vert[edge[:, 1], :] + 0.67 * (scal[:, None] * evec)
-            # scal = ...                      nlin. weight
-            # scal = np.maximum(np.abs(scal) ** 5, np.finfo(float).eps ** 0.75)
             scal = np.maximum(np.abs(scal) ** 1, np.finfo(float).eps ** 0.75)
             # sum contributions edge-to-vert
             vnew = IMAT.dot(scal[:, None] * ipos) + JMAT.dot(scal[:, None] * jpos)
             vsum = np.maximum(EMAT.dot(scal), np.finfo(float).eps ** 0.75)
 
             vnew = vnew / vsum[:, None]
-            # fixed points. edge projection?
             vnew[conn.flatten(), :] = vert[conn.flatten(), :]
             vnew[vdeg == 0, :] = vert[vdeg == 0, :]
-            # reset for the next local iter.
             vert = vnew
 
         tcpu["iter"] += time.time() - ttic
@@ -372,12 +367,6 @@ def smooth(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, har
         vert, conn, tria, tnum = deltri(vert, conn, node, PSLG, part)
         tcpu["dtri"] += time.time() - ttic
 
-        # ------------------------------------- fix small flow links
-        if "removesmalllinkstrsh" in opts:
-            vert, conn, tria, tnum = fix_small_flow_links(
-                vert, conn, tria, tnum, node, PSLG, part, opts
-            )
-
         # ------------------------------------- dump-out progress
         vdel = vdel / (hvrt.flatten() ** 2)
         move = vdel > opts["vtol"] ** 2
@@ -453,25 +442,37 @@ def evalhfn(vert, edge, EMAT, hfun=None, harg=[]):
     Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
 
+    # Default: mean edge length at each vertex (used when no hfun or as fallback)
+    evec = vert[edge[:, 1], :] - vert[edge[:, 0], :]
+    elen = np.sqrt(np.sum(evec**2, axis=1))
+    default_hvrt = np.ravel(EMAT @ elen) / np.maximum(
+        np.ravel(np.sum(EMAT, axis=1)), np.finfo(float).eps
+    )
+    free = np.ones(vert.shape[0], dtype=bool)
+    free[edge[:, 0]] = False
+    free[edge[:, 1]] = False
+    default_hvrt[free] = np.inf
+
     if hfun is not None and (np.isscalar(hfun) or callable(hfun)):
         if np.isscalar(hfun):
             hvrt = hfun * np.ones(vert.shape[0])
         else:
-            hvrt = hfun(vert, *harg)
+            try:
+                hvrt = np.asarray(hfun(vert, *harg)).flatten()
+            except Exception:
+                # hfun peut échouer sur des sommets hors domaine (ex. bbox) -> fallback global
+                hvrt = default_hvrt.copy()
+            else:
+                if hvrt.size != vert.shape[0]:
+                    raise ValueError(
+                        "smooth:evalhfn - hfun must return one value per vertex, "
+                        f"got size {hvrt.size} for {vert.shape[0]} vertices."
+                    )
+                # Sommets hors domaine (ex. bbox) peuvent donner NaN/inf : on utilise le défaut
+                bad = ~np.isfinite(hvrt) | (hvrt <= 0)
+                hvrt[bad] = default_hvrt[bad]
     else:
-        # no HFUN - HVRT is mean edge-len. at vertices!
-        evec = vert[edge[:, 1], :] - vert[edge[:, 0], :]
-        elen = np.sqrt(np.sum(evec**2, axis=1))
-
-        hvrt = np.ravel(EMAT @ elen) / np.maximum(
-            np.ravel(np.sum(EMAT, axis=1)), np.finfo(float).eps
-        )
-
-        free = np.ones(vert.shape[0], dtype=bool)
-        free[edge[:, 0]] = False
-        free[edge[:, 1]] = False
-
-        hvrt[free] = np.inf
+        hvrt = default_hvrt.copy()
 
     return hvrt
 
