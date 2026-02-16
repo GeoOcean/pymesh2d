@@ -157,11 +157,12 @@ def interpolate_from_tiff(
 def interpolate_from_xr(
     ds,
     vert,
-    input_crs=None,
     order=3,
     mode="constant",
     cval=np.nan,
     var_name="elevation",
+    fill_nan=True,
+    handle_out_of_bounds="nearest",
 ):
     """
     Fast interpolation of bathymetry values from an xarray.Dataset (e.g. GEBCO)
@@ -172,9 +173,7 @@ def interpolate_from_xr(
     ds : xarray.Dataset
         Dataset with coordinates 'lat' and 'lon' and variable `var_name`.
     vert : (N, 2) array
-        Node coordinates (x, y) in input CRS (e.g., UTM).
-    input_crs : str or pyproj.CRS, optional
-        CRS of input mesh. If None, assumes same as dataset CRS (EPSG:4326).
+        Node coordinates (lon, lat) in degrees (EPSG:4326).
     order : int, optional
         Interpolation order (0=nearest, 1=bilinear, 3=bicubic). Default 3.
     mode : str, optional
@@ -183,6 +182,11 @@ def interpolate_from_xr(
         Constant value outside domain if mode="constant". Default np.nan.
     var_name : str, optional
         Name of the variable in `ds` containing elevation values.
+    fill_nan : bool, optional
+        If True, fill NaN values in dataset with nearest valid value. Default True.
+    handle_out_of_bounds : str, optional
+        How to handle out-of-bounds points: "nearest" (use nearest neighbor),
+        "nan" (return NaN), or "clip" (clip to domain bounds). Default "nearest".
 
     Returns
     -------
@@ -194,28 +198,71 @@ def interpolate_from_xr(
     lon = ds["lon"].values
     lat = ds["lat"].values
     band = np.asarray(ds[var_name].values).astype(float)
+    
+    # Handle NaN values in band (e.g., land mask)
+    if fill_nan and np.isnan(band).any():
+        mask = np.isnan(band)
+        _, indices = distance_transform_edt(mask, return_indices=True)
+        band = band[tuple(indices)]
 
-    # -----------------------prepare transformer (input CRS -> dataset CRS)
-    ds_crs = pyproj.CRS.from_user_input("EPSG:4326")
-    if input_crs is not None:
-        input_crs = pyproj.CRS.from_user_input(input_crs)
-    else:
-        input_crs = ds_crs
-
-    if input_crs != ds_crs:
-        transformer = pyproj.Transformer.from_crs(
-            input_crs, ds_crs, always_xy=True
-        ).transform
-        xs, ys = transformer(vert[:, 0], vert[:, 1])
-    else:
-        xs, ys = vert[:, 0], vert[:, 1]
+    # -----------------------extract coordinates (assumed to be lon/lat)
+    xs, ys = vert[:, 0], vert[:, 1]
 
     # -----------------------compute pixel indices
-    # assuming regular lon/lat grid (sorted)
+    # np.interp returns indices even for out-of-bounds values (extrapolates)
     lon_idx = np.interp(xs, lon, np.arange(len(lon)))
     lat_idx = np.interp(ys, lat, np.arange(len(lat)))
-
-    # -----------------------map_coordinates expects row (y) then col (x)
-    z = -map_coordinates(band, [lat_idx, lon_idx], order=order, mode=mode, cval=cval)
+    
+    # -----------------------identify points inside/outside domain
+    lon_min, lon_max = lon.min(), lon.max()
+    lat_min, lat_max = lat.min(), lat.max()
+    
+    mask_inside = (
+        (xs >= lon_min) & (xs <= lon_max) &
+        (ys >= lat_min) & (ys <= lat_max)
+    )
+    
+    # Initialize output array
+    z = np.full_like(xs, np.nan, dtype=float)
+    
+    # -----------------------interpolate points inside domain
+    if np.any(mask_inside):
+        # Clip indices to valid range for map_coordinates
+        lat_idx_clip = np.clip(lat_idx[mask_inside], 0, len(lat) - 1)
+        lon_idx_clip = np.clip(lon_idx[mask_inside], 0, len(lon) - 1)
+        
+        z[mask_inside] = -map_coordinates(
+            band,
+            [lat_idx_clip, lon_idx_clip],
+            order=order,
+            mode=mode,
+            cval=cval,
+            prefilter=(order > 1)  # Prefilter only for order > 1 (bicubic)
+        )
+    
+    # -----------------------handle out-of-bounds points
+    if np.any(~mask_inside):
+        if handle_out_of_bounds == "nearest":
+            # Use nearest neighbor for out-of-bounds points
+            lat_idx_clip = np.clip(lat_idx[~mask_inside], 0, len(lat) - 1).astype(int)
+            lon_idx_clip = np.clip(lon_idx[~mask_inside], 0, len(lon) - 1).astype(int)
+            z[~mask_inside] = -band[lat_idx_clip, lon_idx_clip]
+        elif handle_out_of_bounds == "clip":
+            # Clip coordinates to domain and interpolate
+            xs_clip = np.clip(xs[~mask_inside], lon_min, lon_max)
+            ys_clip = np.clip(ys[~mask_inside], lat_min, lat_max)
+            lon_idx_clip = np.interp(xs_clip, lon, np.arange(len(lon)))
+            lat_idx_clip = np.interp(ys_clip, lat, np.arange(len(lat)))
+            lat_idx_clip = np.clip(lat_idx_clip, 0, len(lat) - 1)
+            lon_idx_clip = np.clip(lon_idx_clip, 0, len(lon) - 1)
+            z[~mask_inside] = -map_coordinates(
+                band,
+                [lat_idx_clip, lon_idx_clip],
+                order=order,
+                mode=mode,
+                cval=cval,
+                prefilter=(order > 1)
+            )
+        # else: "nan" - already initialized with NaN
 
     return z
