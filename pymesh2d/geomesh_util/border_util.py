@@ -147,64 +147,101 @@ def identify_boundary(vert, tria, z, zlim=0.0, Manual_open_boundary=None):
         Land boundary edges (node1, node2).
     """
 
-    # --- Build edge list
+    # --- Build boundary edge list
     edges = np.vstack([tria[:, [0, 1]], tria[:, [1, 2]], tria[:, [2, 0]]])
     edges = np.sort(edges, axis=1)
-
     edges_sorted, counts = np.unique(edges, axis=0, return_counts=True)
     edge_free = edges_sorted[counts == 1]
     if edge_free.size == 0:
         return np.zeros((0, 3)), np.zeros((0, 2)), np.zeros((0, 2))
 
-    loops = build_loops(edge_free)
-
-    # --- Identify outer and inner loops
-    polygons = []
-    for loop in loops:
-        xy = vert[loop]
-        ring = LinearRing(xy)
-        polygons.append((loop, ring.area))
-
-    polygons.sort(key=lambda x: x[1], reverse=True)
-    outer_loop = polygons[0][0]
-    inner_loops = [p[0] for p in polygons[1:]]
-
+    # --- Classify each boundary edge by depth and optional manual open polygon (no loops)
     edge_open = []
     edge_land = []
+    for (a, b) in edge_free:
+        zmean = 0.5 * (z[a] + z[b])
+        mid = (vert[a] + vert[b]) / 2.0
+        in_manual_open = False
+        if Manual_open_boundary is not None:
+            in_manual_open = Manual_open_boundary.contains(Point(mid))
+        if zmean > zlim or in_manual_open:
+            edge_open.append([a, b])
+        else:
+            edge_land.append([a, b])
 
-    # --- Classify edges
-    for loop in [outer_loop] + inner_loops:
-        for i in range(len(loop) - 1):
-            a, b = loop[i], loop[i + 1]
-            zmean = 0.5 * (z[a] + z[b])
+    edge_open = np.array(edge_open, dtype=int) if edge_open else np.empty((0, 2), dtype=int)
+    edge_land = np.array(edge_land, dtype=int) if edge_land else np.empty((0, 2), dtype=int)
 
-            # Calculate midpoint
-            mid = (vert[a] + vert[b]) / 2.0
-
-            # --- Test if inside manual open boundary
-            in_manual_open = False
-            if Manual_open_boundary is not None:
-                in_manual_open = Manual_open_boundary.contains(Point(mid))
-
-            # --- Final classification
-            if (loop is outer_loop and zmean > zlim) or in_manual_open:
-                edge_open.append([a, b])
-            else:
-                edge_land.append([a, b])
-
-    edge_open = np.array(edge_open, dtype=int)
-    edge_land = np.array(edge_land, dtype=int)
+    # --- Order edges along contours
+    edge_open = _order_edges_as_chains(edge_open)
+    edge_land = _order_edges_as_chains(edge_land)
 
     # --- Assemble edge tags
     tag_open = np.ones((edge_open.shape[0], 1), dtype=int)
     tag_land = np.full((edge_land.shape[0], 1), 2, dtype=int)
-
     edge_tag_parts = []
     if edge_open.shape[0] > 0:
         edge_tag_parts.append(np.hstack([edge_open, tag_open]))
     if edge_land.shape[0] > 0:
         edge_tag_parts.append(np.hstack([edge_land, tag_land]))
-
-    edge_tag = np.vstack(edge_tag_parts) if edge_tag_parts else np.empty((0, 3))
+    edge_tag = np.vstack(edge_tag_parts) if edge_tag_parts else np.empty((0, 3), dtype=int)
 
     return edge_tag, edge_open, edge_land
+
+    return edge_tag, edge_open, edge_land
+
+def _order_edges_as_chains(edges):
+    """Order edges so that consecutive rows share a vertex (open chains or closed loops)."""
+    if edges is None or edges.size == 0:
+        return np.empty((0, 2), dtype=int)
+    edges = np.asarray(edges, dtype=int)
+    out_rows = []
+    used = set()
+    adj = {}
+    for i in range(edges.shape[0]):
+        u, v = int(edges[i, 0]), int(edges[i, 1])
+        if u not in adj:
+            adj[u] = []
+        adj[u].append((i, v))
+        if v not in adj:
+            adj[v] = []
+        adj[v].append((i, u))
+    for start_edge_idx in range(edges.shape[0]):
+        if start_edge_idx in used:
+            continue
+        a0, b0 = edges[start_edge_idx, 0], edges[start_edge_idx, 1]
+        used.add(start_edge_idx)
+        chain = [a0, b0]
+        while True:
+            tail = chain[-1]
+            if tail not in adj:
+                break
+            found = False
+            for i, other in adj[tail]:
+                if i in used:
+                    continue
+                used.add(i)
+                chain.append(other)
+                found = True
+                break
+            if not found:
+                break
+            if len(chain) >= 2 and chain[-1] == chain[0]:
+                break
+        while True:
+            head = chain[0]
+            if head not in adj:
+                break
+            found = False
+            for i, other in adj[head]:
+                if i in used:
+                    continue
+                used.add(i)
+                chain.insert(0, other)
+                found = True
+                break
+            if not found:
+                break
+        for i in range(len(chain) - 1):
+            out_rows.append([chain[i], chain[i + 1]])
+    return np.array(out_rows, dtype=int) if out_rows else np.empty((0, 2), dtype=int)
