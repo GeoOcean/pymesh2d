@@ -7,61 +7,51 @@ except ImportError:
     cKDTree = None
 
 
-def resample_polygon_hfun(polygon, hfun, harg=()):
+def _resample_ring_hfun(ring_coords, hfun, harg=()):
     """
-    Resample a closed polygon so that consecutive vertices are spaced by
-    approximately h(p) along the contour, where h is given by the mesh-size
-    function (same contract as in pymesh2d). The input vertex density has
-    minimal influence on the result. NaN values from hfun are replaced by the
-    h-value at the nearest polygon vertex.
-
+    Helper function to resample a single ring (exterior or interior) using hfun.
+    
     Parameters
     ----------
-    polygon : shapely.geometry.Polygon or ndarray of shape (N, 2)
-        Polygon to resample. Either a Shapely Polygon (exterior ring is used)
-        or an array of vertices (x, y) in order along the boundary.
+    ring_coords : ndarray of shape (N, 2)
+        Coordinates of the ring vertices.
     hfun : float or callable
-        Mesh-size function. If callable, must have signature hfun(pts, *harg)
-        with pts of shape (M, 2), returning mesh-size values (M,) or scalar.
-        If float, a constant spacing is used.
+        Mesh-size function.
     harg : tuple, optional
         Extra arguments passed to hfun when callable.
-
+    
     Returns
     -------
-    shapely.geometry.Polygon
-        Resampled polygon (exterior only; no holes). Invalid geometries are
-        fixed with buffer(0).
-
-    Raises
-    ------
-    ValueError
-        If polygon is not a Shapely Polygon or an (N, 2) array.
-    ImportError
-        If scipy is not available (required for nearest-neighbor NaN fill).
+    ndarray of shape (M, 2)
+        Resampled ring coordinates (closed, first point repeated at end).
     """
-    if cKDTree is None:
-        raise ImportError("resample_polygon_hfun requires scipy (scipy.spatial.cKDTree)")
-
-    # Extract (N, 2) vertex array from Shapely Polygon or array input
-    if hasattr(polygon, "exterior") and hasattr(polygon.exterior, "coords"):
-        coords = np.array(polygon.exterior.coords)
-        if len(coords) > 1 and np.allclose(coords[0], coords[-1]):
-            coords = coords[:-1]
-        polygon = np.asarray(coords, dtype=float)
-    else:
-        polygon = np.asarray(polygon, dtype=float)
-
-    if polygon.ndim != 2 or polygon.shape[1] != 2:
-        raise ValueError("polygon must be a Shapely Polygon or an (N, 2) array")
+    polygon = np.asarray(ring_coords, dtype=float)
     n = polygon.shape[0]
     if n < 2:
         if n == 0:
-            return Polygon()
+            # Empty ring: return empty array (will be skipped in resample_polygon_hfun)
+            return np.array([]).reshape(0, 2)
         if n == 1:
-            return Polygon([polygon[0], polygon[0], polygon[0], polygon[0]])
-        # Two points: close ring for Shapely
-        return Polygon(np.vstack([polygon, polygon[0:1]]))
+            # Single point: create a minimal valid ring (4 points)
+            p = polygon[0]
+            eps_ring = max(np.linalg.norm(p) * 1e-6, 1e-6)
+            return np.array([
+                p,
+                p + np.array([eps_ring, 0]),
+                p + np.array([eps_ring, eps_ring]),
+                p,  # closed
+            ])
+        # Two points: add a third point to form a valid ring
+        p1, p2 = polygon[0], polygon[1]
+        mid = (p1 + p2) / 2.0
+        perp = np.array([-(p2[1] - p1[1]), p2[0] - p1[0]])
+        perp_norm = np.linalg.norm(perp)
+        if perp_norm > 0:
+            perp = perp / perp_norm * np.linalg.norm(p2 - p1) * 0.1
+        else:
+            perp = np.array([1e-6, 0])
+        p3 = mid + perp
+        return np.array([p1, p2, p3, p1])  # closed
 
     # Build segment list and cumulative arc length for closed contour
     segs = [(polygon[i], polygon[(i + 1) % n]) for i in range(n)]
@@ -72,7 +62,30 @@ def resample_polygon_hfun(polygon, hfun, harg=()):
     s_cum = np.concatenate([[0], np.cumsum(seg_len)])
     s_total = s_cum[-1]
     if s_total <= 0:
-        return Polygon(polygon[:1])
+        # Degenerate ring: ensure at least 3 distinct points
+        if n < 3:
+            # Create minimal valid ring from available points
+            if n == 1:
+                p = polygon[0]
+                eps_ring = max(np.linalg.norm(p) * 1e-6, 1e-6)
+                return np.array([
+                    p,
+                    p + np.array([eps_ring, 0]),
+                    p + np.array([eps_ring, eps_ring]),
+                    p,
+                ])
+            elif n == 2:
+                p1, p2 = polygon[0], polygon[1]
+                mid = (p1 + p2) / 2.0
+                perp = np.array([-(p2[1] - p1[1]), p2[0] - p1[0]])
+                perp_norm = np.linalg.norm(perp)
+                if perp_norm > 0:
+                    perp = perp / perp_norm * np.linalg.norm(p2 - p1) * 0.1
+                else:
+                    perp = np.array([1e-6, 0])
+                p3 = mid + perp
+                return np.array([p1, p2, p3, p1])
+        return np.vstack([polygon[:3], polygon[0:1]])  # At least 3 points + closure
 
     def s_to_xy(s):
         """Map arc length s in [0, s_total) to (x, y) on the contour."""
@@ -149,9 +162,122 @@ def resample_polygon_hfun(polygon, hfun, harg=()):
         s_current = s_next
 
     node = np.array(out)
-    # Close ring for Shapely: first point repeated at end
-    exterior_ring = np.vstack([node, node[0:1]])
-    poly_resampled = Polygon(exterior_ring)
+    
+    # Ensure at least 3 distinct points (4 total with closure) for Shapely LinearRing
+    if len(node) < 3:
+        # If we have less than 3 points, create a minimal valid ring
+        if len(node) == 1:
+            # Single point: create a small triangle/square
+            p = node[0]
+            eps_ring = max(np.linalg.norm(p) * 1e-6, 1e-6)
+            node = np.array([
+                p,
+                p + np.array([eps_ring, 0]),
+                p + np.array([eps_ring, eps_ring]),
+            ])
+        elif len(node) == 2:
+            # Two points: add a third point to form a triangle
+            p1, p2 = node[0], node[1]
+            mid = (p1 + p2) / 2.0
+            perp = np.array([-(p2[1] - p1[1]), p2[0] - p1[0]])
+            perp_norm = np.linalg.norm(perp)
+            if perp_norm > 0:
+                perp = perp / perp_norm * np.linalg.norm(p2 - p1) * 0.1
+            else:
+                perp = np.array([1e-6, 0])
+            p3 = mid + perp
+            node = np.array([p1, p2, p3])
+    
+    # Close ring: first point repeated at end
+    return np.vstack([node, node[0:1]])
+
+
+def resample_polygon_hfun(polygon, hfun, harg=()):
+    """
+    Resample a closed polygon so that consecutive vertices are spaced by
+    approximately h(p) along the contour, where h is given by the mesh-size
+    function (same contract as in pymesh2d). The input vertex density has
+    minimal influence on the result. NaN values from hfun are replaced by the
+    h-value at the nearest polygon vertex. Holes (interiors) are preserved.
+
+    Parameters
+    ----------
+    polygon : shapely.geometry.Polygon or ndarray of shape (N, 2)
+        Polygon to resample. Either a Shapely Polygon (exterior and interiors
+        are resampled) or an array of vertices (x, y) in order along the boundary.
+    hfun : float or callable
+        Mesh-size function. If callable, must have signature hfun(pts, *harg)
+        with pts of shape (M, 2), returning mesh-size values (M,) or scalar.
+        If float, a constant spacing is used.
+    harg : tuple, optional
+        Extra arguments passed to hfun when callable.
+
+    Returns
+    -------
+    shapely.geometry.Polygon
+        Resampled polygon with exterior and holes (interiors) preserved.
+        Invalid geometries are fixed with buffer(0).
+
+    Raises
+    ------
+    ValueError
+        If polygon is not a Shapely Polygon or an (N, 2) array.
+    ImportError
+        If scipy is not available (required for nearest-neighbor NaN fill).
+    """
+    if cKDTree is None:
+        raise ImportError("resample_polygon_hfun requires scipy (scipy.spatial.cKDTree)")
+
+    # Check if input is a Shapely Polygon with holes
+    has_interiors = False
+    interiors = []
+    if hasattr(polygon, "exterior") and hasattr(polygon.exterior, "coords"):
+        # Extract exterior
+        coords = np.array(polygon.exterior.coords)
+        if len(coords) > 1 and np.allclose(coords[0], coords[-1]):
+            coords = coords[:-1]
+        exterior_coords = np.asarray(coords, dtype=float)
+        
+        # Extract interiors (holes) if present
+        if hasattr(polygon, "interiors") and len(polygon.interiors) > 0:
+            has_interiors = True
+            for interior in polygon.interiors:
+                interior_coords = np.array(interior.coords)
+                if len(interior_coords) > 1 and np.allclose(interior_coords[0], interior_coords[-1]):
+                    interior_coords = interior_coords[:-1]
+                interiors.append(np.asarray(interior_coords, dtype=float))
+        
+        polygon = exterior_coords
+    else:
+        polygon = np.asarray(polygon, dtype=float)
+
+    if polygon.ndim != 2 or polygon.shape[1] != 2:
+        raise ValueError("polygon must be a Shapely Polygon or an (N, 2) array")
+    
+    # Resample exterior
+    exterior_ring = _resample_ring_hfun(polygon, hfun, harg)
+    
+    # Ensure exterior has at least 4 points (required for LinearRing)
+    if len(exterior_ring) < 4:
+        # If exterior is invalid, return empty polygon
+        return Polygon()
+    
+    # Resample interiors (holes) if present
+    resampled_interiors = []
+    if has_interiors:
+        for interior_coords in interiors:
+            resampled_interior = _resample_ring_hfun(interior_coords, hfun, harg)
+            # Filter out invalid interiors (need at least 4 points for LinearRing)
+            if len(resampled_interior) >= 4:
+                resampled_interiors.append(resampled_interior)
+            # Skip interiors with < 4 points (too small or degenerate)
+    
+    # Create Polygon with exterior and holes
+    if len(resampled_interiors) > 0:
+        poly_resampled = Polygon(exterior_ring, resampled_interiors)
+    else:
+        poly_resampled = Polygon(exterior_ring)
+    
     if not poly_resampled.is_valid:
         poly_resampled = poly_resampled.buffer(0)
     return poly_resampled
