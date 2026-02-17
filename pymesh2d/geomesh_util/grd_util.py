@@ -323,10 +323,13 @@ def build_loops(edges):
 
 
 def export_to_grd(
-    filename, vert, tria, z, crs, edge_tag, edge_open=None, edge_land=None
+    filename, vert, tria, z, crs, edge_tag, edge_open=None, edge_land=None,
+    open_contours=None, land_contours=None,
 ):
     """
     Export mesh to ADCIRC .grd format with boundaries.
+    Prefer open_contours / land_contours from identify_boundary (list of 1D arrays
+    of node indices, one per contour). Discontinuity between contours is preserved.
 
     Parameters
     ----------
@@ -343,20 +346,27 @@ def export_to_grd(
     edge_tag : (K, 3) array
         Edge tags (node1, node2, tag).
     edge_open : (L, 2) array, optional
-        Open boundary edges (node indices). If None, extracted from edge_tag.
+        Open boundary edges (flat). Used if open_contours is None.
     edge_land : (P, 2) array, optional
-        Land boundary edges (node indices). If None, extracted from edge_tag.
+        Land boundary edges (flat). Used if land_contours is None.
+    open_contours : list of 1D arrays, optional
+        One ordered contour per open boundary (node indices). If provided, used instead of edge_open.
+    land_contours : list of 1D arrays, optional
+        One ordered contour per land boundary (node indices). If provided, used instead of edge_land.
     """
+    if open_contours is not None:
+        open_loops = [np.asarray(c, dtype=int).tolist() if np.ndim(c) > 0 else [int(c)] for c in open_contours]
+    else:
+        if edge_open is None:
+            edge_open = edge_tag[edge_tag[:, 2] == 1, :2].astype(int)
+        open_loops = build_loops(edge_open) if edge_open.size > 0 else []
 
-    # --- 1. Extract edges if not provided
-    if edge_open is None:
-        edge_open = edge_tag[edge_tag[:, 2] == 1, :2].astype(int)
-    if edge_land is None:
-        edge_land = edge_tag[edge_tag[:, 2] == 2, :2].astype(int)
-
-    # --- 2. Build loops
-    open_loops = build_loops(edge_open) if edge_open.size > 0 else []
-    land_loops = build_loops(edge_land) if edge_land.size > 0 else []
+    if land_contours is not None:
+        land_loops = [np.asarray(c, dtype=int).tolist() if np.ndim(c) > 0 else [int(c)] for c in land_contours]
+    else:
+        if edge_land is None:
+            edge_land = edge_tag[edge_tag[:, 2] == 2, :2].astype(int)
+        land_loops = build_loops(edge_land) if edge_land.size > 0 else []
 
     # --- 3. Write to file
     with open(filename, "w") as f:

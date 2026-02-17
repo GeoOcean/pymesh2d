@@ -172,7 +172,7 @@ def smood(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg
 
     # ---------------------------------------------- output title
     if not np.isinf(opts["disp"]):
-        print("\n Smooth triangulation...\n")
+        print("\n Smooth triangulation for Delft3D-FM computation...\n")
         print(" -------------------------------------------------------")
         print("      |ITER.|          |MOVE(X)|          |LINK(X)|     ")
         print(" -------------------------------------------------------")
