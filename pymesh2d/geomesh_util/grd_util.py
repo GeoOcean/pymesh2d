@@ -1,198 +1,275 @@
+"""
+Delft3D-FM UGRID (xarray) builders, mixed tri/quad connectivity, and ADCIRC helpers.
+
+This is the canonical copy used by :mod:`pymesh2d.smood`, ``merge_circumcenters``,
+and scripts under ``ortogonalisation/``. The sibling file ``ortogonalisation/grd_util.py``
+re-exports this module for legacy ``import grd_util``.
+"""
 from datetime import datetime
 
 import matplotlib.pyplot as plt
 import numpy as np
-from netCDF4 import Dataset
+import xarray as xr
 
 
-def adcirc2DFlowFM(NODE: np.ndarray, EDGE: np.ndarray, netcdf_path: str) -> None:
+def _signed_area_tri_xy(xy: np.ndarray, i: int, j: int, k: int) -> float:
+    """Twice the signed triangle area in the x–y plane (CCW > 0)."""
+    p, q, r = xy[i], xy[j], xy[k]
+    return (q[0] - p[0]) * (r[1] - p[1]) - (r[0] - p[0]) * (q[1] - p[1])
+
+
+def triangulate_mixed_face_row_to_tris(
+    node_xy: np.ndarray, nodes_valid: np.ndarray
+) -> list[tuple[int, int, int]]:
     """
-    Converts ADCIRC grid data to a NetCDF Delft3DFM format.
+    Build triangle connectivity for one polygon face (valid node indices only).
 
-    Parameters
-    ----------
-    NODE : np.ndarray
-        Array of shape (n_nodes, 3) containing node coordinates (x, y, z).
-    EDGE : np.ndarray
-        Array of shape (n_elements, 3) containing triangle connectivity (node indices).
-    netcdf_path : str
-        Path to the output NetCDF file.
+    - 3 nodes: one triangle.
+    - 4 nodes: ``merge_circumcenters`` stores quads as ``[a, v1, b, v2]`` where
+      ``(v1, v2)`` was the merged small-link edge. Triangulate by splitting along
+      that diagonal: ``(a, v1, v2)`` and ``(b, …)`` with winding chosen so both
+      triangles have the same signed area sign as the quad half (Delft3D-FM dual
+      geometry is consistent with this choice; fan-from-``a`` uses diagonal ``(a, v2)``
+      and can yield ``|cosφ| → 1`` on export).
+    - 5+ nodes: fan around the first node.
     """
+    nodes = np.asarray(nodes_valid, dtype=np.int64).reshape(-1)
+    n = int(nodes.size)
+    if n < 3:
+        return []
+    xy = np.asarray(node_xy, dtype=np.float64)
+    if n == 3:
+        return [(int(nodes[0]), int(nodes[1]), int(nodes[2]))]
+    if n == 4:
+        a, v1, b, v2 = int(nodes[0]), int(nodes[1]), int(nodes[2]), int(nodes[3])
 
-    edges = calculate_edges(EDGE) + 1
-    EDGE_S = np.sort(EDGE, axis=1)
-    EDGE_S = EDGE_S[EDGE_S[:, 2].argsort()]
-    EDGE_S = EDGE_S[EDGE_S[:, 1].argsort()]
-    face_node = np.array(EDGE_S[EDGE_S[:, 0].argsort()], dtype=np.int32)
-    edge_node = np.zeros([len(edges), 2], dtype="i4")
-    edge_face = np.zeros([len(edges), 2], dtype=np.double)
-    edge_x = np.zeros(len(edges))
-    edge_y = np.zeros(len(edges))
+        def sa(ii: int, jj: int, kk: int) -> float:
+            return _signed_area_tri_xy(xy, ii, jj, kk)
 
-    edge_node = np.array(
-        edge_node,
-        dtype=np.int32,
-    )
+        t1 = (a, v1, v2)
+        if sa(*t1) < 0:
+            t1 = (a, v2, v1)
+        o1 = sa(*t1)
+        t2 = None
+        for cand in ((b, v1, v2), (b, v2, v1)):
+            if o1 != 0.0 and sa(*cand) * o1 > 0:
+                t2 = cand
+                break
+        if t2 is None:
+            t2 = (b, v2, v1)
+        return [t1, t2]
+    tris: list[tuple[int, int, int]] = []
+    n0 = int(nodes[0])
+    for i in range(1, n - 1):
+        tris.append((n0, int(nodes[i]), int(nodes[i + 1])))
+    return tris
 
-    face_x = (
-        NODE[EDGE[:, 0].astype(int), 0]
-        + NODE[EDGE[:, 1].astype(int), 0]
-        + NODE[EDGE[:, 2].astype(int), 0]
-    ) / 3
-    face_y = (
-        NODE[EDGE[:, 0].astype(int), 1]
-        + NODE[EDGE[:, 1].astype(int), 1]
-        + NODE[EDGE[:, 2].astype(int), 1]
-    ) / 3
 
-    edge_x = (NODE[edges[:, 0] - 1, 0] + NODE[edges[:, 1] - 1, 0]) / 2
-    edge_y = (NODE[edges[:, 0] - 1, 1] + NODE[edges[:, 1] - 1, 1]) / 2
+def face_nodes_0b_to_faces_list(face_nodes_0b: np.ndarray) -> list:
+    """
+    Convert a (F, 4) face-node array (0-based, ``-1`` padding) to a list of
+    variable-length node index arrays (triangles length 3, quads length 4).
+    """
+    out: list = []
+    for row in np.asarray(face_nodes_0b, dtype=np.int64):
+        nodes = row[row >= 0]
+        if nodes.size >= 3:
+            out.append(nodes.copy())
+    return out
 
-    face_node_dict = {}
 
-    for idx, face in enumerate(face_node):
-        for node in face:
-            if node not in face_node_dict:
-                face_node_dict[node] = []
-            face_node_dict[node].append(idx)
+def validate_mixed_export_matches_smood_tria(
+    vert_xy: np.ndarray,
+    face_nodes_0b: np.ndarray,
+    tria_smood: np.ndarray,
+) -> tuple[int, int]:
+    """
+    Check that mixed ``face_nodes_0b`` (final ortho+merge topology) expands to the **same**
+    set of triangles as ``tria_smood`` returned by :func:`pymesh2d.smood.smood` (same node
+    coordinates). Catches accidental export of the wrong connectivity or a silent fallback.
 
-    for i, edge in enumerate(edges):
-        node1, node2 = map(int, edge)
+    Returns
+    -------
+    n_tri_faces, n_quad_faces
+    """
+    vert_xy = np.asarray(vert_xy, dtype=np.float64)
+    if vert_xy.ndim != 2 or vert_xy.shape[1] < 2:
+        raise ValueError("vert_xy must have shape (N, 2+)")
+    xy = vert_xy[:, :2]
+    fn = np.asarray(face_nodes_0b, dtype=np.int64)
+    tria_smood = np.asarray(tria_smood, dtype=np.int64)
+    if tria_smood.ndim != 2 or tria_smood.shape[1] != 3:
+        raise ValueError("tria_smood must have shape (T, 3)")
 
-        edge_node[i, 0] = node1
-        edge_node[i, 1] = node2
-
-        faces_node1 = face_node_dict.get(node1 - 1, [])
-        faces_node2 = face_node_dict.get(node2 - 1, [])
-
-        faces = list(set(faces_node1) & set(faces_node2))
-
-        if len(faces) < 2:
-            edge_face[i, 0] = faces[0] + 1 if faces else 0
-            edge_face[i, 1] = 0
+    expanded: list[tuple[int, int, int]] = []
+    n_tri_f = n_quad_f = 0
+    for row in fn:
+        nodes = row[row >= 0]
+        if nodes.size < 3:
+            continue
+        if int(nodes.min()) < 0 or int(nodes.max()) >= vert_xy.shape[0]:
+            raise ValueError(
+                f"face node index out of range [0, {vert_xy.shape[0]}): {nodes!r}"
+            )
+        if nodes.size == 4:
+            n_quad_f += 1
         else:
-            edge_face[i, 0] = faces[0] + 1
-            edge_face[i, 1] = faces[1] + 1
+            n_tri_f += 1
+        expanded.extend(triangulate_mixed_face_row_to_tris(xy, nodes))
 
-    face_x = np.array(face_x, dtype=np.double)
-    face_y = np.array(face_y, dtype=np.double)
-
-    node_x = np.array(NODE[:, 0], dtype=np.double)
-    node_y = np.array(NODE[:, 1], dtype=np.double)
-    node_z = np.array(NODE[:, 2], dtype=np.double)
-
-    face_x_bnd = np.array(node_x[face_node], dtype=np.double)
-    face_y_bnd = np.array(node_y[face_node], dtype=np.double)
-
-    num_nodes = NODE.shape[0]
-    num_faces = EDGE.shape[0]
-    num_edges = edges.shape[0]
-
-    with Dataset(netcdf_path, "w", format="NETCDF4") as dataset:
-        _mesh2d_nNodes = dataset.createDimension("mesh2d_nNodes", num_nodes)
-        _mesh2d_nEdges = dataset.createDimension("mesh2d_nEdges", num_edges)
-        _mesh2d_nFaces = dataset.createDimension("mesh2d_nFaces", num_faces)
-        _mesh2d_nMax_face_nodes = dataset.createDimension("mesh2d_nMax_face_nodes", 3)
-        _two_dim = dataset.createDimension("Two", 2)
-
-        mesh2d_node_x = dataset.createVariable(
-            "mesh2d_node_x", "f8", ("mesh2d_nNodes",)
-        )
-        mesh2d_node_x.standard_name = "projection_x_coordinate"
-        mesh2d_node_x.long_name = "x-coordinate of mesh nodes"
-
-        mesh2d_node_y = dataset.createVariable(
-            "mesh2d_node_y", "f8", ("mesh2d_nNodes",)
-        )
-        mesh2d_node_y.standard_name = "projection_y_coordinate"
-        mesh2d_node_y.long_name = "y-coordinate of mesh nodes"
-
-        mesh2d_node_z = dataset.createVariable(
-            "mesh2d_node_z", "f8", ("mesh2d_nNodes",)
-        )
-        mesh2d_node_z.units = "m"
-        mesh2d_node_z.standard_name = "altitude"
-        mesh2d_node_z.long_name = "z-coordinate of mesh nodes"
-
-        mesh2d_edge_x = dataset.createVariable(
-            "mesh2d_edge_x", "f8", ("mesh2d_nEdges",)
-        )
-        mesh2d_edge_x.standard_name = "projection_x_coordinate"
-        mesh2d_edge_x.long_name = (
-            "Characteristic x-coordinate of the mesh edge (e.g., midpoint)"
+    exp = np.asarray(expanded, dtype=np.int64)
+    if exp.shape != tria_smood.shape:
+        raise ValueError(
+            "Export topology mismatch: mixed faces expand to "
+            f"{exp.shape[0]} triangles, but smood returned {tria_smood.shape[0]}. "
+            "You may be exporting triangle-only (quads re-split) or a stale ``face_nodes``."
         )
 
-        mesh2d_edge_y = dataset.createVariable(
-            "mesh2d_edge_y", "f8", ("mesh2d_nEdges",)
-        )
-        mesh2d_edge_y.standard_name = "projection_y_coordinate"
-        mesh2d_edge_y.long_name = (
-            "Characteristic y-coordinate of the mesh edge (e.g., midpoint)"
-        )
+    def _sort_rows(t: np.ndarray) -> np.ndarray:
+        return np.sort(np.asarray(t, dtype=np.int64), axis=1)
 
-        mesh2d_edge_nodes = dataset.createVariable(
-            "mesh2d_edge_nodes", "i4", ("mesh2d_nEdges", "Two")
+    es = _sort_rows(exp)
+    ts = _sort_rows(tria_smood)
+    order_e = np.lexsort((es[:, 2], es[:, 1], es[:, 0]))
+    order_t = np.lexsort((ts[:, 2], ts[:, 1], ts[:, 0]))
+    if not np.array_equal(es[order_e], ts[order_t]):
+        raise ValueError(
+            "Triangle set from mixed faces ≠ smood triangle output (winding/diagonal mismatch)."
         )
-        mesh2d_edge_nodes.cf_role = "edge_node_connectivity"
-        mesh2d_edge_nodes.long_name = "Start and end nodes of mesh edges"
-        mesh2d_edge_nodes.start_index = 1
+    return int(n_tri_f), int(n_quad_f)
 
-        mesh2d_edge_faces = dataset.createVariable(
-            "mesh2d_edge_faces", "f8", ("mesh2d_nEdges", "Two")
-        )
-        mesh2d_edge_faces.cf_role = "edge_face_connectivity"
-        mesh2d_edge_faces.long_name = "Start and end nodes of mesh edges"
-        mesh2d_edge_faces.start_index = 1
 
-        mesh2d_face_nodes = dataset.createVariable(
-            "mesh2d_face_nodes", "i4", ("mesh2d_nFaces", "mesh2d_nMax_face_nodes")
-        )
-        mesh2d_face_nodes.long_name = "Vertex node of mesh face (counterclockwise)"
-        mesh2d_face_nodes.start_index = 1
+def _xr_dataset_from_ugrid_dict(ugrid: dict) -> xr.Dataset:
+    """Build the standard Delft3D-FM-style xarray Dataset from a ``build_ugrid_arrays*`` dict."""
+    node_z_out = -ugrid["node_z"]
+    _WGS84_FILL = np.int32(-2147483647)
+    _UGRID_FILL = np.int32(-999)
 
-        mesh2d_face_x = dataset.createVariable(
-            "mesh2d_face_x", "f8", ("mesh2d_nFaces",)
-        )
-        mesh2d_face_x.standard_name = "projection_x_coordinate"
-        mesh2d_face_x.long_name = "characteristic x-coordinate of the mesh face"
-        mesh2d_face_x.start_index = 1
+    coords = {
+        "mesh2d_node_x": xr.DataArray(
+            ugrid["node_x"],
+            dims=("mesh2d_nNodes",),
+            attrs={
+                "standard_name": "longitude",
+                "long_name": "x-coordinate of mesh nodes",
+                "units": "degrees_east",
+            },
+        ),
+        "mesh2d_node_y": xr.DataArray(
+            ugrid["node_y"],
+            dims=("mesh2d_nNodes",),
+            attrs={
+                "standard_name": "latitude",
+                "long_name": "y-coordinate of mesh nodes",
+                "units": "degrees_north",
+            },
+        ),
+    }
 
-        mesh2d_face_y = dataset.createVariable(
-            "mesh2d_face_y", "f8", ("mesh2d_nFaces",)
-        )
-        mesh2d_face_y.standard_name = "projection_y_coordinate"
-        mesh2d_face_y.long_name = "characteristic y-coordinate of the mesh face"
-        mesh2d_face_y.start_index = 1
-
-        mesh2d_face_x_bnd = dataset.createVariable(
-            "mesh2d_face_x_bnd", "f8", ("mesh2d_nFaces", "mesh2d_nMax_face_nodes")
-        )
-        mesh2d_face_x_bnd.long_name = (
-            "x-coordinate bounds of mesh faces (i.e. corner coordinates)"
-        )
-
-        mesh2d_face_y_bnd = dataset.createVariable(
-            "mesh2d_face_y_bnd", "f8", ("mesh2d_nFaces", "mesh2d_nMax_face_nodes")
-        )
-        mesh2d_face_y_bnd.long_name = (
-            "y-coordinate bounds of mesh faces (i.e. corner coordinates)"
-        )
-
-        mesh2d_node_x.units = "longitude"
-        mesh2d_node_y.units = "latitude"
-        mesh2d_edge_x.units = "longitude"
-        mesh2d_edge_y.units = "latitude"
-        mesh2d_face_x.units = "longitude"
-        mesh2d_face_y.units = "latitude"
-        mesh2d_face_x_bnd.units = "grados"
-        mesh2d_face_y_bnd.units = "grados"
-        mesh2d_face_x_bnd.standard_name = "longitude"
-        mesh2d_face_y_bnd.standard_name = "latitude"
-        mesh2d_face_nodes.coordinates = "mesh2d_node_x mesh2d_node_y"
-
-        wgs84 = dataset.createVariable("wgs84", "int32")
-        wgs84.setncatts(
-            {
+    data_vars = {
+        "mesh2d_node_z": xr.DataArray(
+            node_z_out,
+            dims=("mesh2d_nNodes",),
+            attrs={
+                "mesh": "mesh2d",
+                "location": "node",
+                "units": "m",
+                "standard_name": "altitude",
+                "long_name": "z-coordinate of mesh nodes",
+                "grid_mapping": "wgs84",
+            },
+        ),
+        "mesh2d_edge_x": xr.DataArray(
+            ugrid["edge_x"],
+            dims=("mesh2d_nEdges",),
+            attrs={
+                "standard_name": "projection_x_coordinate",
+                "long_name": "characteristic x-coordinate of the mesh edge (e.g. midpoint)",
+                "units": "degrees_east",
+                # Keep standard_name as in GUI (longitude) instead of projection_x_coordinate.
+                "standard_name": "longitude",
+            },
+        ),
+        "mesh2d_edge_y": xr.DataArray(
+            ugrid["edge_y"],
+            dims=("mesh2d_nEdges",),
+            attrs={
+                "standard_name": "projection_y_coordinate",
+                "long_name": "characteristic y-coordinate of the mesh edge (e.g. midpoint)",
+                "units": "degrees_north",
+                "standard_name": "latitude",
+            },
+        ),
+        "mesh2d_edge_nodes": xr.DataArray(
+            ugrid["edge_nodes"],
+            dims=("mesh2d_nEdges", "Two"),
+            attrs={
+                "cf_role": "edge_node_connectivity",
+                "long_name": "Start and end nodes of mesh edges",
+                "start_index": 1,
+            },
+        ),
+        "mesh2d_edge_faces": xr.DataArray(
+            ugrid["edge_faces"],
+            dims=("mesh2d_nEdges", "Two"),
+            attrs={
+                "cf_role": "edge_face_connectivity",
+                "long_name": "Neighboring faces of mesh edges",
+                "start_index": np.int32(1),
+            },
+        ).assign_attrs(_FillValue=_UGRID_FILL),
+        "mesh2d_face_nodes": xr.DataArray(
+            ugrid["face_nodes"],
+            dims=("mesh2d_nFaces", "mesh2d_nMax_face_nodes"),
+            attrs={
+                "cf_role": "face_node_connectivity",
+                "long_name": "Vertex nodes of mesh faces (counterclockwise)",
+                "start_index": np.int32(1),
+                "coordinates": "mesh2d_node_x mesh2d_node_y",
+            },
+        ).assign_attrs(_FillValue=_UGRID_FILL),
+        "mesh2d_face_x": xr.DataArray(
+            ugrid["face_x"],
+            dims=("mesh2d_nFaces",),
+            attrs={
+                "units": "degrees_east",
+                "standard_name": "longitude",
+                "long_name": "Characteristic x-coordinate of mesh face",
+                "bounds": "mesh2d_face_x_bnd",
+            },
+        ),
+        "mesh2d_face_y": xr.DataArray(
+            ugrid["face_y"],
+            dims=("mesh2d_nFaces",),
+            attrs={
+                "units": "degrees_north",
+                "standard_name": "latitude",
+                "long_name": "Characteristic y-coordinate of mesh face",
+                "bounds": "mesh2d_face_y_bnd",
+            },
+        ),
+        "mesh2d_face_x_bnd": xr.DataArray(
+            ugrid["face_x_bnd"],
+            dims=("mesh2d_nFaces", "mesh2d_nMax_face_nodes"),
+            attrs={
+                "long_name": "x-coordinate bounds of mesh faces (i.e. corner coordinates)",
+                "units": "degrees_east",
+                "standard_name": "longitude",
+            },
+        ),
+        "mesh2d_face_y_bnd": xr.DataArray(
+            ugrid["face_y_bnd"],
+            dims=("mesh2d_nFaces", "mesh2d_nMax_face_nodes"),
+            attrs={
+                "long_name": "y-coordinate bounds of mesh faces (i.e. corner coordinates)",
+                "units": "degrees_north",
+                "standard_name": "latitude",
+            },
+        ),
+        "wgs84": xr.DataArray(
+            np.int32(4326),
+            dims=(),
+            attrs={
                 "name": "WGS 84",
                 "epsg": np.int32(4326),
                 "grid_mapping_name": "latitude_longitude",
@@ -200,50 +277,143 @@ def adcirc2DFlowFM(NODE: np.ndarray, EDGE: np.ndarray, netcdf_path: str) -> None
                 "semi_major_axis": 6378137.0,
                 "semi_minor_axis": 6356752.314245,
                 "inverse_flattening": 298.257223563,
-                "EPSG_code": "value is equal to EPSG code",
-                "proj4_params": "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs",
-                "projection_name": "unknown",
-                "wkt": 'GEOGCS["WGS 84",\n    DATUM["WGS_1984",\n        SPHEROID["WGS 84",6378137,298.257223563,\n            AUTHORITY["EPSG","7030"]],\n        AUTHORITY["EPSG","6326"]],\n    PRIMEM["Greenwich",0,\n        AUTHORITY["EPSG","8901"]],\n    UNIT["degree",0.0174532925199433,\n        AUTHORITY["EPSG","9122"]],\n    AXIS["Latitude",NORTH],\n    AXIS["Longitude",EAST],\n    AUTHORITY["EPSG","4326"]]',
-            }
-        )
+                "EPSG_code": "",
+                "value": "value is equal to EPSG code",
+                "proj_string": "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs",
+            },
+        ).assign_attrs(_FillValue=_WGS84_FILL),
+        "mesh2d": xr.DataArray(
+            _WGS84_FILL,
+            dims=(),
+            attrs={
+                "cf_role": "mesh_topology",
+                "long_name": "Topology data of 2D mesh",
+                "topology_dimension": 2,
+                "node_coordinates": "mesh2d_node_x mesh2d_node_y",
+                "node_dimension": "mesh2d_nNodes",
+                "edge_node_connectivity": "mesh2d_edge_nodes",
+                "edge_dimension": "mesh2d_nEdges",
+                "edge_coordinates": "mesh2d_edge_x mesh2d_edge_y",
+                "face_node_connectivity": "mesh2d_face_nodes",
+                "face_dimension": "mesh2d_nFaces",
+                "face_coordinates": "mesh2d_face_x mesh2d_face_y",
+                "max_face_nodes_dimension": "mesh2d_nMax_face_nodes",
+                "edge_face_connectivity": "mesh2d_edge_faces",
+            },
+        ),
+    }
 
-        mesh2d_node_x[:] = node_x
-        mesh2d_node_y[:] = node_y
-        mesh2d_node_z[:] = -node_z
+    attrs = {
+        "institution": "GeoOcean",
+        "references": "https://github.com/GeoOcean/BlueMath_tk",
+        "source": f"BlueMath tk {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "history": "Created with OCSmesh",
+        "Conventions": "CF-1.8 UGRID-1.0 Deltares-0.10",
+    }
 
-        mesh2d_edge_x[:] = edge_x
-        mesh2d_edge_y[:] = edge_y
-        mesh2d_edge_nodes[:, :] = edge_node
+    return xr.Dataset(data_vars=data_vars, coords=coords, attrs=attrs)
 
-        mesh2d_edge_faces[:] = edge_face
-        mesh2d_face_nodes[:] = face_node + 1
-        mesh2d_face_x[:] = face_x
-        mesh2d_face_y[:] = face_y
 
-        mesh2d_face_x_bnd[:] = face_x_bnd
-        mesh2d_face_y_bnd[:] = face_y_bnd
+def adcirc2DFlowFM_mixed(NODE: np.ndarray, face_nodes_0b: np.ndarray) -> xr.Dataset:
+    """
+    Build a UGRID dataset that keeps **quads + triangles** (e.g. after ``merge_circumcenters``).
 
-        dataset.institution = "GeoOcean"
-        dataset.references = "https://github.com/GeoOcean/BlueMath_tk"
-        dataset.source = f"BlueMath tk {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        dataset.history = "Created with OCSmesh"
-        dataset.Conventions = "CF-1.8 UGRID-1.0 Deltares-0.10"
+    If you merge two triangles into a quad to remove a short dual link, then export
+    a **triangle-only** mesh by re-splitting the quad, you recover the **same two
+    triangles** and the same two triangle circumcenters — small-link checks still
+    fail. Call this with the mixed ``face_nodes`` from the merge pipeline instead.
+    """
+    NODE = np.asarray(NODE, dtype=np.float64)
+    if NODE.ndim != 2 or NODE.shape[1] < 3:
+        raise ValueError("NODE must have shape (n_nodes, 3) with x, y, z")
+    faces_list = face_nodes_0b_to_faces_list(face_nodes_0b)
+    ugrid = build_ugrid_arrays_mixed(NODE, faces_list)
+    ds = _xr_dataset_from_ugrid_dict(ugrid)
+    # Defensive re-encoding:
+    # Delft3D-FM / GUI is sensitive to the raw NetCDF encoding of UGRID connectivity
+    # variables. In particular, `mesh2d_face_nodes` / `mesh2d_edge_faces` must be
+    # int32 with `_FillValue=-999`.
+    #
+    # Note: `_xr_dataset_from_ugrid_dict` already sets `_FillValue` in the variable *attrs*.
+    # Setting `_FillValue` again via `encoding` makes xarray error out with:
+    # "failed to prevent overwriting existing key _FillValue in attrs".
+    _UGRID_FILL = np.int32(-999)
 
-        dataset.createDimension("str_dim", 1)
-        mesh2d = dataset.createVariable("mesh2d", "i4", ("str_dim",))
-        mesh2d.cf_role = "mesh_topology"
-        mesh2d.long_name = "Topology data of 2D mesh"
-        mesh2d.topology_dimension = 2
-        mesh2d.node_coordinates = "mesh2d_node_x mesh2d_node_y"
-        mesh2d.node_dimension = "mesh2d_nNodes"
-        mesh2d.edge_node_connectivity = "mesh2d_edge_nodes"
-        mesh2d.edge_dimension = "mesh2d_nEdges"
-        mesh2d.edge_coordinates = "mesh2d_edge_x mesh2d_edge_y"
-        mesh2d.face_node_connectivity = "mesh2d_face_nodes"
-        mesh2d.face_dimension = "mesh2d_nFaces"
-        mesh2d.face_coordinates = "mesh2d_face_x mesh2d_face_y"
-        mesh2d.max_face_nodes_dimension = "mesh2d_nMax_face_nodes"
-        mesh2d.edge_face_connectivity = "mesh2d_edge_faces"
+    if "mesh2d_face_nodes" in ds:
+        da = ds["mesh2d_face_nodes"]
+        vals = da.values
+        if np.issubdtype(vals.dtype, np.floating):
+            # Replace NaN padding with GUI-like -999 fill, then cast to int32.
+            vals = np.where(np.isnan(vals), _UGRID_FILL, vals)
+            ds["mesh2d_face_nodes"] = da.copy(data=np.asarray(vals, dtype=np.int32))
+        # Ensure dtype is int32 (but do not touch encoding _FillValue).
+        if ds["mesh2d_face_nodes"].dtype != np.int32:
+            ds["mesh2d_face_nodes"] = ds["mesh2d_face_nodes"].astype(np.int32)
+
+    if "mesh2d_edge_faces" in ds:
+        da = ds["mesh2d_edge_faces"]
+        vals = da.values
+        if np.issubdtype(vals.dtype, np.floating):
+            vals = np.where(np.isnan(vals), _UGRID_FILL, vals)
+            ds["mesh2d_edge_faces"] = da.copy(data=np.asarray(vals, dtype=np.int32))
+        if ds["mesh2d_edge_faces"].dtype != np.int32:
+            ds["mesh2d_edge_faces"] = ds["mesh2d_edge_faces"].astype(np.int32)
+
+    # Match GUI type for the WGS84 grid mapping scalar (dtype only).
+    if "wgs84" in ds and ds["wgs84"].dtype != np.int32:
+        ds["wgs84"] = ds["wgs84"].astype(np.int32)
+
+    n_quad = sum(1 for f in faces_list if len(f) == 4)
+    n_tri = sum(1 for f in faces_list if len(f) == 3)
+    ds.attrs["pymesh2d_export"] = "adcirc2DFlowFM_mixed"
+    ds.attrs["pymesh2d_n_faces"] = str(len(faces_list))
+    ds.attrs["pymesh2d_n_triangle_faces"] = str(n_tri)
+    ds.attrs["pymesh2d_n_quad_faces"] = str(n_quad)
+    return ds
+
+
+def adcirc2DFlowFM(NODE: np.ndarray, EDGE: np.ndarray) -> xr.Dataset:
+    """
+    Build a Delft3D FM UGRID mesh Dataset from ADCIRC-style node and triangle data.
+
+    Parameters
+    ----------
+    NODE : np.ndarray
+        Array of shape (n_nodes, 3) containing node coordinates (x, y, z).
+    EDGE : np.ndarray
+        Either:
+        - (n_faces, 3) triangle connectivity (0-based node indices), OR
+        - (n_faces, 4) face_nodes (0-based) with fill = -1 (triangles padded to 4).
+
+    Returns
+    -------
+    xr.Dataset
+        UGRID mesh Dataset (mesh2d_node_x/y/z, mesh2d_face_nodes, etc.).
+        Use ds.to_netcdf(path) to write to file.
+    """
+    # Shape-based export selection:
+    # - (T,3) int : triangle connectivity => export triangle-only mesh.
+    # - (F,4) int with negative padding (typically -1) => face_nodes_0b => export mixed
+    #   tri+quad mesh using adcirc2DFlowFM_mixed.
+    # - (F,4) int without negative padding => assume legacy "face nodes" encoding and
+    #   triangulate them (triangle-only export) for backward compatibility.
+    EDGE = np.asarray(EDGE)
+    if EDGE.ndim == 2 and EDGE.shape[1] == 4 and np.any(EDGE < 0):
+        # face_nodes_0b with -1 padding => keep mixed topology.
+        return adcirc2DFlowFM_mixed(NODE, EDGE)
+
+    if EDGE.ndim == 2 and EDGE.shape[1] == 4:
+        # Legacy: triangulate face rows to triangle-only.
+        node_xy = np.asarray(NODE[:, :2], dtype=np.float64)
+        tri: list[tuple[int, int, int]] = []
+        for row in EDGE:
+            nodes = row[row >= 0]
+            if nodes.size >= 3:
+                tri.extend(triangulate_mixed_face_row_to_tris(node_xy, nodes))
+        EDGE = np.asarray(tri, dtype=np.int64)
+
+    ugrid = build_ugrid_arrays(NODE, EDGE)
+    return _xr_dataset_from_ugrid_dict(ugrid)
 
 
 def calculate_edges(Elmts: np.ndarray) -> np.ndarray:
@@ -262,12 +432,9 @@ def calculate_edges(Elmts: np.ndarray) -> np.ndarray:
         each represented by a pair of node indices.
     """
 
-    perc = 0
     Links = np.zeros((len(Elmts) * 3, 2), dtype=int)
     tel = 0
-    for ii, elmt in enumerate(Elmts):
-        if round(100 * (ii / len(Elmts))) != perc:
-            perc = round(100 * (ii / len(Elmts)))
+    for elmt in Elmts:
         Links[tel] = [elmt[0], elmt[1]]
         tel += 1
         Links[tel] = [elmt[1], elmt[2]]
@@ -279,6 +446,224 @@ def calculate_edges(Elmts: np.ndarray) -> np.ndarray:
     Links_unique = np.unique(Links_sorted, axis=0)
 
     return Links_unique
+
+
+def build_ugrid_arrays(NODE: np.ndarray, EDGE: np.ndarray) -> dict:
+    """
+    Build UGRID mesh arrays from node coordinates and triangle connectivity.
+    Same logic as adcirc2DFlowFM but returns arrays instead of writing to file.
+    Used to rebuild ds_final from (vert, z, tria) after edge flips.
+
+    Parameters
+    ----------
+    NODE : np.ndarray
+        Array of shape (n_nodes, 3) containing node coordinates (x, y, z).
+    EDGE : np.ndarray
+        Array of shape (n_faces, 3) containing triangle connectivity (0-based node indices).
+
+    Returns
+    -------
+    dict
+        Keys: node_x, node_y, node_z, face_nodes (1-based), edge_nodes (1-based),
+        edge_faces (1-based), face_x, face_y, edge_x, edge_y, face_x_bnd, face_y_bnd.
+        Also num_nodes, num_faces, num_edges for dimension sizes.
+    """
+    edges = calculate_edges(EDGE) + 1
+    EDGE_S = np.sort(EDGE, axis=1)
+    EDGE_S = EDGE_S[EDGE_S[:, 2].argsort()]
+    EDGE_S = EDGE_S[EDGE_S[:, 1].argsort()]
+    face_node = np.array(EDGE_S[EDGE_S[:, 0].argsort()], dtype=np.int32)
+    edge_node = np.zeros([len(edges), 2], dtype="i4")
+    edge_face = np.zeros([len(edges), 2], dtype=np.double)
+    edge_x = np.zeros(len(edges))
+    edge_y = np.zeros(len(edges))
+
+    face_x = (
+        NODE[EDGE[:, 0].astype(int), 0]
+        + NODE[EDGE[:, 1].astype(int), 0]
+        + NODE[EDGE[:, 2].astype(int), 0]
+    ) / 3
+    face_y = (
+        NODE[EDGE[:, 0].astype(int), 1]
+        + NODE[EDGE[:, 1].astype(int), 1]
+        + NODE[EDGE[:, 2].astype(int), 1]
+    ) / 3
+
+    edge_x = (NODE[edges[:, 0] - 1, 0] + NODE[edges[:, 1] - 1, 0]) / 2
+    edge_y = (NODE[edges[:, 0] - 1, 1] + NODE[edges[:, 1] - 1, 1]) / 2
+
+    face_node_dict = {}
+    for idx, face in enumerate(face_node):
+        for node in face:
+            if node not in face_node_dict:
+                face_node_dict[node] = []
+            face_node_dict[node].append(idx)
+
+    for i, edge in enumerate(edges):
+        node1, node2 = map(int, edge)
+        edge_node[i, 0] = node1
+        edge_node[i, 1] = node2
+        faces_node1 = face_node_dict.get(node1 - 1, [])
+        faces_node2 = face_node_dict.get(node2 - 1, [])
+        faces = list(set(faces_node1) & set(faces_node2))
+        if len(faces) < 2:
+            edge_face[i, 0] = faces[0] + 1 if faces else 0
+            edge_face[i, 1] = 0
+        else:
+            edge_face[i, 0] = faces[0] + 1
+            edge_face[i, 1] = faces[1] + 1
+
+    face_x = np.asarray(face_x, dtype=np.float64)
+    face_y = np.asarray(face_y, dtype=np.float64)
+    node_x = np.asarray(NODE[:, 0], dtype=np.float64)
+    node_y = np.asarray(NODE[:, 1], dtype=np.float64)
+    node_z = np.asarray(NODE[:, 2], dtype=np.float64)
+    face_x_bnd = np.asarray(node_x[face_node], dtype=np.float64)
+    face_y_bnd = np.asarray(node_y[face_node], dtype=np.float64)
+
+    return {
+        "node_x": node_x,
+        "node_y": node_y,
+        "node_z": node_z,
+        "face_nodes": face_node + 1,
+        "edge_nodes": edge_node,
+        "edge_faces": edge_face,
+        "face_x": face_x,
+        "face_y": face_y,
+        "edge_x": edge_x,
+        "edge_y": edge_y,
+        "face_x_bnd": face_x_bnd,
+        "face_y_bnd": face_y_bnd,
+        "num_nodes": NODE.shape[0],
+        "num_faces": EDGE.shape[0],
+        "num_edges": edges.shape[0],
+    }
+
+
+def build_ugrid_arrays_mixed(NODE: np.ndarray, faces_list: list) -> dict:
+    """
+    Build UGRID mesh arrays from node coordinates and mixed faces (triangles and quads).
+    Each element of faces_list is an array of 3 or 4 node indices (0-based).
+
+    Parameters
+    ----------
+    NODE : np.ndarray
+        Array of shape (n_nodes, 3) containing node coordinates (x, y, z).
+    faces_list : list of np.ndarray
+        Each array has shape (3,) or (4,) with 0-based node indices.
+
+    Returns
+    -------
+    dict
+        Same keys as build_ugrid_arrays, with mesh2d_nMax_face_nodes = 4.
+    face_nodes has shape (n_faces, 4) with padding encoded like the GUI exports:
+        triangles padded with `-999` in 4th column, with `_FillValue=-999`.
+    """
+    n_nodes = NODE.shape[0]
+    n_faces = len(faces_list)
+    node_x = np.asarray(NODE[:, 0], dtype=np.float64)
+    node_y = np.asarray(NODE[:, 1], dtype=np.float64)
+    node_z = np.asarray(NODE[:, 2], dtype=np.float64)
+    # GUI-like connectivity encoding (raw NetCDF):
+    # - face_nodes / edge_faces are int32 with `_FillValue=-999`.
+    #   Xarray will typically decode -999 -> NaN depending on how the file is read.
+    FILL = np.int32(-999)
+    # Build faces in CCW order to match UGRID expectations and
+    # Delft3D-FM polygon orientation conventions.
+    faces_list_ccw: list[np.ndarray] = []
+
+    face_nodes = np.full((n_faces, 4), FILL, dtype=np.int32)
+    face_x = np.zeros(n_faces, dtype=np.float64)
+    face_y = np.zeros(n_faces, dtype=np.float64)
+    face_x_bnd = np.zeros((n_faces, 4), dtype=np.float64)
+    face_y_bnd = np.zeros((n_faces, 4), dtype=np.float64)
+
+    def _polygon_centroid_xy(xx: np.ndarray, yy: np.ndarray) -> tuple[float, float]:
+        """
+        Area-weighted polygon centroid (shoelace formula).
+        Falls back to vertex mean for near-degenerate polygons.
+        """
+        cross = xx * np.roll(yy, -1) - np.roll(xx, -1) * yy
+        area2 = np.sum(cross)
+        if abs(area2) < 1e-30:
+            return float(np.mean(xx)), float(np.mean(yy))
+        cx = np.sum((xx + np.roll(xx, -1)) * cross) / (3.0 * area2)
+        cy = np.sum((yy + np.roll(yy, -1)) * cross) / (3.0 * area2)
+        return float(cx), float(cy)
+
+    for i, f in enumerate(faces_list):
+        f = np.asarray(f, dtype=np.int32).reshape(-1)
+        nv = len(f)
+
+        # Signed area in current vertex order.
+        # For convex polygons this reliably detects CW/CCW orientation.
+        if nv >= 3:
+            x = node_x[f]
+            y = node_y[f]
+            area2 = 0.5 * (np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+            if area2 < 0.0:
+                f = f[::-1]
+
+        faces_list_ccw.append(f)
+
+        face_nodes[i, :nv] = f + 1
+        if nv == 3:
+            face_nodes[i, 3] = FILL
+        fx, fy = _polygon_centroid_xy(node_x[f], node_y[f])
+        face_x[i] = fx
+        face_y[i] = fy
+        face_x_bnd[i, :nv] = node_x[f]
+        face_y_bnd[i, :nv] = node_y[f]
+        if nv == 3:
+            face_x_bnd[i, 3] = np.nan
+            face_y_bnd[i, 3] = np.nan
+
+    # Build unique edges and edge->face mapping
+    edge_set = {}
+    for fi, f in enumerate(faces_list_ccw):
+        f = np.asarray(f, dtype=np.int32)
+        nv = len(f)
+        for k in range(nv):
+            v1, v2 = f[k], f[(k + 1) % nv]
+            key = (min(v1, v2), max(v1, v2))
+            if key not in edge_set:
+                edge_set[key] = []
+            edge_set[key].append(fi)
+
+    edges = np.array(list(edge_set.keys()), dtype=np.int32)
+    edge_node = edges + 1
+    # GUI padding for boundary edges:
+    # In the working Delft3D-FM GUI export, missing neighbor faces in
+    # `mesh2d_edge_faces(:, 1)` are encoded as 0 (NOT as `_FillValue`).
+    # Using 0 instead of `_FillValue` makes UGRID import validation pass.
+    edge_face = np.zeros((len(edges), 2), dtype=np.int32)
+    for i, (v1, v2) in enumerate(edges):
+        faces = edge_set[(v1, v2)]
+        if len(faces) >= 1:
+            edge_face[i, 0] = faces[0] + 1
+        if len(faces) >= 2:
+            edge_face[i, 1] = faces[1] + 1
+
+    edge_x = (node_x[edges[:, 0]] + node_x[edges[:, 1]]) / 2
+    edge_y = (node_y[edges[:, 0]] + node_y[edges[:, 1]]) / 2
+
+    return {
+        "node_x": node_x,
+        "node_y": node_y,
+        "node_z": node_z,
+        "face_nodes": face_nodes,
+        "edge_nodes": edge_node,
+        "edge_faces": edge_face,
+        "face_x": face_x,
+        "face_y": face_y,
+        "edge_x": edge_x,
+        "edge_y": edge_y,
+        "face_x_bnd": face_x_bnd,
+        "face_y_bnd": face_y_bnd,
+        "num_nodes": n_nodes,
+        "num_faces": n_faces,
+        "num_edges": edges.shape[0],
+    }
 
 
 def build_loops(edges):
