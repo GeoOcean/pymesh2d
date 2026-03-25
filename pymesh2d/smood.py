@@ -1,24 +1,442 @@
-"""
-Mesh smoothing with orthogonalization.
-
-This module implements a mesh smoothing algorithm with orthogonalization,
-combining aspect ratio optimization with angle-based smoothing for improved
-mesh quality in flow simulations.
-"""
-
-import time
 import warnings
 
-import numpy as np
-from scipy.sparse import csr_matrix
+import pyproj
 
-from .mesh_cost.triscr import triscr
-from .mesh_util.circo import fix_small_flow_links, small_flow_links
-from .mesh_util.deltri import deltri
-from .mesh_util.setset import setset
+import numpy as np
+from .geomesh_util.grd_util import triangulate_mixed_face_row_to_tris
 from .mesh_util.tricon import tricon
+from .geom_util.proj_util import get_local_utm_crs, reproject_node
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
+
+BACKUP_ORTHO_MERGE_SMALLLINK_THRESHOLD: float = 0.11
+BACKUP_ORTHO_MERGE_REQUIRE_STRICT_DUAL: bool = False
+
+
+def _signed_area_quad(vert, quad):
+    """Signed area (doubled) of quadrilateral (a,b,c,d) for CCW check."""
+    v = vert[quad]
+    return (
+        (v[1, 0] - v[0, 0]) * (v[2, 1] - v[0, 1])
+        - (v[2, 0] - v[0, 0]) * (v[1, 1] - v[0, 1])
+        + (v[3, 0] - v[1, 0]) * (v[2, 1] - v[1, 1])
+        - (v[2, 0] - v[1, 0]) * (v[3, 1] - v[1, 1])
+    )
+
+
+def _merge_small_links_quads_fan_tria_from_indices(
+    tria,
+    tnum,
+    edge_cc,
+    small_link_indices,
+    vert_utm,
+):
+    """
+    Merge each small-flow-link pair into one quad, then rebuild back to
+    triangles by splitting the quad along the shared edge diagonal.
+    """
+    tria = np.asarray(tria, dtype=np.int64)
+    tnum_1d = np.asarray(tnum, dtype=np.int64).reshape(-1)
+
+    merged_tri = np.zeros(tria.shape[0], dtype=bool)
+    quads = []  # list of (quad_nodes_4, part_idx)
+
+    for idx in small_link_indices:
+        e = edge_cc[int(idx)]
+        v1, v2, t1, t2 = int(e[0]), int(e[1]), int(e[2]), int(e[3])
+
+        if t2 < 0:
+            continue
+        if merged_tri[t1] or merged_tri[t2]:
+            continue
+
+        tri1 = tria[t1]
+        tri2 = tria[t2]
+
+        mask1 = (tri1 != v1) & (tri1 != v2)
+        mask2 = (tri2 != v1) & (tri2 != v2)
+        if not np.any(mask1) or not np.any(mask2):
+            continue
+
+        a = int(tri1[mask1][0])
+        b = int(tri2[mask2][0])
+
+        quad = np.array([a, v1, b, v2], dtype=np.int64)
+        if _signed_area_quad(vert_utm, quad) < 0:
+            quad = np.array([a, v2, b, v1], dtype=np.int64)
+
+        part_idx = int(tnum_1d[t1])
+        quads.append((quad, part_idx))
+        merged_tri[t1] = True
+        merged_tri[t2] = True
+
+    new_tris = []
+    new_parts = []
+
+    for quad, part_idx in quads:
+        # quad is `[a, v1, b, v2]` where (v1,v2) is the shared merged edge.
+        # Fan triangulation around `a`:
+        # (a, v1, b) and (a, b, v2)
+        a = int(quad[0])
+        v1 = int(quad[1])
+        b = int(quad[2])
+        v2 = int(quad[3])
+        new_tris.append((a, v1, b))
+        new_parts.append(part_idx)
+        new_tris.append((a, b, v2))
+        new_parts.append(part_idx)
+
+    for ti in range(tria.shape[0]):
+        if not merged_tri[ti]:
+            new_tris.append(tuple(tria[ti].tolist()))
+            new_parts.append(int(tnum_1d[ti]))
+
+    tria_out = np.asarray(new_tris, dtype=np.int64)
+    tnum_out = np.asarray(new_parts, dtype=np.int64).reshape(-1, 1)
+    return tria_out, tnum_out, len(quads)
+
+
+def _count_small_flow_links(tria, vert_lonlat, conn, removesmalllinkstrsh):
+    """
+    Compute number of small flow links using the same metric as meshkernel.
+
+    This aligns with `meshkernel_orthogonalize_3.compute_small_links_from_arrays`,
+    which is also what we use to validate `n_small` outside of `pymesh2d`.
+    """
+    from .ortho_merge import meshkernel_orthogonalize_3 as mk3
+
+    tria = np.asarray(tria, dtype=np.int64)
+    vert_lonlat = np.asarray(vert_lonlat, dtype=np.float64)
+    if vert_lonlat.ndim != 2 or vert_lonlat.shape[1] != 2:
+        raise ValueError("vert_lonlat must have shape (N,2) [lon,lat]")
+
+    edge_cc, _ = tricon(tria, conn)
+    edge_nodes = edge_cc[:, 0:2]
+    edge_faces = edge_cc[:, 2:4]
+
+    n_small, _ = mk3.compute_small_links_from_arrays(
+        node_x=vert_lonlat[:, 0],
+        node_y=vert_lonlat[:, 1],
+        face_nodes=tria,
+        edge_nodes=edge_nodes,
+        edge_faces=edge_faces,
+        removesmalllinkstrsh=removesmalllinkstrsh,
+    )
+    return int(n_small)
+
+
+def _smood_ortho_merge_backup_pipeline(vert, conn, tria, tnum, opts):
+    """
+    Pipeline from ``backup_ortho_merge_20260319_174424``: repeated orthogonalize (mixed faces
+    triangulated like export: quad diagonal ``(v1,v2)``, not fan-from-``a``)
+    then ``merge_circumcenters``, same numerical defaults as that folder except
+    ``smalllink_threshold`` defaults to ``BACKUP_ORTHO_MERGE_SMALLLINK_THRESHOLD`` (0.11).
+
+    When ``require_both_criteria`` is False (default), behaviour matches the backup
+    (no global dual check / no recovery). Set it True to require the fan-proxy dual
+    criteria and run recovery cycles (see :mod:`pymesh2d.ortho_merge.ortho_merge_iter`).
+    """
+    from .ortho_merge.ortho_merge_iter import ortho_merge_iterate_tria, print_stats
+
+    vert_in = np.asarray(vert, dtype=np.float64)
+    tria_in = np.asarray(tria, dtype=np.int64)
+    tnum_in = np.asarray(tnum, dtype=np.int64).reshape(-1)
+
+    outer_iter_max = int(opts.get("iter", 4))
+    outer_iter_max = max(1, min(outer_iter_max, 4))
+
+    smalllink_trsh = float(
+        opts.get("smalllink_threshold", BACKUP_ORTHO_MERGE_SMALLLINK_THRESHOLD)
+    )
+    require_strict = bool(
+        opts.get("require_both_criteria", BACKUP_ORTHO_MERGE_REQUIRE_STRICT_DUAL)
+    )
+
+    do_log = not np.isinf(opts.get("disp", 4))
+
+    # Initial snapshot (triangle proxy: 1 mixed-face row per input triangle).
+    init_max_c = None
+    init_n_small = None
+    if do_log:
+        cosphi_threshold = float(opts.get("orthogonality_threshold", 0.49))
+        removesmalllinkstrsh = smalllink_trsh
+        tri_origin_face_id = np.arange(tria_in.shape[0], dtype=np.int64)
+        quad_face_mask = np.zeros(tria_in.shape[0], dtype=bool)
+
+        from .ortho_merge.ortho_merge_iter import dual_criteria_on_fan_mesh, OrthoMergeStats
+
+        _, init_max_c, init_n_small = dual_criteria_on_fan_mesh(
+            np.asarray(vert_in, dtype=np.float64),
+            tria_in,
+            tri_origin_face_id,
+            quad_face_mask,
+            cosphi_threshold=cosphi_threshold,
+            removesmalllinkstrsh=removesmalllinkstrsh,
+        )
+        print_stats(
+            [
+                OrthoMergeStats(
+                    outer_iter=-1,
+                    max_cosphi=float(init_max_c),
+                    n_small_flow_links=int(init_n_small),
+                    merged_this_iter=0,
+                    n_zones_orthogonalized=0,
+                )
+            ],
+            print_header=True,
+        )
+
+    def _on_state(s):
+        if do_log:
+            print_stats([s], print_header=False)
+
+    # Keep output compact: disable verbose per-zone logs inside meshkernel orthogonalization.
+    from .ortho_merge import meshkernel_orthogonalize_3 as mk3
+    old_verbose = getattr(mk3, "VERBOSE_ZONE_LOGS", True)
+    mk3.VERBOSE_ZONE_LOGS = False
+    try:
+        vert_out, face_nodes_0b, stats = ortho_merge_iterate_tria(
+            vert_in,
+            tria_in,
+            node_z=None,
+            outer_iter_max=outer_iter_max,
+            cosphi_threshold=float(opts.get("orthogonality_threshold", 0.49)),
+            removesmalllinkstrsh=smalllink_trsh,
+            buffer_layers=int(opts.get("buffer_layers", 2)),
+            max_global_iter=int(opts.get("max_global_iter", int(opts.get("inner_iter", 4)) + 2)),
+            smooth_iter=int(opts.get("smooth_iter", int(opts.get("inner_iter", 4)) * 4)),
+            enable_edge_flips=bool(opts.get("enable_edge_flips", True)),
+            stop_if_no_merge=True,
+            ortho_disable_smalllink_logic=True,
+            require_both_criteria=require_strict,
+            max_recovery_iterations=int(opts.get("max_recovery_iterations", 25)),
+            recovery_stagnation_break=int(opts.get("recovery_stagnation_break", 3)),
+            on_state=_on_state if do_log else None,
+        )
+    finally:
+        mk3.VERBOSE_ZONE_LOGS = old_verbose
+
+    # Final snapshot (triangle proxy built from mixed faces).
+    if do_log:
+        cosphi_threshold = float(opts.get("orthogonality_threshold", 0.49))
+        removesmalllinkstrsh = smalllink_trsh
+
+        from .ortho_merge.ortho_merge_iter import dual_criteria_on_fan_mesh, OrthoMergeStats
+
+        face_nodes_0b_arr = np.asarray(face_nodes_0b, dtype=np.int64)
+        vert_xy = np.asarray(vert_out, dtype=np.float64)
+
+        tria_proxy = []
+        tri_origin_face_id = []
+        quad_face_mask = np.zeros(face_nodes_0b_arr.shape[0], dtype=bool)
+
+        for fid, row in enumerate(face_nodes_0b_arr):
+            nodes = row[row >= 0]
+            if nodes.size < 3:
+                continue
+            quad_face_mask[fid] = nodes.size == 4
+            for t in triangulate_mixed_face_row_to_tris(vert_xy, nodes):
+                tria_proxy.append(t)
+                tri_origin_face_id.append(fid)
+
+        tria_proxy = np.asarray(tria_proxy, dtype=np.int64)
+        tri_origin_face_id = np.asarray(tri_origin_face_id, dtype=np.int64)
+
+        _, fin_max_c, fin_n_small = dual_criteria_on_fan_mesh(
+            vert_xy,
+            tria_proxy,
+            tri_origin_face_id,
+            quad_face_mask,
+            cosphi_threshold=cosphi_threshold,
+            removesmalllinkstrsh=removesmalllinkstrsh,
+        )
+
+        last_zones = int(getattr(stats[-1], "n_zones_orthogonalized", 0)) if stats else 0
+        print_stats(
+            [
+                OrthoMergeStats(
+                    outer_iter=-2,
+                    max_cosphi=float(fin_max_c),
+                    n_small_flow_links=int(fin_n_small),
+                    merged_this_iter=0,
+                    n_zones_orthogonalized=last_zones,
+                )
+            ],
+            print_header=False,
+        )
+
+    # Optional: keep merged quads for NetCDF export (see ``preserve_merged_quads`` in ``code.py``).
+    preserve_merged_quads = bool(opts.get("preserve_merged_quads", False))
+    face_nodes_arr = np.asarray(face_nodes_0b, dtype=np.int64)
+
+    if preserve_merged_quads:
+        opts["_mixed_face_nodes_0b"] = face_nodes_arr.copy()
+    else:
+        opts.pop("_mixed_face_nodes_0b", None)
+
+    # If we actually have quads and the caller asked to preserve them, return
+    # ``face_nodes_0b`` directly as the 3rd output (`tria`), so callers can do:
+    #   ds_out = adcirc2DFlowFM(NODE, tria)
+    # without needing the separate `mixed_fn` conditional.
+    #
+    # For purely triangulated meshes (no quads), keep the historical return
+    # type: triangle connectivity (T,3).
+    valid_counts = np.sum(face_nodes_arr >= 0, axis=1)
+    has_quads = bool(np.any(valid_counts == 4))
+    if preserve_merged_quads and has_quads:
+        tria_out = face_nodes_arr.copy()
+        # `tnum` is not used by `adcirc2DFlowFM`, but keep the shape consistent
+        # with the returned face rows.
+        tnum_out = np.ones((tria_out.shape[0], 1), dtype=np.int64)
+        return np.asarray(vert_out, dtype=np.float64), conn, tria_out, tnum_out
+
+    # Triangle-only connectivity.
+    # Quads from merge_circumcenters: split on diagonal (v1,v2), not fan-from-a.
+    new_tris = []
+    new_parts = []
+    vert_xy = np.asarray(vert_out, dtype=np.float64)
+    for row in face_nodes_arr:
+        nodes = row[row >= 0]
+        if nodes.size < 3:
+            continue
+        for t in triangulate_mixed_face_row_to_tris(vert_xy, nodes):
+            new_tris.append(t)
+            new_parts.append(1)
+
+    tria_out = np.asarray(new_tris, dtype=np.int64)
+    if tria_out.size == 0:
+        tria_out = tria_in.copy()
+        tnum_out = np.asarray(tnum, dtype=np.int64)
+    else:
+        tnum_out = np.asarray(new_parts, dtype=np.int64).reshape(-1, 1)
+
+    return np.asarray(vert_out, dtype=np.float64), conn, tria_out, tnum_out
+
+
+def _smood_v3_ortho_merge(vert, conn, tria, tnum, opts):
+    """
+    V3 orthogonalization + small-flow-link removal through iterated
+    tri->quad merge (then fan triangulation back to triangles).
+    """
+    use_backup_transition = bool(opts.get("use_backup_transition", True))
+    if use_backup_transition:
+        return _smood_ortho_merge_backup_pipeline(vert, conn, tria, tnum, opts)
+
+    from .ortho_merge.meshkernel_orthogonalize_3_tria import orthogonalize_tria_mesh
+
+    from .ortho_merge import meshkernel_orthogonalize_3 as mk3
+
+    vert_cur = np.asarray(vert, dtype=np.float64)
+    tria_cur = np.asarray(tria, dtype=np.int64)
+    tnum_cur = np.asarray(tnum, dtype=np.int64)
+    conn_cur = np.asarray(conn, dtype=np.int64) if conn is not None else np.empty((0, 2), dtype=np.int64)
+
+    removesmalllinkstrsh = float(opts.get("smalllink_threshold", 0.11))
+
+    cosphi_threshold = float(opts.get("orthogonality_threshold", 0.49))
+    # Keep Delft3D-ish target as a minimum for stability.
+    cosphi_threshold = max(cosphi_threshold, 0.49)
+
+    outer_iter_max = int(opts.get("iter", 4))
+    # Hard cap to keep runtime bounded.
+    outer_iter_max = max(1, min(outer_iter_max, 4))
+
+    inner_iter = int(opts.get("inner_iter", 4))
+    buffer_layers = int(opts.get("buffer_layers", 2))
+    max_global_iter = int(opts.get("max_global_iter", inner_iter + 2))
+    smooth_iter = int(opts.get("smooth_iter", inner_iter * 4))
+    enable_edge_flips = bool(opts.get("enable_edge_flips", True))
+
+    need_smalllinks = bool(opts.get("converge_on_smalllinks", True))
+    need_ortho = bool(opts.get("converge_on_orthogonality", True))
+    # Ensure we run at least 2 outer cycles when convergence is requested:
+    # merge can temporarily worsen orthogonality, so we need a second
+    # orthogonalization pass after small-link handling.
+    if (need_smalllinks or need_ortho) and outer_iter_max < 2:
+        outer_iter_max = 2
+
+    # Stability: disable small-link-specific logic inside orthogonalization,
+    # and let merge_circumcenters-style tri->quad replacement handle it.
+    ortho_disable_smalllink_logic = True
+    ortho_smalllinkstrsh = 1.0e-12 if ortho_disable_smalllink_logic else removesmalllinkstrsh
+
+    crs_wgs84 = pyproj.CRS.from_epsg(4326)
+    utm_crs = get_local_utm_crs(crs_wgs84, x=vert_cur[:, 0], y=vert_cur[:, 1])
+
+    prev_max_cosphi = None
+
+    for _outer in range(outer_iter_max):
+        vert_before_outer = vert_cur.copy()
+        tria_before_outer = tria_cur.copy()
+        tnum_before_outer = tnum_cur.copy()
+
+        # 1) Orthogonalize (node movement).
+        ortho_res = orthogonalize_tria_mesh(
+            vert_cur,
+            tria_cur,
+            cosphi_threshold=cosphi_threshold,
+            removesmalllinkstrsh=ortho_smalllinkstrsh,
+            buffer_layers=buffer_layers,
+            max_global_iter=max_global_iter,
+            smooth_iter=smooth_iter,
+            enable_edge_flips=enable_edge_flips,
+        )
+        vert_cur = ortho_res.vert
+        tria_cur = ortho_res.tria
+        max_cosphi = float(ortho_res.max_cosphi)
+
+        # 2) Merge small links (tri->quad) and fan triangulate back to triangles.
+        edge_cc, _ = tricon(tria_cur, conn_cur)
+        edge_nodes = edge_cc[:, 0:2]
+        edge_faces = edge_cc[:, 2:4]
+        n_small_now, small_link_indices = mk3.compute_small_links_from_arrays(
+            node_x=vert_cur[:, 0],
+            node_y=vert_cur[:, 1],
+            face_nodes=tria_cur,
+            edge_nodes=edge_nodes,
+            edge_faces=edge_faces,
+            removesmalllinkstrsh=removesmalllinkstrsh,
+        )
+
+        if int(n_small_now) > 0:
+            # Only reproject when we actually need to merge (signed quad area uses meters).
+            vert_utm = reproject_node(vert_cur, crs_wgs84, utm_crs)
+            tria_cur, tnum_cur, n_quads = _merge_small_links_quads_fan_tria_from_indices(
+                tria_cur,
+                tnum_cur,
+                edge_cc,
+                small_link_indices,
+                vert_utm,
+            )
+        else:
+            n_quads = 0
+
+        # 3) Optional guardrail: if merge did nothing and orthogonality got worse, revert.
+        if n_quads == 0 and prev_max_cosphi is not None and max_cosphi > (prev_max_cosphi + 1.0e-9):
+            vert_cur = vert_before_outer
+            tria_cur = tria_before_outer
+            tnum_cur = tnum_before_outer
+            break
+
+        prev_max_cosphi = max_cosphi
+
+        # 4) Stop conditions.
+        if need_ortho and max_cosphi > cosphi_threshold:
+            continue
+
+        if need_smalllinks:
+            n_small_after = _count_small_flow_links(
+                tria_cur,
+                vert_cur,
+                conn_cur,
+                removesmalllinkstrsh,
+            )
+            if n_small_after > 0:
+                continue
+
+        break
+
+    return vert_cur, conn, tria_cur, tnum_cur
 
 
 def smood(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg=[]):
@@ -52,41 +470,34 @@ def smood(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg
           The actual factor starts small and increases progressively during iterations (like Delft3D's mu).
         - 'relaxation' : float, default = 0.75
           Relaxation factor for coordinate updates.
-        - 'use_smalllink' : bool, default = True
-          Whether to apply fix_small_flow_links during iterations and at the end.
         - 'converge_on_smalllinks' : bool, default = True
-          If True, continue iterating until no small flow links remain (or max iterations reached).
-          If False, converge only based on vertex movement tolerance.
+          Used when ``use_backup_transition`` is **False** (inline V3 loop): keep outer cycles until
+          small-link count drops, subject to ``iter``.
         - 'converge_on_orthogonality' : bool, default = True
-          If True, continue iterating until internal constrained edges have acceptable orthogonality.
-          If False, converge only based on vertex movement tolerance and small links.
-        - 'orthogonality_threshold' : float, default = 0.3
-          Maximum acceptable orthogonality value (|cos(angle)|) for internal constrained edges.
-          Lower values are better (0.0 = perfect orthogonality, 1.0 = parallel).
-          Edges with orthogonality > threshold are considered "poor" and prevent convergence.
-        - 'allow_constraint_sliding' : bool, default = False
-          If True, allow vertices on internal constrained edges to slide along their constraint lines
-          to improve orthogonality. Vertices at junctions (on multiple constraint lines) remain fixed
-          unless allow_constraint_sliding_junctions=True.
-        - 'allow_constraint_sliding_junctions' : bool, default = False
-          If True, automatically enables allow_constraint_sliding and also allows vertices at junctions
-          (on multiple constraint lines) to slide along constraint lines. For junctions, the vertex is
-          projected onto the closest constraint line. If False, only vertices on exactly one constraint
-          line can slide (if allow_constraint_sliding=True).
-        - 'max_final_smalllink_iter' : int, default = 10
-          Maximum number of iterations for final small link correction phase.
-        - 'smalllink_iter_start' : int, optional
-          Iteration at which to start applying small flow link fixes.
-          If not provided, automatically set to iter // 2 (halfway through iterations).
-        - 'smalllink_iter_freq' : int, optional
-          Frequency of small flow link fixes (every N iterations).
-          If not provided, automatically set based on number of iterations:
-          - iter <= 10: every 2 iterations
-          - iter <= 20: every 3 iterations
-          - iter > 20: approximately every iter/8 iterations
-          Applied every iteration in the last 3 iterations regardless of frequency.
+          Same branch: continue while ``max|cosφ|`` exceeds ``orthogonality_threshold``.
+        - 'orthogonality_threshold' : float, default = 0.49
+          Passed to the V3 triangle orthogonalizer (max allowed |cos φ| on internal flow links).
+        - 'allow_constraint_sliding' / 'allow_constraint_sliding_junctions' : bool
+          Reserved for :func:`makeopt_smood` compatibility (not used by the default ortho-merge path).
+        - 'max_final_smalllink_iter' / 'smalllink_iter_start' / 'smalllink_iter_freq' : int
+          Reserved for option-schema compatibility with older scripts.
         - 'smalllink_threshold' : float, default = 0.11
-          Threshold for small flow links (passed to fix_small_flow_links as removesmalllinkstrsh).
+          Threshold for small flow links (``removesmalllinkstrsh`` in merge / meshkernel checks).
+          Same role as in ``backup_ortho_merge_20260319_174424`` (that folder used 0.1; default here 0.11).
+        - 'use_backup_transition' : bool, default = True
+          Use the ortho↔merge pipeline implemented as ``_smood_ortho_merge_backup_pipeline``
+          (:mod:`pymesh2d.ortho_merge.ortho_merge_iter`). If False, falls back to the inline V3 ortho+merge loop.
+        - 'require_both_criteria' : bool, default = False
+          If True, after the main ortho-merge cycles, require dual criteria on the merge-consistent
+          triangle proxy and run recovery (may raise ``RuntimeError``). **False** matches the backup
+          snapshot (no global check). *Not* a threshold — use ``smalllink_threshold`` for 0.11.
+        - 'max_recovery_iterations' : int, default = 25
+          Extra ortho+merge cycles when ``require_both_criteria`` is True and checks fail.
+        - 'recovery_stagnation_break' : int, default = 3
+          Stop recovery when ``(max|cosφ|, n_small)`` is unchanged for this many consecutive
+          recovery cycles (0 = disabled). Still raises if criteria are unmet.
+        - 'preserve_merged_quads' : bool, default = False
+          If True, store mixed face-node rows on ``opts['_mixed_face_nodes_0b']`` for UGRID export.
         - 'disp' : int or float, default = 4
           Display frequency for iteration progress. Set to `np.inf` for quiet execution.
     hfun : callable, optional
@@ -107,26 +518,9 @@ def smood(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg
 
     Notes
     -----
-    This routine implements a Delft3D-inspired approach that:
-    1. Computes orthogonalization weights based on edge aspect ratios
-    2. Computes smoothing weights based on angle optimization
-    3. Combines both contributions with a weighted factor
-    4. Uses iterative refinement with relaxation for stability
-    5. Optimized for performance using vectorized numpy operations
-    
-    Performance optimizations:
-    - Weights are computed once per outer iteration (not per inner iteration)
-    - Adaptive ortho_factor (mu) starts small and increases progressively
-    - Small flow link fixes are applied conditionally (not every iteration)
-    - Vectorized operations replace Python loops where possible
-    
-    The ortho_factor adaptively increases from a small initial value (0.01 * max)
-    to the maximum specified value, similar to Delft3D's mu parameter.
-
-    References
-    ----------
-    Inspired by MeshKernel's OrthogonalizationAndSmoothing implementation.
-    See: https://github.com/Deltares/MeshKernel
+    Default path delegates to :mod:`pymesh2d.ortho_merge.ortho_merge_iter` (orthogonalize on a
+    merge-consistent triangle proxy, then ``merge_circumcenters``). See MeshKernel /
+    Delft3D-FM references in :mod:`pymesh2d.ortho_merge.meshkernel_orthogonalize_3`.
     """
 
     if vert is None:
@@ -173,1029 +567,10 @@ def smood(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg
     # ---------------------------------------------- output title
     if not np.isinf(opts["disp"]):
         print("\n Smooth triangulation for Delft3D-FM computation...\n")
-        print(" -------------------------------------------------------")
-        print("      |ITER.|          |MOVE(X)|          |LINK(X)|     ")
-        print(" -------------------------------------------------------")
 
-    # ---------------------------------------------- polygon bounds
-    node = vert.copy()
-    PSLG = conn.copy()
-    pmax = int(np.max(tnum))
-    part = [None for _ in range(pmax)]
 
-    for ppos in range(pmax):
-        tsel = tnum.flatten() == (ppos + 1)
-        tcur = tria[tsel, :]
-        ecur, tcur = tricon(tcur)
-        ebnd = ecur[:, 3] == -1
-        same, _ = setset(PSLG, ecur[ebnd, 0:2])
-        part[ppos] = np.where(same)[0]
-
-    # ---------------------------------------------- DO MESH ITER
-    tnow = time.time()
-    tcpu = {
-        "full": 0.0,
-        "ortho": 0.0,
-        "smooth": 0.0,
-        "solve": 0.0,
-        "smalllink": 0.0,
-    }
-
-    ortho_factor_max = opts["ortho_factor"]
-    ortho_factor = min(0.05, ortho_factor_max * 0.15)
-    relaxation = opts["relaxation"]
-    
-    smalllink_iter_start = int(opts["smalllink_iter_start"])
-    smalllink_iter_freq = int(opts["smalllink_iter_freq"])
-
-    for outer_iter in range(int(opts["iter"])):
-        # ---------------------------------------------- rebuild connectivity
-        edge, tria_6col = tricon(tria, conn)
-        nvrt = vert.shape[0]
-        nedg = edge.shape[0]
-
-        # Build vertex-edge incidence matrix
-        IMAT = csr_matrix(
-            (np.ones(nedg), (edge[:, 0], np.arange(nedg))), shape=(nvrt, nedg)
-        )
-        JMAT = csr_matrix(
-            (np.ones(nedg), (edge[:, 1], np.arange(nedg))), shape=(nvrt, nedg)
-        )
-        EMAT = IMAT + JMAT
-        vdeg = np.array(EMAT.sum(axis=1)).flatten()
-
-        allow_constraint_sliding = opts.get("allow_constraint_sliding", False)
-        allow_junctions = opts.get("allow_constraint_sliding_junctions", False)
-        
-        # If allow_constraint_sliding_junctions is True, automatically enable allow_constraint_sliding
-        if allow_junctions:
-            allow_constraint_sliding = True
-        
-        free_vertices = compute_free_vertices(nvrt, conn, part, allow_constraint_sliding)
-        vold = vert.copy()
-        oscr = triscr(vert, tria)
-
-        # ---------------------------------------------- compute weights
-        # Evaluate hfun first (needed for both orthogonalization and smoothing)
-        hvrt = evalhfn(vert, edge, EMAT, hfun, harg)
-        
-        ttic_ortho = time.time()
-        ortho_weights, ortho_rhs = compute_orthogonalization_weights(
-            vert, edge, tria, tria_6col, free_vertices, part, conn, hvrt
-        )
-        tcpu["ortho"] += time.time() - ttic_ortho
-
-        ttic_smooth = time.time()
-        smooth_weights = compute_smoothing_weights(
-            vert, edge, EMAT, vdeg, hvrt
-        )
-        tcpu["smooth"] += time.time() - ttic_smooth
-
-        # ---------------------------------------------- inner iterations
-        smooth_factor = 1.0 - ortho_factor
-        
-        for inner_iter in range(opts["inner_iter"]):
-            ttic_solve = time.time()
-
-            vnew = combine_and_solve(
-                vert,
-                edge,
-                EMAT,
-                ortho_weights,
-                ortho_rhs,
-                smooth_weights,
-                ortho_factor,
-                smooth_factor,
-                free_vertices,
-                conn,
-                part,
-            )
-
-            vnew = relaxation * vnew + (1.0 - relaxation) * vert
-
-            # Project vertices on constraint lines
-            if allow_constraint_sliding and conn is not None and len(conn) > 0 and part is not None:
-                external_vertex_set = set()
-                for p in part:
-                    if p is not None and len(p) > 0:
-                        part_edges = conn[p, :]
-                        for e in part_edges:
-                            external_vertex_set.add(int(e[0]))
-                            external_vertex_set.add(int(e[1]))
-                
-                external_vertex_array = np.array(list(external_vertex_set))
-                if len(external_vertex_array) > 0:
-                    vnew[external_vertex_array, :] = vert[external_vertex_array, :]
-                
-                # Count constraint lines per vertex to identify junctions
-                conn_sorted = np.sort(conn, axis=1)
-                external_edge_set = set()
-                for p in part:
-                    if p is not None and len(p) > 0:
-                        part_edges = conn[p, :]
-                        part_edges_sorted = np.sort(part_edges, axis=1)
-                        for e in part_edges_sorted:
-                            external_edge_set.add(tuple(e))
-                
-                vertex_constraint_count = {}
-                internal_constrained_vertices = set()
-                for e in conn_sorted:
-                    edge_tuple = tuple(e)
-                    if edge_tuple not in external_edge_set:
-                        v1_idx = int(e[0])
-                        v2_idx = int(e[1])
-                        internal_constrained_vertices.add(v1_idx)
-                        internal_constrained_vertices.add(v2_idx)
-                        vertex_constraint_count[v1_idx] = vertex_constraint_count.get(v1_idx, 0) + 1
-                        vertex_constraint_count[v2_idx] = vertex_constraint_count.get(v2_idx, 0) + 1
-                
-                for v_idx in internal_constrained_vertices:
-                    if v_idx < len(vnew) and v_idx not in external_vertex_set:
-                        is_junction = vertex_constraint_count.get(v_idx, 0) > 1
-                        if not is_junction or allow_junctions:
-                            vnew[v_idx, :] = project_vertex_on_constraint_line(
-                                v_idx, vnew[v_idx, :], conn, part, vert, allow_junctions
-                            )
-            else:
-                # Fix all constrained vertices if sliding is not allowed
-                if conn is not None and len(conn) > 0:
-                    vnew[conn.flatten(), :] = vert[conn.flatten(), :]
-            
-            # Only fix vertices that are truly fixed (external boundaries or constrained without sliding)
-            vnew[~free_vertices, :] = vert[~free_vertices, :]
-
-            vert = vnew
-
-            tcpu["solve"] += time.time() - ttic_solve
-
-        # ---------------------------------------------- fix small flow links
-        if opts.get("use_smalllink", True):
-            should_fix = False
-            
-            if outer_iter >= smalllink_iter_start:
-                iter_remaining = int(opts["iter"]) - outer_iter
-                if iter_remaining <= 3:
-                    should_fix = True
-                elif outer_iter % smalllink_iter_freq == 0:
-                    should_fix = True
-            
-            if should_fix:
-                ttic_smalllink = time.time()
-                try:
-                    if "removesmalllinkstrsh" not in opts:
-                        opts["removesmalllinkstrsh"] = opts.get("smalllink_threshold", 0.1)
-                    
-                    vert, conn, tria, tnum = fix_small_flow_links(
-                        vert, conn, tria, tnum, node, PSLG, part, opts
-                    )
-                    vold = vert.copy()
-                    edge, tria_6col = tricon(tria, conn)
-                    nvrt = vert.shape[0]
-                    nedg = edge.shape[0]
-                    IMAT = csr_matrix(
-                        (np.ones(nedg), (edge[:, 0], np.arange(nedg))), shape=(nvrt, nedg)
-                    )
-                    JMAT = csr_matrix(
-                        (np.ones(nedg), (edge[:, 1], np.arange(nedg))), shape=(nvrt, nedg)
-                    )
-                    EMAT = IMAT + JMAT
-                    vdeg = np.array(EMAT.sum(axis=1)).flatten()
-                    free_vertices = compute_free_vertices(nvrt, conn, part, allow_constraint_sliding)
-                    
-                    # Recalculate hvrt after mesh modification
-                    ttic_ortho_recomp = time.time()
-                    hvrt = evalhfn(vert, edge, EMAT, hfun, harg)
-                    ortho_weights, ortho_rhs = compute_orthogonalization_weights(
-                        vert, edge, tria, tria_6col, free_vertices, part, conn, hvrt
-                    )
-                    tcpu["ortho"] += time.time() - ttic_ortho_recomp
-                    
-                    ttic_smooth_recomp = time.time()
-                    smooth_weights = compute_smoothing_weights(
-                        vert, edge, EMAT, vdeg, hvrt
-                    )
-                    tcpu["smooth"] += time.time() - ttic_smooth_recomp
-                    
-                except Exception as e:
-                    if opts.get("dbug", False):
-                        print(f"Warning: fix_small_flow_links failed at iter {outer_iter}: {e}")
-                tcpu["smalllink"] += time.time() - ttic_smalllink
-
-        # ---------------------------------------------- update ortho_factor
-        progress = (outer_iter + 1) / int(opts["iter"])
-        
-        if progress < 0.5:
-            growth_factor = 2.5
-            ortho_factor = min(growth_factor * ortho_factor, ortho_factor_max)
-        else:
-            target_factor = ortho_factor_max * (0.5 + 0.5 * (progress - 0.5) / 0.5)
-            ortho_factor = min(max(ortho_factor * 1.2, target_factor), ortho_factor_max)
-
-        # ---------------------------------------------- check convergence
-        n_smalllinks = 0
-        if opts.get("use_smalllink", True) and opts.get("converge_on_smalllinks", True):
-            try:
-                edge_check, tria_6col_check = tricon(tria, conn)
-                removesmalllinkstrsh = opts.get("removesmalllinkstrsh", opts.get("smalllink_threshold", 0.1))
-                n_smalllinks, _ = small_flow_links(
-                    vert, tria, edge_check, removesmalllinkstrsh, conn, tria_6col_check
-                )
-            except Exception:
-                n_smalllinks = -1
-        
-        n_poor_ortho = 0
-        if opts.get("converge_on_orthogonality", True):
-            try:
-                ortho_threshold = opts.get("orthogonality_threshold", 0.3)
-                n_poor_ortho = check_internal_constrained_orthogonality(
-                    vert, edge, tria, conn, part, ortho_threshold
-                )
-            except Exception:
-                n_poor_ortho = -1
-
-        # ---------------------------------------------- test convergence
-        # Recalculate hvrt if mesh was modified (vertex count changed)
-        if hvrt.shape[0] != vert.shape[0]:
-            hvrt = evalhfn(vert, edge, EMAT, hfun, harg)
-        
-        if vert.shape[0] == vold.shape[0]:
-            vdel = np.sum((vert - vold) ** 2, axis=1)
-        else:
-            n_common = min(vert.shape[0], vold.shape[0])
-            vdel = np.sum((vert[:n_common, :] - vold[:n_common, :]) ** 2, axis=1)
-            if vert.shape[0] > vold.shape[0]:
-                vdel = np.concatenate([vdel, np.zeros(vert.shape[0] - vold.shape[0])])
-            elif vold.shape[0] > vert.shape[0]:
-                vdel = np.concatenate([vdel, np.zeros(vold.shape[0] - vert.shape[0])])
-
-        # Ensure hvrt matches vdel shape
-        hvrt_flat = hvrt.flatten()
-        if hvrt_flat.shape[0] != vdel.shape[0]:
-            # Recalculate if still mismatched
-            hvrt = evalhfn(vert, edge, EMAT, hfun, harg)
-            hvrt_flat = hvrt.flatten()
-        
-        vdel_norm = vdel / (hvrt_flat ** 2 + np.finfo(float).eps)
-
-        move = vdel_norm > opts["vtol"] ** 2
-        nmov = np.count_nonzero(move)
-
-        nscr = triscr(vert, tria)
-        
-        # Display small links count (or -1 if not computed)
-        n_smalllinks_display = n_smalllinks if n_smalllinks >= 0 else -1
-
-        if outer_iter % opts["disp"] == 0:
-            print(f"{outer_iter:11d} {nmov:18d} {n_smalllinks_display:18d}")
-
-        # ---------------------------------------------- loop convergence
-        converged = nmov == 0
-        if converged and opts.get("converge_on_smalllinks", True) and n_smalllinks > 0:
-            converged = False
-        if converged and opts.get("converge_on_orthogonality", True) and n_poor_ortho > 0:
-            converged = False
-            if outer_iter % 2 == 0:
-                try:
-                    if "removesmalllinkstrsh" not in opts:
-                        opts["removesmalllinkstrsh"] = opts.get("smalllink_threshold", 0.11)
-                    vert, conn, tria, tnum = fix_small_flow_links(
-                        vert, conn, tria, tnum, node, PSLG, part, opts
-                    )
-                    vold = vert.copy()
-                    edge, tria_6col = tricon(tria, conn)
-                    nvrt = vert.shape[0]
-                    nedg = edge.shape[0]
-                    IMAT = csr_matrix(
-                        (np.ones(nedg), (edge[:, 0], np.arange(nedg))), shape=(nvrt, nedg)
-                    )
-                    JMAT = csr_matrix(
-                        (np.ones(nedg), (edge[:, 1], np.arange(nedg))), shape=(nvrt, nedg)
-                    )
-                    EMAT = IMAT + JMAT
-                    vdeg = np.array(EMAT.sum(axis=1)).flatten()
-                    free_vertices = compute_free_vertices(nvrt, conn, part, allow_constraint_sliding)
-                    
-                    # Recalculate hvrt after mesh modification
-                    hvrt = evalhfn(vert, edge, EMAT, hfun, harg)
-                    ortho_weights, ortho_rhs = compute_orthogonalization_weights(
-                        vert, edge, tria, tria_6col, free_vertices, part, conn, hvrt
-                    )
-                    smooth_weights = compute_smoothing_weights(
-                        vert, edge, EMAT, vdeg, hvrt
-                    )
-                except Exception:
-                    pass
-        
-        if converged:
-            break
-
-    # ---------------------------------------------- final small link fix
-    if opts.get("use_smalllink", True):
-        ttic_smalllink = time.time()
-        try:
-            if "removesmalllinkstrsh" not in opts:
-                opts["removesmalllinkstrsh"] = opts.get("smalllink_threshold", 0.11)
-            
-            removesmalllinkstrsh = opts["removesmalllinkstrsh"]
-            max_final_iter = opts.get("max_final_smalllink_iter", 15)
-            
-            edge_final, tria_6col_final = tricon(tria, conn)
-            
-            n_smalllinks_final, _ = small_flow_links(
-                vert, tria, edge_final, removesmalllinkstrsh, conn, tria_6col_final
-            )
-            
-            if n_smalllinks_final > 0 and opts.get("converge_on_smalllinks", True):
-                if opts.get("dbug", False):
-                    print(f"\nFinal small link correction: starting with {n_smalllinks_final} small links")
-                
-                vert_before_final = vert.copy()
-                final_opts = opts.copy()
-                
-                if n_smalllinks_final <= 3:
-                    final_opts["max_fix_iter"] = max(30, max_final_iter * 3)
-                else:
-                    final_opts["max_fix_iter"] = min(20, max_final_iter * 2)
-                
-                prev_nlinks = n_smalllinks_final
-                no_improvement_count = 0
-                max_no_improvement = 3 if n_smalllinks_final <= 3 else 2
-                
-                for final_iter in range(max_final_iter):
-                    vert, conn, tria, tnum = fix_small_flow_links(
-                        vert, conn, tria, tnum, node, PSLG, part, final_opts
-                    )
-                    
-                    edge_final, tria_6col_final = tricon(tria, conn)
-                    n_smalllinks_final, _ = small_flow_links(
-                        vert, tria, edge_final, removesmalllinkstrsh, conn, tria_6col_final
-                    )
-                    
-                    if n_smalllinks_final == 0:
-                        break
-                    elif n_smalllinks_final >= prev_nlinks:
-                        no_improvement_count += 1
-                        if no_improvement_count >= max_no_improvement and n_smalllinks_final > 1:
-                            break
-                    else:
-                        no_improvement_count = 0
-                        prev_nlinks = n_smalllinks_final
-                    
-                    if n_smalllinks_final == 1 and final_iter < max_final_iter - 1:
-                        continue
-                
-                if opts.get("dbug", False):
-                    n_vert_before = vert_before_final.shape[0]
-                    n_vert_after = vert.shape[0]
-                    print(f"Final fix_small_flow_links: {n_vert_before} -> {n_vert_after} vertices, "
-                          f"{n_smalllinks_final} small links remaining after {final_iter + 1} iterations")
-            elif n_smalllinks_final > 0:
-                vert, conn, tria, tnum = fix_small_flow_links(
-                    vert, conn, tria, tnum, node, PSLG, part, opts
-                )
-        except Exception as e:
-            if opts.get("dbug", False):
-                print(f"Warning: final fix_small_flow_links failed: {e}")
-        tcpu["smalllink"] += time.time() - ttic_smalllink
-
-    tcpu["full"] += time.time() - tnow
-
-    if opts["dbug"]:
-        print("\n Mesh smoothing timer...\n")
-        print(f" FULL: {tcpu['full']:.6f}")
-        print(f" ORTHO: {tcpu['ortho']:.6f}")
-        print(f" SMOOTH: {tcpu['smooth']:.6f}")
-        print(f" SOLVE: {tcpu['solve']:.6f}")
-        print(f" SMALLLINK: {tcpu['smalllink']:.6f}\n")
-
-    if not np.isinf(opts["disp"]):
-        print("")
-
-    return vert, conn, tria, tnum
-
-
-def compute_free_vertices(nvrt, conn, part, allow_constraint_sliding=False):
-    """
-    Compute which vertices are free to move.
-    
-    Vertices on external boundaries (part) are always fixed.
-    Vertices on internal constrained edges are free if allow_constraint_sliding=True.
-    
-    Parameters
-    ----------
-    nvrt : int
-        Number of vertices.
-    conn : ndarray of shape (E_conn, 2)
-        All constrained edges (PSLG).
-    part : list of ndarray
-        List of edge indices in conn that define external boundaries.
-    allow_constraint_sliding : bool, default = False
-        If True, vertices on internal constrained edges are considered free (can slide along lines).
-        If False, all constrained vertices are fixed.
-    
-    Returns
-    -------
-    free_vertices : ndarray of shape (nvrt,)
-        Boolean array indicating free (movable) vertices.
-    """
-    free_vertices = np.ones(nvrt, dtype=bool)
-    if part is not None and conn is not None and len(conn) > 0:
-        # Always fix vertices on external boundaries
-        external_vertex_set = set()
-        for p in part:
-            if p is not None and len(p) > 0:
-                part_edges = conn[p, :]
-                for e in part_edges:
-                    external_vertex_set.add(int(e[0]))
-                    external_vertex_set.add(int(e[1]))
-        external_vertex_array = np.array(list(external_vertex_set))
-        if len(external_vertex_array) > 0:
-            free_vertices[external_vertex_array] = False
-        
-        # Handle internal constrained vertices based on allow_constraint_sliding
-        if not allow_constraint_sliding:
-            # Fix all constrained vertices if sliding is not allowed
-            external_edge_set = set()
-            for p in part:
-                if p is not None and len(p) > 0:
-                    part_edges = conn[p, :]
-                    part_edges_sorted = np.sort(part_edges, axis=1)
-                    for e in part_edges_sorted:
-                        external_edge_set.add(tuple(e))
-            
-            conn_sorted = np.sort(conn, axis=1)
-            internal_constrained_vertices = set()
-            for e in conn_sorted:
-                edge_tuple = tuple(e)
-                if edge_tuple not in external_edge_set:
-                    internal_constrained_vertices.add(int(e[0]))
-                    internal_constrained_vertices.add(int(e[1]))
-            
-            internal_vertex_array = np.array(list(internal_constrained_vertices))
-            if len(internal_vertex_array) > 0:
-                free_vertices[internal_vertex_array] = False
-    else:
-        # If no part info, fix all constrained vertices if sliding is not allowed
-        if not allow_constraint_sliding and conn is not None and len(conn) > 0:
-            free_vertices[conn.flatten()] = False
-    return free_vertices
-
-
-def check_internal_constrained_orthogonality(vert, edge, tria, conn, part, ortho_threshold=0.3):
-    """
-    Check orthogonality of internal constrained edges (edges in conn but not in part).
-    
-    Returns the number of internal constrained edges with poor orthogonality.
-    
-    Parameters
-    ----------
-    vert : ndarray of shape (V, 2)
-        Vertex coordinates.
-    edge : ndarray of shape (E, 5)
-        Edge connectivity from tricon.
-    tria : ndarray of shape (T, 3)
-        Triangle connectivity.
-    conn : ndarray of shape (E_conn, 2)
-        All constrained edges (PSLG).
-    part : list of ndarray
-        List of edge indices in conn that define external boundaries.
-    ortho_threshold : float, default = 0.3
-        Maximum acceptable orthogonality value (|cos(angle)|).
-        Lower values are better (0.0 = perfect orthogonality).
-    
-    Returns
-    -------
-    n_poor_ortho : int
-        Number of internal constrained edges with orthogonality > threshold.
-    """
-    if conn is None or len(conn) == 0 or part is None:
-        return 0
-    
-    external_edge_set = set()
-    for p in part:
-        if p is not None and len(p) > 0:
-            part_edges = conn[p, :]
-            part_edges_sorted = np.sort(part_edges, axis=1)
-            for e in part_edges_sorted:
-                external_edge_set.add(tuple(e))
-    
-    conn_sorted = np.sort(conn, axis=1)
-    internal_constrained_set = set()
-    for e in conn_sorted:
-        edge_tuple = tuple(e)
-        if edge_tuple not in external_edge_set:
-            internal_constrained_set.add(edge_tuple)
-    
-    if len(internal_constrained_set) == 0:
-        return 0
-    
-    edge_sorted = np.sort(edge[:, 0:2], axis=1)
-    internal_edge_indices = []
-    for i in range(edge.shape[0]):
-        edge_tuple = tuple(edge_sorted[i, :])
-        if edge_tuple in internal_constrained_set:
-            if edge[i, 3] > 0:
-                internal_edge_indices.append(i)
-    
-    if len(internal_edge_indices) == 0:
-        return 0
-    
-    n_poor_ortho = 0
-    for e_idx in internal_edge_indices:
-        v1_idx = int(edge[e_idx, 0])
-        v2_idx = int(edge[e_idx, 1])
-        v1 = vert[v1_idx, :]
-        v2 = vert[v2_idx, :]
-        
-        t1_idx = int(edge[e_idx, 2])
-        t2_idx = int(edge[e_idx, 3])
-        
-        tri1_verts = tria[t1_idx, :]
-        tri2_verts = tria[t2_idx, :]
-        
-        def circumcenter_triangle(p1, p2, p3):
-            dx2 = p2[0] - p1[0]
-            dy2 = p2[1] - p1[1]
-            dx3 = p3[0] - p1[0]
-            dy3 = p3[1] - p1[1]
-            den = dy2 * dx3 - dy3 * dx2
-            if abs(den) < 1e-12:
-                return (p1 + p2 + p3) / 3.0
-            z = (dx2 * (dx2 - dx3) + dy2 * (dy2 - dy3)) / den
-            return np.array([
-                p1[0] + 0.5 * (dx3 - z * dy3),
-                p1[1] + 0.5 * (dy3 + z * dx3)
-            ])
-        
-        cc1 = circumcenter_triangle(vert[tri1_verts[0], :], vert[tri1_verts[1], :], vert[tri1_verts[2], :])
-        cc2 = circumcenter_triangle(vert[tri2_verts[0], :], vert[tri2_verts[1], :], vert[tri2_verts[2], :])
-        
-        if not (np.all(np.isfinite(cc1)) and np.all(np.isfinite(cc2))):
-            continue
-        
-        edge_vec = v2 - v1
-        cc_vec = cc2 - cc1
-        
-        edge_len_sq = np.sum(edge_vec**2)
-        cc_len_sq = np.sum(cc_vec**2)
-        
-        if edge_len_sq > 0 and cc_len_sq > 0:
-            cosphi = np.abs(np.dot(edge_vec, cc_vec) / np.sqrt(edge_len_sq * cc_len_sq))
-            if np.isfinite(cosphi) and cosphi > ortho_threshold:
-                n_poor_ortho += 1
-    
-    return n_poor_ortho
-
-
-def compute_orthogonalization_weights(vert, edge, tria, tria_6col, free_vertices, part=None, conn=None, hvrt=None):
-    """
-    Compute orthogonalization weights based on edge aspect ratios.
-
-    This function computes weights that encourage orthogonal edges by
-    optimizing aspect ratios, similar to Delft3D's orthogonalizer.
-    Uses a simplified but efficient approach for performance.
-    Weights are normalized by mesh-size function to respect hfun constraints.
-
-    Parameters
-    ----------
-    vert : ndarray of shape (V, 2)
-        Vertex coordinates.
-    edge : ndarray of shape (E, 5)
-        Edge connectivity from tricon.
-    tria : ndarray of shape (T, 3)
-        Triangle connectivity.
-    tria_6col : ndarray of shape (T, 6)
-        Triangle-to-edge mapping from tricon.
-    free_vertices : ndarray of shape (V,)
-        Boolean array indicating free (movable) vertices.
-    part : list of ndarray, optional
-        List of edge indices in conn that define external boundaries.
-        Each element is an array of edge indices in conn (PSLG).
-    conn : ndarray of shape (E_conn, 2), optional
-        Array of all constrained edges (PSLG). Used to identify external
-        boundary edges when part is provided.
-    hvrt : ndarray of shape (V,), optional
-        Mesh-size function values at vertices. If provided, weights are
-        normalized to respect mesh-size constraints.
-
-    Returns
-    -------
-    weights : scipy.sparse matrix of shape (V, V)
-        Sparse representation of orthogonalization weights.
-    rhs : ndarray of shape (V, 2)
-        Right-hand side contributions for orthogonalization.
-    """
-    nvrt = vert.shape[0]
-    nedg = edge.shape[0]
-
-    evec = vert[edge[:, 1], :] - vert[edge[:, 0], :]
-    elen = np.sqrt(np.sum(evec**2, axis=1))
-    elen = np.maximum(elen, np.finfo(float).eps)
-
-    evec_norm = evec / elen[:, None]
-    aspect_ratios = np.ones(nedg, dtype=np.float64)
-    
-    # Normalize weights by mesh-size function if provided
-    h_weights = np.ones(nedg, dtype=np.float64)
-    if hvrt is not None:
-        hmid = 0.5 * (hvrt[edge[:, 0]] + hvrt[edge[:, 1]])
-        hmid = np.maximum(hmid, np.finfo(float).eps)
-        hmid = np.where(np.isfinite(hmid), hmid, np.finfo(float).eps)
-        # Weight inversely proportional to target edge length
-        # Longer target edges get lower weight (less orthogonalization)
-        h_weights = 1.0 / (hmid + np.finfo(float).eps)
-        h_weights = np.where(np.isfinite(h_weights), h_weights, 1.0)
-        # Normalize to avoid scaling issues
-        h_weights = h_weights / (np.mean(h_weights) + np.finfo(float).eps)
-
-    has_two_tri = edge[:, 3] > 0
-    if np.any(has_two_tri):
-        t1_idx = edge[has_two_tri, 2].astype(int)
-        t2_idx = edge[has_two_tri, 3].astype(int)
-
-        tri1 = tria[t1_idx, :]
-        tri2 = tria[t2_idx, :]
-
-        v1_t1 = vert[tri1[:, 0], :]
-        v2_t1 = vert[tri1[:, 1], :]
-        v3_t1 = vert[tri1[:, 2], :]
-        area1 = 0.5 * np.abs(
-            (v2_t1[:, 0] - v1_t1[:, 0]) * (v3_t1[:, 1] - v1_t1[:, 1])
-            - (v3_t1[:, 0] - v1_t1[:, 0]) * (v2_t1[:, 1] - v1_t1[:, 1])
-        )
-
-        v1_t2 = vert[tri2[:, 0], :]
-        v2_t2 = vert[tri2[:, 1], :]
-        v3_t2 = vert[tri2[:, 2], :]
-        area2 = 0.5 * np.abs(
-            (v2_t2[:, 0] - v1_t2[:, 0]) * (v3_t2[:, 1] - v1_t2[:, 1])
-            - (v3_t2[:, 0] - v1_t2[:, 0]) * (v2_t2[:, 1] - v1_t2[:, 1])
-        )
-
-        edge_idx = np.where(has_two_tri)[0]
-        tri1_edges = tria_6col[t1_idx, 3:6]
-        tri2_edges = tria_6col[t2_idx, 3:6]
-
-        tri1_sum_len = np.sum(elen[tri1_edges], axis=1)
-        tri2_sum_len = np.sum(elen[tri2_edges], axis=1)
-        
-        tri1_avg_len = (tri1_sum_len - elen[edge_idx]) / 2.0
-        tri2_avg_len = (tri2_sum_len - elen[edge_idx]) / 2.0
-        
-        tri1_avg_len = np.maximum(tri1_avg_len, np.finfo(float).eps)
-        tri2_avg_len = np.maximum(tri2_avg_len, np.finfo(float).eps)
-
-        area_ratio = np.minimum(area1, area2) / np.maximum(area1, area2 + np.finfo(float).eps)
-        len_ratio = np.minimum(tri1_avg_len, tri2_avg_len) / np.maximum(
-            tri1_avg_len, tri2_avg_len + np.finfo(float).eps
-        )
-        aspect_ratios[has_two_tri] = area_ratio * len_ratio
-        aspect_ratios[has_two_tri] = np.where(
-            np.isfinite(aspect_ratios[has_two_tri]), 
-            aspect_ratios[has_two_tri], 
-            1.0
-        )
-        # Apply mesh-size function weighting
-        aspect_ratios[has_two_tri] = aspect_ratios[has_two_tri] * h_weights[has_two_tri]
-
-    is_external_boundary = np.zeros(nedg, dtype=bool)
-    if part is not None and conn is not None and len(conn) > 0:
-        external_edge_set = set()
-        for p in part:
-            if p is not None and len(p) > 0:
-                part_edges = conn[p, :]
-                part_edges_sorted = np.sort(part_edges, axis=1)
-                for e in part_edges_sorted:
-                    external_edge_set.add(tuple(e))
-        
-        edge_sorted = np.sort(edge[:, 0:2], axis=1)
-        for i in range(nedg):
-            edge_tuple = tuple(edge_sorted[i, :])
-            if edge_tuple in external_edge_set:
-                is_external_boundary[i] = True
-    
-    aspect_ratios[is_external_boundary] = 0.0
-
-    row_indices = np.concatenate([edge[:, 0], edge[:, 1]])
-    col_indices = np.concatenate([edge[:, 1], edge[:, 0]])
-    data = np.concatenate([aspect_ratios, aspect_ratios])
-
-    weight_matrix = csr_matrix((data, (row_indices, col_indices)), shape=(nvrt, nvrt))
-
-    row_sums = np.array(weight_matrix.sum(axis=1)).flatten()
-    row_sums = np.maximum(row_sums, np.finfo(float).eps)
-    inv_row_sums = 1.0 / row_sums
-    weight_matrix = weight_matrix.multiply(inv_row_sums[:, np.newaxis])
-
-    rhs = np.zeros((nvrt, 2))
-
-    return weight_matrix, rhs
-
-
-def compute_smoothing_weights(vert, edge, EMAT, vdeg, hvrt):
-    """
-    Compute smoothing weights based on edge length deviation from target.
-
-    Parameters
-    ----------
-    vert : ndarray of shape (V, 2)
-        Vertex coordinates.
-    edge : ndarray of shape (E, 5)
-        Edge connectivity from tricon.
-    EMAT : scipy.sparse matrix
-        Vertex-edge incidence matrix.
-    vdeg : ndarray of shape (V,)
-        Vertex degrees.
-    hvrt : ndarray of shape (V,)
-        Mesh-size function values at vertices.
-
-    Returns
-    -------
-    weights : ndarray of shape (E,)
-        Smoothing weights for each edge.
-    """
-    evec = vert[edge[:, 1], :] - vert[edge[:, 0], :]
-    elen = np.sqrt(np.sum(evec**2, axis=1))
-
-    hmid = 0.5 * (hvrt[edge[:, 0]] + hvrt[edge[:, 1]])
-    hmid = np.maximum(hmid, np.finfo(float).eps)
-    
-    # Ensure no NaN or inf in calculations
-    hmid = np.where(np.isfinite(hmid), hmid, np.finfo(float).eps)
-
-    scal = elen / hmid
-    scal = np.maximum(scal, np.finfo(float).eps)
-    scal = np.where(np.isfinite(scal), scal, 1.0)
-    
-    weights = 1.0 / scal
-    weights = np.where(np.isfinite(weights), weights, 0.0)
-    weights = weights / (np.sum(weights) + np.finfo(float).eps)
-
-    return weights
-
-
-def project_vertex_on_constraint_line(vertex_idx, new_pos, conn, part, vert, allow_junctions=False):
-    """
-    Project a vertex position onto its constraint line(s) if it's on an internal constrained edge.
-    
-    For vertices at junctions (on multiple constraint lines), projects onto the closest line
-    or the intersection if allow_junctions=True.
-    
-    Parameters
-    ----------
-    vertex_idx : int
-        Index of the vertex.
-    new_pos : ndarray of shape (2,)
-        Proposed new position.
-    conn : ndarray of shape (E_conn, 2)
-        All constrained edges (PSLG).
-    part : list of ndarray
-        List of edge indices in conn that define external boundaries.
-    vert : ndarray of shape (V, 2)
-        Current vertex coordinates.
-    allow_junctions : bool, default = False
-        If True, allow projection for vertices at junctions (on multiple constraint lines).
-        For junctions, projects onto the closest constraint line.
-        If False, only project vertices on exactly one constraint line (not at junctions).
-    
-    Returns
-    -------
-    projected_pos : ndarray of shape (2,)
-        Projected position on the constraint line, or new_pos if not on internal constraint or at junction.
-    """
-    if conn is None or len(conn) == 0 or part is None:
-        return new_pos
-    
-    external_edge_set = set()
-    for p in part:
-        if p is not None and len(p) > 0:
-            part_edges = conn[p, :]
-            part_edges_sorted = np.sort(part_edges, axis=1)
-            for e in part_edges_sorted:
-                external_edge_set.add(tuple(e))
-    
-    conn_sorted = np.sort(conn, axis=1)
-    constraint_lines = []
-    for e in conn_sorted:
-        edge_tuple = tuple(e)
-        if edge_tuple not in external_edge_set:
-            if int(e[0]) == vertex_idx or int(e[1]) == vertex_idx:
-                constraint_lines.append((int(e[0]), int(e[1])))
-    
-    if len(constraint_lines) == 0:
-        return new_pos
-    
-    if not allow_junctions and len(constraint_lines) > 1:
-        return vert[vertex_idx, :]
-    
-    # For junctions with allow_junctions=True, project onto the closest line
-    if len(constraint_lines) > 1:
-        min_dist_sq = np.inf
-        best_projected = new_pos
-        
-        for v1_idx, v2_idx in constraint_lines:
-            v1 = vert[v1_idx, :]
-            v2 = vert[v2_idx, :]
-            
-            line_dir = v2 - v1
-            line_len_sq = np.sum(line_dir**2)
-            
-            if line_len_sq < np.finfo(float).eps:
-                continue
-            
-            to_point = new_pos - v1
-            t = np.dot(to_point, line_dir) / line_len_sq
-            projected = v1 + t * line_dir
-            
-            dist_sq = np.sum((new_pos - projected)**2)
-            if dist_sq < min_dist_sq:
-                min_dist_sq = dist_sq
-                best_projected = projected
-        
-        return best_projected
-    
-    # Single constraint line
-    v1_idx, v2_idx = constraint_lines[0]
-    v1 = vert[v1_idx, :]
-    v2 = vert[v2_idx, :]
-    
-    line_dir = v2 - v1
-    line_len_sq = np.sum(line_dir**2)
-    
-    if line_len_sq < np.finfo(float).eps:
-        return vert[vertex_idx, :]
-    
-    to_point = new_pos - v1
-    t = np.dot(to_point, line_dir) / line_len_sq
-    projected_pos = v1 + t * line_dir
-    
-    return projected_pos
-
-
-def combine_and_solve(
-    vert,
-    edge,
-    EMAT,
-    ortho_weights,
-    ortho_rhs,
-    smooth_weights,
-    ortho_factor,
-    smooth_factor,
-    free_vertices,
-    conn=None,
-    part=None,
-):
-    """
-    Combine orthogonalization and smoothing contributions and solve for new positions.
-
-    Optimized version using vectorized operations for performance.
-
-    Parameters
-    ----------
-    vert : ndarray of shape (V, 2)
-        Current vertex coordinates.
-    edge : ndarray of shape (E, 5)
-        Edge connectivity.
-    EMAT : scipy.sparse matrix
-        Vertex-edge incidence matrix.
-    ortho_weights : scipy.sparse matrix
-        Orthogonalization weight matrix.
-    ortho_rhs : ndarray of shape (V, 2)
-        Orthogonalization right-hand side.
-    smooth_weights : ndarray of shape (E,)
-        Smoothing weights.
-    ortho_factor : float
-        Weight for orthogonalization (0-1).
-    smooth_factor : float
-        Weight for smoothing (0-1).
-    free_vertices : ndarray of shape (V,)
-        Boolean array indicating free vertices.
-    conn : ndarray of shape (E_conn, 2), optional
-        All constrained edges (PSLG). Used for projecting vertices onto constraint lines.
-    part : list of ndarray, optional
-        List of edge indices in conn that define external boundaries.
-
-    Returns
-    -------
-    vnew : ndarray of shape (V, 2)
-        New vertex coordinates.
-    """
-    nvrt = vert.shape[0]
-    nedg = edge.shape[0]
-
-    IMAT = csr_matrix(
-        (np.ones(nedg), (edge[:, 0], np.arange(nedg))), shape=(nvrt, nedg)
-    )
-    JMAT = csr_matrix(
-        (np.ones(nedg), (edge[:, 1], np.arange(nedg))), shape=(nvrt, nedg)
-    )
-    EMAT = IMAT + JMAT
-
-    emid = 0.5 * (vert[edge[:, 0], :] + vert[edge[:, 1], :])
-    weighted_emid = smooth_weights[:, None] * emid
-
-    smooth_contrib = IMAT.dot(weighted_emid) + JMAT.dot(weighted_emid)
-    smooth_sum = EMAT.dot(smooth_weights)
-
-    if hasattr(smooth_contrib, 'toarray'):
-        smooth_contrib = np.asarray(smooth_contrib.toarray())
-    else:
-        smooth_contrib = np.asarray(smooth_contrib)
-    
-    if hasattr(smooth_sum, 'toarray'):
-        smooth_sum = np.asarray(smooth_sum.toarray()).flatten()
-    else:
-        smooth_sum = np.asarray(smooth_sum).flatten()
-
-    smooth_sum_safe = np.maximum(smooth_sum, np.finfo(float).eps)
-    
-    if smooth_contrib.shape[0] != nvrt:
-        if smooth_contrib.size == nvrt * 2:
-            smooth_contrib = smooth_contrib.reshape(nvrt, 2)
-        else:
-            smooth_contrib = smooth_contrib[:nvrt, :]
-    
-    if smooth_sum_safe.shape[0] != nvrt:
-        smooth_sum_safe = smooth_sum_safe[:nvrt]
-    
-    smooth_contrib = smooth_contrib / smooth_sum_safe[:, None]
-    smooth_contrib = np.where(np.isfinite(smooth_contrib), smooth_contrib, 0.0)
-
-    ortho_contrib = np.zeros((nvrt, 2))
-    if ortho_factor > 0:
-        ortho_result = ortho_weights.dot(vert)
-        if hasattr(ortho_result, 'toarray'):
-            ortho_contrib = ortho_result.toarray()
-        else:
-            ortho_contrib = np.asarray(ortho_result)
-        ortho_contrib = np.where(np.isfinite(ortho_contrib), ortho_contrib, 0.0)
-
-    vnew = smooth_factor * smooth_contrib + ortho_factor * ortho_contrib
-    vnew += ortho_factor * ortho_rhs
-    vnew = np.where(np.isfinite(vnew), vnew, vert)
-    vnew[~free_vertices, :] = vert[~free_vertices, :]
-
-    return vnew
-
-
-def evalhfn(vert, edge, EMAT, hfun=None, harg=[]):
-    """
-    Evaluate the mesh spacing function at mesh vertices.
-
-    Parameters
-    ----------
-    vert : ndarray of shape (N, 2)
-        XY coordinates of the mesh vertices.
-    edge : ndarray of shape (E, 2)
-        Array of edge connections.
-    EMAT : scipy.sparse matrix
-        Vertex–edge incidence matrix.
-    hfun : float, callable, or None
-        Mesh-size function or constant spacing value.
-    harg : tuple
-        Additional arguments passed to the mesh-size function `hfun`.
-
-    Returns
-    -------
-    hvrt : ndarray of shape (N,)
-        Mesh-size function values evaluated at the vertices.
-    """
-    # Fast path for scalar hfun
-    if hfun is not None and np.isscalar(hfun):
-        return hfun * np.ones(vert.shape[0], dtype=np.float64)
-    
-    # Compute default (mean edge length) only if needed
-    evec = vert[edge[:, 1], :] - vert[edge[:, 0], :]
-    elen = np.sqrt(np.sum(evec**2, axis=1))
-    elen = np.where(np.isfinite(elen), elen, 0.0)
-    
-    # Use sparse matrix multiplication (more efficient)
-    default_hvrt = np.ravel(EMAT.dot(elen))
-    vdeg_sum = np.ravel(EMAT.sum(axis=1))
-    default_hvrt = np.where(
-        vdeg_sum > np.finfo(float).eps,
-        default_hvrt / np.maximum(vdeg_sum, np.finfo(float).eps),
-        np.inf
-    )
-    default_hvrt = np.where(np.isfinite(default_hvrt), default_hvrt, np.inf)
-
-    if hfun is not None and callable(hfun):
-        try:
-            hvrt = np.asarray(hfun(vert, *harg)).flatten()
-            if hvrt.size != vert.shape[0]:
-                raise ValueError(
-                    "smood:evalhfn - hfun must return one value per vertex, "
-                    f"got size {hvrt.size} for {vert.shape[0]} vertices."
-                )
-            bad = ~np.isfinite(hvrt) | (hvrt <= 0)
-            hvrt = np.where(bad, default_hvrt, hvrt)
-            hvrt = np.where(np.isfinite(hvrt), hvrt, default_hvrt)
-        except Exception:
-            hvrt = default_hvrt.copy()
-    else:
-        hvrt = default_hvrt.copy()
-
-    return hvrt
+    # Ortho ↔ merge (default ``use_backup_transition``) or inline V3 tria loop.
+    return _smood_v3_ortho_merge(vert, conn, tria, tnum, opts)
 
 
 def makeopt_smood(opts=None):
@@ -1217,7 +592,8 @@ def makeopt_smood(opts=None):
 
     # --------------------------- ITER
     if "iter" not in opts:
-        opts["iter"] = 16
+        # Default pipeline: ortho <-> merge 4 outer cycles (matches prior `code.py` opts_smood).
+        opts["iter"] = 4
     else:
         if not isinstance(opts["iter"], (int, float)):
             raise TypeError("smood:incorrectInputClass - Incorrect input class.")
@@ -1253,7 +629,7 @@ def makeopt_smood(opts=None):
 
     # --------------------------- DISP
     if "disp" not in opts:
-        opts["disp"] = 4
+        opts["disp"] = 8
     else:
         if not isinstance(opts["disp"], (int, float)):
             raise TypeError("smood:incorrectInputClass - Incorrect input class.")
@@ -1299,12 +675,56 @@ def makeopt_smood(opts=None):
     
     # --------------------------- ORTHOGONALITY_THRESHOLD
     if "orthogonality_threshold" not in opts:
-        opts["orthogonality_threshold"] = 0.3  # Maximum acceptable |cos(angle)| for internal constrained edges
+        opts["orthogonality_threshold"] = 0.49  # max|cosphi|
     else:
         if not isinstance(opts["orthogonality_threshold"], (int, float)):
             raise TypeError("smood:incorrectInputClass - Incorrect input class.")
         if not (0.0 <= opts["orthogonality_threshold"] <= 1.0):
             raise ValueError("smood:invalidOptionValues - ORTHOGONALITY_THRESHOLD must be in [0, 1].")
+
+    # --------------------------- SMALLLINK_THRESHOLD
+    if "smalllink_threshold" not in opts:
+        opts["smalllink_threshold"] = 0.11
+    else:
+        if not isinstance(opts["smalllink_threshold"], (int, float)):
+            raise TypeError("smood:incorrectInputClass - Incorrect input class.")
+        opts["smalllink_threshold"] = float(opts["smalllink_threshold"])
+
+    # --------------------------- BUFFER_LAYERS
+    if "buffer_layers" not in opts:
+        opts["buffer_layers"] = 2
+    else:
+        if not isinstance(opts["buffer_layers"], (int, float)):
+            raise TypeError("smood:incorrectInputClass - Incorrect input class.")
+        opts["buffer_layers"] = int(opts["buffer_layers"])
+        if opts["buffer_layers"] <= 0:
+            raise ValueError("smood:invalidOptionValues - buffer_layers must be > 0.")
+
+    # --------------------------- ENABLE_EDGE_FLIPS
+    if "enable_edge_flips" not in opts:
+        opts["enable_edge_flips"] = True
+    else:
+        if not isinstance(opts["enable_edge_flips"], bool):
+            raise TypeError("smood:incorrectInputClass - Incorrect input class.")
+
+    # --------------------------- MAX_GLOBAL_ITER / SMOOTH_ITER
+    if "max_global_iter" not in opts:
+        opts["max_global_iter"] = int(opts["inner_iter"]) + 2
+    else:
+        if not isinstance(opts["max_global_iter"], (int, float)):
+            raise TypeError("smood:incorrectInputClass - Incorrect input class.")
+        opts["max_global_iter"] = int(opts["max_global_iter"])
+        if opts["max_global_iter"] <= 0:
+            raise ValueError("smood:invalidOptionValues - max_global_iter must be > 0.")
+
+    if "smooth_iter" not in opts:
+        opts["smooth_iter"] = int(opts["inner_iter"]) * 4
+    else:
+        if not isinstance(opts["smooth_iter"], (int, float)):
+            raise TypeError("smood:incorrectInputClass - Incorrect input class.")
+        opts["smooth_iter"] = int(opts["smooth_iter"])
+        if opts["smooth_iter"] <= 0:
+            raise ValueError("smood:invalidOptionValues - smooth_iter must be > 0.")
     
     # --------------------------- ALLOW_CONSTRAINT_SLIDING_JUNCTIONS (check first)
     if "allow_constraint_sliding_junctions" not in opts:
@@ -1362,5 +782,43 @@ def makeopt_smood(opts=None):
         if opts["smalllink_iter_freq"] <= 0:
             raise ValueError("smood:invalidOptionValues - SMALLLINK_ITER_FREQ must be > 0.")
         opts["smalllink_iter_freq"] = int(opts["smalllink_iter_freq"])
+
+    # --------------------------- USE_BACKUP_TRANSITION (ortho_merge_iterate_tria path)
+    if "use_backup_transition" not in opts:
+        opts["use_backup_transition"] = True
+    else:
+        if not isinstance(opts["use_backup_transition"], bool):
+            raise TypeError("smood:incorrectInputClass - Incorrect input class.")
+
+    # --------------------------- REQUIRE_BOTH_CRITERIA (fan-proxy dual check + recovery)
+    if "require_both_criteria" not in opts:
+        opts["require_both_criteria"] = BACKUP_ORTHO_MERGE_REQUIRE_STRICT_DUAL
+    else:
+        if not isinstance(opts["require_both_criteria"], bool):
+            raise TypeError("smood:incorrectInputClass - require_both_criteria must be bool.")
+
+    if "max_recovery_iterations" not in opts:
+        opts["max_recovery_iterations"] = 25
+    else:
+        if not isinstance(opts["max_recovery_iterations"], (int, float)):
+            raise TypeError("smood:incorrectInputClass - Incorrect input class.")
+        opts["max_recovery_iterations"] = int(opts["max_recovery_iterations"])
+        if opts["max_recovery_iterations"] < 0:
+            raise ValueError("smood:invalidOptionValues - max_recovery_iterations must be >= 0.")
+
+    if "recovery_stagnation_break" not in opts:
+        opts["recovery_stagnation_break"] = 3
+    else:
+        if not isinstance(opts["recovery_stagnation_break"], (int, float)):
+            raise TypeError("smood:incorrectInputClass - Incorrect input class.")
+        opts["recovery_stagnation_break"] = int(opts["recovery_stagnation_break"])
+        if opts["recovery_stagnation_break"] < 0:
+            raise ValueError("smood:invalidOptionValues - recovery_stagnation_break must be >= 0.")
+
+    if "preserve_merged_quads" not in opts:
+        opts["preserve_merged_quads"] = True
+    else:
+        if not isinstance(opts["preserve_merged_quads"], bool):
+            raise TypeError("smood:incorrectInputClass - Incorrect input class.")
 
     return opts
