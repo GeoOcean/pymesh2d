@@ -12,7 +12,7 @@ It reuses the zone-based orthogonalization + small-link handling from
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 
 import numpy as np
 
@@ -134,6 +134,7 @@ def orthogonalize_tria_mesh(
             break
 
         max_cosphi = float(np.nanmax(cosphi_abs[mask]))
+        bad_edges = np.where((mask) & (cosphi_abs > cosphi_threshold))[0]
         n_small, small_edges_arr = mk3.compute_small_links_from_arrays(
             mesh.node_x,
             mesh.node_y,
@@ -144,8 +145,16 @@ def orthogonalize_tria_mesh(
         )
 
         # Optional: edge flips pre-pass (still triangles)
-        if enable_edge_flips and n_small > 0:
-            _ = mk3.try_flip_small_flow_edges_ugrid(mesh, small_edges_arr, removesmalllinkstrsh)
+        # If no small links remain but orthogonality is still bad, also let
+        # problematic edges participate so the mesh can keep improving.
+        if enable_edge_flips:
+            flip_candidates = small_edges_arr if n_small > 0 else bad_edges
+            _ = mk3.try_flip_candidate_edges_ugrid(
+                mesh,
+                flip_candidates,
+                removesmalllinkstrsh,
+                max_cosphi_allowed=(cosphi_threshold if n_small == 0 else None),
+            )
             # After flips, recompute edges & faces because topology changed
             # (face_nodes changed, but edge_nodes/edge_faces are now stale)
             mesh.edge_nodes, mesh.edge_faces = _build_edges_from_tria(mesh.face_nodes[:, :3])

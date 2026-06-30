@@ -283,6 +283,117 @@ def _resample_ring_hfun(ring_coords, hfun, harg=()):
     # Close ring: first point repeated at end
     return np.vstack([node, node[0:1]])
 
+
+def _make_hfun_evaluator(reference_pts, hfun, harg=()):
+    """
+    Build hfun(pts) -> (M,) with NaN filled from the nearest reference vertex.
+    """
+
+    def eval_h_raw(pts):
+        pts = np.atleast_2d(pts)
+        if np.isscalar(hfun) or isinstance(hfun, (int, float, np.number)):
+            return np.full(pts.shape[0], float(hfun))
+        return np.asarray(hfun(pts, *harg)).ravel()[: pts.shape[0]]
+
+    reference_pts = np.asarray(reference_pts, dtype=float)
+    h_verts = eval_h_raw(reference_pts).astype(float)
+    nan_mask = np.isnan(h_verts)
+    if np.any(nan_mask):
+        tree_ref = cKDTree(reference_pts)
+        ok = np.where(~nan_mask)[0]
+        if len(ok) == 0:
+            h_verts[:] = 1.0
+        else:
+            for i in np.where(nan_mask)[0]:
+                _, j = tree_ref.query(reference_pts[i], k=1)
+                j = j if np.isscalar(j) else j[0]
+                if nan_mask[j]:
+                    h_verts[i] = (
+                        np.nanmean(h_verts[~nan_mask])
+                        if np.any(~nan_mask)
+                        else 1.0
+                    )
+                else:
+                    h_verts[i] = h_verts[j]
+    tree_ref = cKDTree(reference_pts)
+
+    def eval_h(pts):
+        pts = np.atleast_2d(pts)
+        h = eval_h_raw(pts).astype(float)
+        nan_pts = np.isnan(h)
+        if np.any(nan_pts):
+            idx_nan = np.where(nan_pts)[0]
+            _, nearest = tree_ref.query(pts[idx_nan], k=1)
+            if np.ndim(nearest) == 0:
+                nearest = np.array([nearest])
+            h[idx_nan] = h_verts[nearest]
+        return h
+
+    return eval_h
+
+
+def _prune_ring_by_hfun(ring_coords, hfun, harg=(), min_fraction=1.0):
+    """
+    Remove ring vertices whose spacing along the contour is below hfun(p).
+
+    A vertex is removed when either adjacent edge length is shorter than
+    ``min_fraction * h(p)`` at that vertex. The pass is repeated until stable.
+    """
+    ring = np.asarray(ring_coords, dtype=float)
+    if len(ring) < 4:
+        return ring
+
+    if np.allclose(ring[0], ring[-1]):
+        pts = ring[:-1].copy()
+    else:
+        pts = ring.copy()
+
+    if len(pts) < 3:
+        return ring
+
+    eval_h = _make_hfun_evaluator(pts, hfun, harg)
+    eps = np.finfo(float).eps
+    max_iterations = max(len(pts) * 2, 1)
+
+    for _ in range(max_iterations):
+        n = len(pts)
+        if n <= 3:
+            break
+
+        to_remove = np.zeros(n, dtype=bool)
+        for i in range(n):
+            prev_i = (i - 1) % n
+            next_i = (i + 1) % n
+            d_prev = np.linalg.norm(pts[i] - pts[prev_i])
+            d_next = np.linalg.norm(pts[next_i] - pts[i])
+            h_req = max(min_fraction * float(eval_h(pts[i : i + 1])[0]), eps)
+            if d_prev < h_req or d_next < h_req:
+                to_remove[i] = True
+
+        if not np.any(to_remove):
+            break
+
+        if np.count_nonzero(~to_remove) < 3:
+            scores = []
+            for i in range(n):
+                prev_i = (i - 1) % n
+                next_i = (i + 1) % n
+                d_prev = np.linalg.norm(pts[i] - pts[prev_i])
+                d_next = np.linalg.norm(pts[next_i] - pts[i])
+                h_req = max(min_fraction * float(eval_h(pts[i : i + 1])[0]), eps)
+                scores.append((i, min(d_prev, d_next) / h_req))
+            worst = min(scores, key=lambda item: item[1])[0]
+            to_remove = np.zeros(n, dtype=bool)
+            to_remove[worst] = True
+
+        pts = pts[~to_remove]
+
+    if len(pts) < 3:
+        return ring
+
+    return np.vstack([pts, pts[0:1]])
+
+
 def _signed_area(ring):
     """Aire signée (positive = CCW). ring: (N, 2), fermé (dernier = premier)."""
     r = np.asarray(ring)
@@ -306,7 +417,13 @@ def _ensure_ring_orientation(ring_coords, want_ccw):
     return np.vstack([r, r[0:1]])
 
 
-def resample_polygon_hfun(polygon, hfun, harg=()):
+def resample_polygon_hfun(
+    polygon,
+    hfun,
+    harg=(),
+    verify_spacing=True,
+    verify_min_fraction=1.0,
+):
     """
     Resample a closed polygon so that consecutive vertices are spaced by
     approximately h(p) along the contour, where h is given by the mesh-size
@@ -325,6 +442,12 @@ def resample_polygon_hfun(polygon, hfun, harg=()):
         If float, a constant spacing is used.
     harg : tuple, optional
         Extra arguments passed to hfun when callable.
+    verify_spacing : bool, optional
+        If True (default), run a final pass on each resampled ring and remove
+        vertices whose adjacent edge length is shorter than ``h(p)``.
+    verify_min_fraction : float, optional
+        Required minimum edge length as a fraction of ``h(p)`` during the final
+        verification pass. Default is 1.0 (strictly enforce hfun spacing).
 
     Returns
     -------
@@ -370,6 +493,10 @@ def resample_polygon_hfun(polygon, hfun, harg=()):
     
     # Resample exterior
     exterior_ring = _resample_ring_hfun(polygon, hfun, harg)
+    if verify_spacing:
+        exterior_ring = _prune_ring_by_hfun(
+            exterior_ring, hfun, harg, min_fraction=verify_min_fraction
+        )
     exterior_ring = _ensure_ring_orientation(exterior_ring, want_ccw=True)
     
     # Ensure exterior has at least 4 points (required for LinearRing)
@@ -382,6 +509,13 @@ def resample_polygon_hfun(polygon, hfun, harg=()):
     if has_interiors:
         for interior_coords in interiors:
             resampled_interior = _resample_ring_hfun(interior_coords, hfun, harg)
+            if verify_spacing:
+                resampled_interior = _prune_ring_by_hfun(
+                    resampled_interior,
+                    hfun,
+                    harg,
+                    min_fraction=verify_min_fraction,
+                )
             # Filter out invalid interiors (need at least 4 points for LinearRing)
             if len(resampled_interior) >= 4:
                 resampled_interiors.append(resampled_interior)

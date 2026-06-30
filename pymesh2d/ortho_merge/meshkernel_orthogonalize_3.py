@@ -94,6 +94,38 @@ def _load_ugrid(netcdf_path: str) -> Tuple:
     return node_x, node_y, face_nodes, edge_nodes, edge_faces, face_x_file, face_y_file
 
 
+def _build_edges_from_tria(tria: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Build (edge_nodes, edge_faces) from 0-based triangles."""
+    tria = np.asarray(tria, dtype=np.int64)
+    if tria.ndim != 2 or tria.shape[1] != 3:
+        raise ValueError("tria must be an array of shape (T,3) with 0-based indices")
+
+    edge_map: Dict[Tuple[int, int], int] = {}
+    edge_nodes: List[Tuple[int, int]] = []
+    edge_faces: List[List[int]] = []
+
+    def _add_edge(a: int, b: int, f: int) -> None:
+        i, j = (a, b) if a < b else (b, a)
+        key = (i, j)
+        if key in edge_map:
+            eidx = edge_map[key]
+            if edge_faces[eidx][1] == -1:
+                edge_faces[eidx][1] = f
+        else:
+            eidx = len(edge_nodes)
+            edge_map[key] = eidx
+            edge_nodes.append((i, j))
+            edge_faces.append([f, -1])
+
+    for f in range(tria.shape[0]):
+        a, b, c = int(tria[f, 0]), int(tria[f, 1]), int(tria[f, 2])
+        _add_edge(a, b, f)
+        _add_edge(b, c, f)
+        _add_edge(c, a, f)
+
+    return np.asarray(edge_nodes, dtype=np.int64), np.asarray(edge_faces, dtype=np.int64)
+
+
 def _getdx_vec(
     x1: np.ndarray, y1: np.ndarray, x2: np.ndarray, y2: np.ndarray, jsferic: int = 1
 ) -> np.ndarray:
@@ -611,6 +643,53 @@ def try_flip_small_flow_edges_ugrid(
         )
         if small_edges_arr.size == 0:
             break
+    return total_flipped
+
+
+def try_flip_candidate_edges_ugrid(
+    mesh: "MeshData",
+    candidate_edges: np.ndarray,
+    removesmalllinkstrsh: float,
+    max_flip_iter: int = 20,
+    max_cosphi_allowed: Optional[float] = None,
+) -> int:
+    """
+    Try to flip a set of candidate edges.
+
+    The caller is responsible for the global quality check after the batch.
+    This keeps the helper cheap: it only verifies geometric validity of each
+    flip and updates connectivity once per accepted flip.
+    """
+    candidate_edges = np.asarray(candidate_edges, dtype=np.int64).ravel()
+    if candidate_edges.size == 0:
+        return 0
+
+    total_flipped = 0
+    for _ in range(max_flip_iter):
+        flipped_any = False
+        for ei in range(candidate_edges.size):
+            e = int(candidate_edges[ei])
+            if not try_flip_small_flow_edge_ugrid(mesh, e):
+                continue
+
+            mesh.edge_nodes, mesh.edge_faces = _build_edges_from_tria(mesh.face_nodes[:, :3])
+
+            total_flipped += 1
+            flipped_any = True
+            break
+
+        if not flipped_any:
+            break
+
+        _, candidate_edges = compute_small_links_from_arrays(
+            mesh.node_x,
+            mesh.node_y,
+            mesh.face_nodes,
+            mesh.edge_nodes,
+            mesh.edge_faces,
+            removesmalllinkstrsh=removesmalllinkstrsh,
+        )
+
     return total_flipped
 
 

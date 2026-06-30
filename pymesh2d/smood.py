@@ -142,8 +142,7 @@ def _smood_ortho_merge_backup_pipeline(vert, conn, tria, tnum, opts):
     tria_in = np.asarray(tria, dtype=np.int64)
     tnum_in = np.asarray(tnum, dtype=np.int64).reshape(-1)
 
-    outer_iter_max = int(opts.get("iter", 4))
-    outer_iter_max = max(1, min(outer_iter_max, 4))
+    outer_iter_max = max(1, int(opts.get("iter", 4)))
 
     smalllink_trsh = float(
         opts.get("smalllink_threshold", BACKUP_ORTHO_MERGE_SMALLLINK_THRESHOLD)
@@ -206,11 +205,16 @@ def _smood_ortho_merge_backup_pipeline(vert, conn, tria, tnum, opts):
             max_global_iter=int(opts.get("max_global_iter", int(opts.get("inner_iter", 4)) + 2)),
             smooth_iter=int(opts.get("smooth_iter", int(opts.get("inner_iter", 4)) * 4)),
             enable_edge_flips=bool(opts.get("enable_edge_flips", True)),
-            stop_if_no_merge=True,
+            stop_if_no_merge=bool(opts.get("stop_if_no_merge", False)),
             ortho_disable_smalllink_logic=True,
             require_both_criteria=require_strict,
-            max_recovery_iterations=int(opts.get("max_recovery_iterations", 25)),
-            recovery_stagnation_break=int(opts.get("recovery_stagnation_break", 3)),
+            max_recovery_iterations=int(opts.get("max_recovery_iterations", 100)),
+            recovery_stagnation_break=int(opts.get("recovery_stagnation_break", 10)),
+            outer_stagnation_break=int(opts.get("outer_stagnation_break", 2)),
+            adaptive_recovery=bool(opts.get("adaptive_recovery", True)),
+            recovery_buffer_growth=int(opts.get("recovery_buffer_growth", 1)),
+            recovery_smooth_iter_growth=int(opts.get("recovery_smooth_iter_growth", 6)),
+            recovery_global_iter_growth=int(opts.get("recovery_global_iter_growth", 1)),
             on_state=_on_state if do_log else None,
         )
     finally:
@@ -294,21 +298,89 @@ def _smood_ortho_merge_backup_pipeline(vert, conn, tria, tnum, opts):
     # Quads from merge_circumcenters: split on diagonal (v1,v2), not fan-from-a.
     new_tris = []
     new_parts = []
+    tri_origin_face_id_export: list = []
+    quad_face_mask_export = np.zeros(face_nodes_arr.shape[0], dtype=bool)
     vert_xy = np.asarray(vert_out, dtype=np.float64)
-    for row in face_nodes_arr:
+    for fid, row in enumerate(face_nodes_arr):
         nodes = row[row >= 0]
         if nodes.size < 3:
             continue
+        quad_face_mask_export[fid] = nodes.size == 4
         for t in triangulate_mixed_face_row_to_tris(vert_xy, nodes):
             new_tris.append(t)
             new_parts.append(1)
+            tri_origin_face_id_export.append(int(fid))
 
     tria_out = np.asarray(new_tris, dtype=np.int64)
     if tria_out.size == 0:
         tria_out = tria_in.copy()
         tnum_out = np.asarray(tnum, dtype=np.int64)
+        tri_origin_face_id_for_dual = np.arange(tria_out.shape[0], dtype=np.int64)
+        quad_face_mask_for_dual = np.zeros(tria_out.shape[0], dtype=bool)
     else:
         tnum_out = np.asarray(new_parts, dtype=np.int64).reshape(-1, 1)
+        tri_origin_face_id_for_dual = np.asarray(tri_origin_face_id_export, dtype=np.int64)
+        quad_face_mask_for_dual = quad_face_mask_export
+
+    # Optional post-pass: enforce dual criteria on the final triangle output.
+    # This addresses cases where outer-cycle stats are good but exported triangle
+    # connectivity still shows degraded max|cos(phi)|.
+    enforce_output_dual = bool(
+        opts.get("enforce_output_dual_criteria", bool(require_strict))
+    )
+    if enforce_output_dual and tria_out.size > 0:
+        from .ortho_merge import meshkernel_orthogonalize_3 as mk3
+        from .ortho_merge.meshkernel_orthogonalize_3_tria import orthogonalize_tria_mesh
+        from .ortho_merge.ortho_merge_iter import dual_criteria_on_fan_mesh
+
+        post_iter = int(opts.get("post_output_ortho_iter", 3))
+        post_iter = max(1, post_iter)
+        cosphi_threshold = float(opts.get("orthogonality_threshold", 0.49))
+        removesmalllinkstrsh = float(
+            opts.get("smalllink_threshold", BACKUP_ORTHO_MERGE_SMALLLINK_THRESHOLD)
+        )
+
+        # Same compact logs as the main ortho+merge loop: each orthogonalize pass
+        # visits every zone once — without this, [ZONE] lines look like a hang.
+        old_verbose = getattr(mk3, "VERBOSE_ZONE_LOGS", True)
+        mk3.VERBOSE_ZONE_LOGS = False
+        try:
+            # A few short recovery cycles are enough in practice and avoid over-smoothing.
+            for _ in range(post_iter):
+                _, max_c_now, n_small_now = dual_criteria_on_fan_mesh(
+                    np.asarray(vert_out, dtype=np.float64),
+                    tria_out,
+                    tri_origin_face_id_for_dual,
+                    quad_face_mask_for_dual,
+                    cosphi_threshold=cosphi_threshold,
+                    removesmalllinkstrsh=removesmalllinkstrsh,
+                )
+                if (float(max_c_now) <= cosphi_threshold + 1.0e-9) and (
+                    int(n_small_now) == 0
+                ):
+                    break
+
+                ortho_res = orthogonalize_tria_mesh(
+                    np.asarray(vert_out, dtype=np.float64),
+                    np.asarray(tria_out, dtype=np.int64),
+                    cosphi_threshold=cosphi_threshold,
+                    removesmalllinkstrsh=removesmalllinkstrsh,
+                    buffer_layers=int(opts.get("buffer_layers", 2)),
+                    max_global_iter=int(
+                        opts.get(
+                            "max_global_iter",
+                            int(opts.get("inner_iter", 4)) + 2,
+                        )
+                    ),
+                    smooth_iter=int(
+                        opts.get("smooth_iter", int(opts.get("inner_iter", 4)) * 4)
+                    ),
+                    enable_edge_flips=bool(opts.get("enable_edge_flips", True)),
+                )
+                vert_out = ortho_res.vert
+                tria_out = ortho_res.tria
+        finally:
+            mk3.VERBOSE_ZONE_LOGS = old_verbose
 
     return np.asarray(vert_out, dtype=np.float64), conn, tria_out, tnum_out
 
@@ -338,8 +410,8 @@ def _smood_v3_ortho_merge(vert, conn, tria, tnum, opts):
     cosphi_threshold = max(cosphi_threshold, 0.49)
 
     outer_iter_max = int(opts.get("iter", 4))
-    # Hard cap to keep runtime bounded.
-    outer_iter_max = max(1, min(outer_iter_max, 4))
+    # Respect the caller's outer-iteration budget.
+    outer_iter_max = max(1, outer_iter_max)
 
     inner_iter = int(opts.get("inner_iter", 4))
     buffer_layers = int(opts.get("buffer_layers", 2))
@@ -491,6 +563,11 @@ def smood(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg
           If True, after the main ortho-merge cycles, require dual criteria on the merge-consistent
           triangle proxy and run recovery (may raise ``RuntimeError``). **False** matches the backup
           snapshot (no global check). *Not* a threshold — use ``smalllink_threshold`` for 0.11.
+        - 'enforce_output_dual_criteria' : bool, default = require_both_criteria
+          After building final triangle connectivity, run a short strict recovery so output triangles
+          satisfy the dual criteria more reliably.
+        - 'post_output_ortho_iter' : int, default = 3
+          Maximum short post-recovery cycles used by ``enforce_output_dual_criteria``.
         - 'max_recovery_iterations' : int, default = 25
           Extra ortho+merge cycles when ``require_both_criteria`` is True and checks fail.
         - 'recovery_stagnation_break' : int, default = 3
@@ -790,6 +867,13 @@ def makeopt_smood(opts=None):
         if not isinstance(opts["use_backup_transition"], bool):
             raise TypeError("smood:incorrectInputClass - Incorrect input class.")
 
+    # --------------------------- STOP_IF_NO_MERGE
+    if "stop_if_no_merge" not in opts:
+        opts["stop_if_no_merge"] = False
+    else:
+        if not isinstance(opts["stop_if_no_merge"], bool):
+            raise TypeError("smood:incorrectInputClass - Incorrect input class.")
+
     # --------------------------- REQUIRE_BOTH_CRITERIA (fan-proxy dual check + recovery)
     if "require_both_criteria" not in opts:
         opts["require_both_criteria"] = BACKUP_ORTHO_MERGE_REQUIRE_STRICT_DUAL
@@ -798,7 +882,7 @@ def makeopt_smood(opts=None):
             raise TypeError("smood:incorrectInputClass - require_both_criteria must be bool.")
 
     if "max_recovery_iterations" not in opts:
-        opts["max_recovery_iterations"] = 25
+        opts["max_recovery_iterations"] = 100
     else:
         if not isinstance(opts["max_recovery_iterations"], (int, float)):
             raise TypeError("smood:incorrectInputClass - Incorrect input class.")
@@ -807,7 +891,7 @@ def makeopt_smood(opts=None):
             raise ValueError("smood:invalidOptionValues - max_recovery_iterations must be >= 0.")
 
     if "recovery_stagnation_break" not in opts:
-        opts["recovery_stagnation_break"] = 3
+        opts["recovery_stagnation_break"] = 10
     else:
         if not isinstance(opts["recovery_stagnation_break"], (int, float)):
             raise TypeError("smood:incorrectInputClass - Incorrect input class.")
@@ -815,8 +899,50 @@ def makeopt_smood(opts=None):
         if opts["recovery_stagnation_break"] < 0:
             raise ValueError("smood:invalidOptionValues - recovery_stagnation_break must be >= 0.")
 
+    if "outer_stagnation_break" not in opts:
+        opts["outer_stagnation_break"] = 2
+    else:
+        if not isinstance(opts["outer_stagnation_break"], (int, float)):
+            raise TypeError("smood:incorrectInputClass - Incorrect input class.")
+        opts["outer_stagnation_break"] = int(opts["outer_stagnation_break"])
+        if opts["outer_stagnation_break"] < 0:
+            raise ValueError("smood:invalidOptionValues - outer_stagnation_break must be >= 0.")
+
+    if "adaptive_recovery" not in opts:
+        opts["adaptive_recovery"] = True
+    else:
+        if not isinstance(opts["adaptive_recovery"], bool):
+            raise TypeError("smood:incorrectInputClass - Incorrect input class.")
+
+    if "recovery_buffer_growth" not in opts:
+        opts["recovery_buffer_growth"] = 1
+    else:
+        if not isinstance(opts["recovery_buffer_growth"], (int, float)):
+            raise TypeError("smood:incorrectInputClass - Incorrect input class.")
+        opts["recovery_buffer_growth"] = int(opts["recovery_buffer_growth"])
+        if opts["recovery_buffer_growth"] < 0:
+            raise ValueError("smood:invalidOptionValues - recovery_buffer_growth must be >= 0.")
+
+    if "recovery_smooth_iter_growth" not in opts:
+        opts["recovery_smooth_iter_growth"] = 6
+    else:
+        if not isinstance(opts["recovery_smooth_iter_growth"], (int, float)):
+            raise TypeError("smood:incorrectInputClass - Incorrect input class.")
+        opts["recovery_smooth_iter_growth"] = int(opts["recovery_smooth_iter_growth"])
+        if opts["recovery_smooth_iter_growth"] < 0:
+            raise ValueError("smood:invalidOptionValues - recovery_smooth_iter_growth must be >= 0.")
+
+    if "recovery_global_iter_growth" not in opts:
+        opts["recovery_global_iter_growth"] = 1
+    else:
+        if not isinstance(opts["recovery_global_iter_growth"], (int, float)):
+            raise TypeError("smood:incorrectInputClass - Incorrect input class.")
+        opts["recovery_global_iter_growth"] = int(opts["recovery_global_iter_growth"])
+        if opts["recovery_global_iter_growth"] < 0:
+            raise ValueError("smood:invalidOptionValues - recovery_global_iter_growth must be >= 0.")
+
     if "preserve_merged_quads" not in opts:
-        opts["preserve_merged_quads"] = True
+        opts["preserve_merged_quads"] = False
     else:
         if not isinstance(opts["preserve_merged_quads"], bool):
             raise TypeError("smood:incorrectInputClass - Incorrect input class.")
