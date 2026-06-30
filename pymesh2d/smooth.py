@@ -374,7 +374,6 @@ def smooth(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, har
         nmov = np.count_nonzero(move)
 
         ntri = tria.shape[0]
-
         if iter % opts["disp"] == 0:
             print(f"{iter:11d} {nmov:18d} {ntri:18d}")
 
