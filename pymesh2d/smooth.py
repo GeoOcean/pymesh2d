@@ -1,5 +1,4 @@
 import time
-import warnings
 
 import numpy as np
 from scipy.sparse import csr_matrix
@@ -8,8 +7,6 @@ from .mesh_cost.triscr import triscr
 from .mesh_util.deltri import deltri
 from .mesh_util.setset import setset
 from .mesh_util.tricon import tricon
-
-warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 
 def smooth(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg=[]):

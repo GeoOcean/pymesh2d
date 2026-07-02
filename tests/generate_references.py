@@ -11,7 +11,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 from pymesh2d.hfun_util.lfshfn import lfshfn
 from pymesh2d.hfun_util.trihfn import trihfn
-from pymesh2d.initmsh import initmsh
 from pymesh2d.mesh_util.idxtri import idxtri
 from pymesh2d.mesh_util.tridiv import tridiv
 from pymesh2d.refine import refine
@@ -267,8 +266,7 @@ def run_demo10():
 def main():
     """Generate all reference files."""
     print("Generating reference data files...")
-    initmsh()
-    
+
     demos = [
         (0, run_demo0), (1, run_demo1), (2, run_demo2), (3, run_demo3),
         (4, run_demo4), (5, run_demo5), (6, run_demo6), (7, run_demo7),

@@ -6,7 +6,6 @@ import numpy as np
 
 from pymesh2d.hfun_util.lfshfn import lfshfn
 from pymesh2d.hfun_util.trihfn import trihfn
-from pymesh2d.initmsh import initmsh
 from pymesh2d.mesh_util.idxtri import idxtri
 from pymesh2d.mesh_util.tridiv import tridiv
 from pymesh2d.refine import refine
@@ -63,8 +62,6 @@ def tridemo(demo):
     Email: d.engwirda@gmail.com
     Last updated: 09/07/2018
     """
-
-    initmsh()
 
     if demo == 0:
         demo0()
@@ -802,7 +799,7 @@ def demo10():
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python -m examples.tridemo <demo_number>")
+        print("Usage: python -m pymesh2d.tridemo <demo_number>")
         sys.exit(1)
 
     try:

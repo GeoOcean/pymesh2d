@@ -20,7 +20,7 @@ Algorithms implemented in `pymesh2D` are "probably-good" - ensuring convergence,
     ├── pymesh2d              -- core pymesh2D library functions. See refine, smooth, tridemo etc.
     ├── pymesh2d/aabb_tree    -- support for fast spatial indexing, via tree-based data-structures.
     ├── pymesh2d/geom_util    -- geometry processing, repair, etc.
-    ├── pymesh2d/geomesh_util -- mesh gestion, export interpolation, etc.
+    ├── pymesh2d/geomesh_util -- mesh management, export interpolation, etc.
     ├── pymesh2d/hfun_util    -- mesh-spacing definitions, limiters, etc.
     ├── pymesh2d/hjac_util    -- solver for Hamilton-Jacobi eqn's.
     ├── pymesh2d/mesh_ball    -- circumscribing balls, orthogonal balls etc.

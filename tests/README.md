@@ -16,7 +16,7 @@ This directory contains unit tests for the pymesh2d package, based on the `tride
 First, generate the reference data files from the current implementation:
 
 ```bash
-cd /home/etienne/pymesh2d_1/pymesh2d
+# from the repository root
 python tests/generate_references.py
 ```
 

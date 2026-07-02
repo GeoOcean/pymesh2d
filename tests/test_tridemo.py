@@ -12,7 +12,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 from pymesh2d.hfun_util.lfshfn import lfshfn
 from pymesh2d.hfun_util.trihfn import trihfn
-from pymesh2d.initmsh import initmsh
 from pymesh2d.mesh_util.idxtri import idxtri
 from pymesh2d.mesh_util.tridiv import tridiv
 from pymesh2d.refine import refine
@@ -35,11 +34,6 @@ def hfun8(test):
 
 class TestTridemo(unittest.TestCase):
     """Test cases for tridemo functions."""
-    
-    @classmethod
-    def setUpClass(cls):
-        """Initialize mesh system once for all tests."""
-        initmsh()
     
     def test_demo0_1(self):
         """Test DEMO0 first output (basic refine)."""

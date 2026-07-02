@@ -1,13 +1,9 @@
-import warnings
-
 import pyproj
 
 import numpy as np
 from .geomesh_util.grd_util import triangulate_mixed_face_row_to_tris
 from .mesh_util.tricon import tricon
 from .geom_util.proj_util import get_local_utm_crs, reproject_node
-
-warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 BACKUP_ORTHO_MERGE_SMALLLINK_THRESHOLD: float = 0.11
 BACKUP_ORTHO_MERGE_REQUIRE_STRICT_DUAL: bool = False
