@@ -186,35 +186,30 @@ def _smood_ortho_merge_backup_pipeline(vert, conn, tria, tnum, opts):
             print_stats([s], print_header=False)
 
     # Keep output compact: disable verbose per-zone logs inside meshkernel orthogonalization.
-    from .ortho_merge import meshkernel_orthogonalize_3 as mk3
-    old_verbose = getattr(mk3, "VERBOSE_ZONE_LOGS", True)
-    mk3.VERBOSE_ZONE_LOGS = False
-    try:
-        vert_out, face_nodes_0b, stats = ortho_merge_iterate_tria(
-            vert_in,
-            tria_in,
-            node_z=None,
-            outer_iter_max=outer_iter_max,
-            cosphi_threshold=float(opts.get("orthogonality_threshold", 0.49)),
-            removesmalllinkstrsh=smalllink_trsh,
-            buffer_layers=int(opts.get("buffer_layers", 2)),
-            max_global_iter=int(opts.get("max_global_iter", int(opts.get("inner_iter", 4)) + 2)),
-            smooth_iter=int(opts.get("smooth_iter", int(opts.get("inner_iter", 4)) * 4)),
-            enable_edge_flips=bool(opts.get("enable_edge_flips", True)),
-            stop_if_no_merge=bool(opts.get("stop_if_no_merge", False)),
-            ortho_disable_smalllink_logic=True,
-            require_both_criteria=require_strict,
-            max_recovery_iterations=int(opts.get("max_recovery_iterations", 100)),
-            recovery_stagnation_break=int(opts.get("recovery_stagnation_break", 10)),
-            outer_stagnation_break=int(opts.get("outer_stagnation_break", 2)),
-            adaptive_recovery=bool(opts.get("adaptive_recovery", True)),
-            recovery_buffer_growth=int(opts.get("recovery_buffer_growth", 1)),
-            recovery_smooth_iter_growth=int(opts.get("recovery_smooth_iter_growth", 6)),
-            recovery_global_iter_growth=int(opts.get("recovery_global_iter_growth", 1)),
-            on_state=_on_state if do_log else None,
-        )
-    finally:
-        mk3.VERBOSE_ZONE_LOGS = old_verbose
+    vert_out, face_nodes_0b, stats = ortho_merge_iterate_tria(
+        vert_in,
+        tria_in,
+        node_z=None,
+        outer_iter_max=outer_iter_max,
+        cosphi_threshold=float(opts.get("orthogonality_threshold", 0.49)),
+        removesmalllinkstrsh=smalllink_trsh,
+        buffer_layers=int(opts.get("buffer_layers", 2)),
+        max_global_iter=int(opts.get("max_global_iter", int(opts.get("inner_iter", 4)) + 2)),
+        smooth_iter=int(opts.get("smooth_iter", int(opts.get("inner_iter", 4)) * 4)),
+        enable_edge_flips=bool(opts.get("enable_edge_flips", True)),
+        stop_if_no_merge=bool(opts.get("stop_if_no_merge", False)),
+        ortho_disable_smalllink_logic=True,
+        require_both_criteria=require_strict,
+        max_recovery_iterations=int(opts.get("max_recovery_iterations", 100)),
+        recovery_stagnation_break=int(opts.get("recovery_stagnation_break", 10)),
+        outer_stagnation_break=int(opts.get("outer_stagnation_break", 2)),
+        adaptive_recovery=bool(opts.get("adaptive_recovery", True)),
+        recovery_buffer_growth=int(opts.get("recovery_buffer_growth", 1)),
+        recovery_smooth_iter_growth=int(opts.get("recovery_smooth_iter_growth", 6)),
+        recovery_global_iter_growth=int(opts.get("recovery_global_iter_growth", 1)),
+        on_state=_on_state if do_log else None,
+        verbose=False,
+    )
 
     # Final snapshot (triangle proxy built from mixed faces).
     if do_log:
@@ -325,7 +320,6 @@ def _smood_ortho_merge_backup_pipeline(vert, conn, tria, tnum, opts):
         opts.get("enforce_output_dual_criteria", bool(require_strict))
     )
     if enforce_output_dual and tria_out.size > 0:
-        from .ortho_merge import meshkernel_orthogonalize_3 as mk3
         from .ortho_merge.meshkernel_orthogonalize_3_tria import orthogonalize_tria_mesh
         from .ortho_merge.ortho_merge_iter import dual_criteria_on_fan_mesh
 
@@ -336,47 +330,43 @@ def _smood_ortho_merge_backup_pipeline(vert, conn, tria, tnum, opts):
             opts.get("smalllink_threshold", BACKUP_ORTHO_MERGE_SMALLLINK_THRESHOLD)
         )
 
-        # Same compact logs as the main ortho+merge loop: each orthogonalize pass
-        # visits every zone once — without this, [ZONE] lines look like a hang.
-        old_verbose = getattr(mk3, "VERBOSE_ZONE_LOGS", True)
-        mk3.VERBOSE_ZONE_LOGS = False
-        try:
-            # A few short recovery cycles are enough in practice and avoid over-smoothing.
-            for _ in range(post_iter):
-                _, max_c_now, n_small_now = dual_criteria_on_fan_mesh(
-                    np.asarray(vert_out, dtype=np.float64),
-                    tria_out,
-                    tri_origin_face_id_for_dual,
-                    quad_face_mask_for_dual,
-                    cosphi_threshold=cosphi_threshold,
-                    removesmalllinkstrsh=removesmalllinkstrsh,
-                )
-                if (float(max_c_now) <= cosphi_threshold + 1.0e-9) and (
-                    int(n_small_now) == 0
-                ):
-                    break
+        # A few short recovery cycles are enough in practice and avoid over-smoothing.
+        for _ in range(post_iter):
+            _, max_c_now, n_small_now = dual_criteria_on_fan_mesh(
+                np.asarray(vert_out, dtype=np.float64),
+                tria_out,
+                tri_origin_face_id_for_dual,
+                quad_face_mask_for_dual,
+                cosphi_threshold=cosphi_threshold,
+                removesmalllinkstrsh=removesmalllinkstrsh,
+            )
+            if (float(max_c_now) <= cosphi_threshold + 1.0e-9) and (
+                int(n_small_now) == 0
+            ):
+                break
 
-                ortho_res = orthogonalize_tria_mesh(
-                    np.asarray(vert_out, dtype=np.float64),
-                    np.asarray(tria_out, dtype=np.int64),
-                    cosphi_threshold=cosphi_threshold,
-                    removesmalllinkstrsh=removesmalllinkstrsh,
-                    buffer_layers=int(opts.get("buffer_layers", 2)),
-                    max_global_iter=int(
-                        opts.get(
-                            "max_global_iter",
-                            int(opts.get("inner_iter", 4)) + 2,
-                        )
-                    ),
-                    smooth_iter=int(
-                        opts.get("smooth_iter", int(opts.get("inner_iter", 4)) * 4)
-                    ),
-                    enable_edge_flips=bool(opts.get("enable_edge_flips", True)),
-                )
-                vert_out = ortho_res.vert
-                tria_out = ortho_res.tria
-        finally:
-            mk3.VERBOSE_ZONE_LOGS = old_verbose
+            # Same compact logs as the main ortho+merge loop: each orthogonalize pass
+            # visits every zone once — without this, [ZONE] lines look like a hang.
+            ortho_res = orthogonalize_tria_mesh(
+                np.asarray(vert_out, dtype=np.float64),
+                np.asarray(tria_out, dtype=np.int64),
+                cosphi_threshold=cosphi_threshold,
+                removesmalllinkstrsh=removesmalllinkstrsh,
+                buffer_layers=int(opts.get("buffer_layers", 2)),
+                max_global_iter=int(
+                    opts.get(
+                        "max_global_iter",
+                        int(opts.get("inner_iter", 4)) + 2,
+                    )
+                ),
+                smooth_iter=int(
+                    opts.get("smooth_iter", int(opts.get("inner_iter", 4)) * 4)
+                ),
+                enable_edge_flips=bool(opts.get("enable_edge_flips", True)),
+                verbose=False,
+            )
+            vert_out = ortho_res.vert
+            tria_out = ortho_res.tria
 
     return np.asarray(vert_out, dtype=np.float64), conn, tria_out, tnum_out
 

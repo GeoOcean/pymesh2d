@@ -227,6 +227,7 @@ def ortho_merge_iterate_dataset(
     recovery_smooth_iter_growth: int = 6,
     recovery_global_iter_growth: int = 1,
     on_state: Optional[Callable[[OrthoMergeStats], None]] = None,
+    verbose: bool = True,
 ) -> tuple:
     """
     Iteratively apply (**orthogonalize → merge_circumcenters**) on a UGRID dataset.
@@ -317,6 +318,7 @@ def ortho_merge_iterate_dataset(
             max_global_iter=mgi,
             smooth_iter=si,
             enable_edge_flips=enable_edge_flips,
+            verbose=verbose,
         )
 
         NODE = np.column_stack([ortho_res.vert[:, 0], ortho_res.vert[:, 1], node_z])
@@ -526,6 +528,7 @@ def ortho_merge_iterate_tria(
     recovery_smooth_iter_growth: int = 6,
     recovery_global_iter_growth: int = 1,
     on_state: Optional[Callable[[OrthoMergeStats], None]] = None,
+    verbose: bool = True,
 ) -> tuple:
     """
     Convenience wrapper that starts from a pure triangle mesh (vert, tria).
@@ -589,6 +592,7 @@ def ortho_merge_iterate_tria(
         recovery_smooth_iter_growth=recovery_smooth_iter_growth,
         recovery_global_iter_growth=recovery_global_iter_growth,
         on_state=on_state,
+        verbose=verbose,
     )
 
     vert_out = np.column_stack(

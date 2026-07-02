@@ -12,12 +12,13 @@ It reuses the zone-based orthogonalization + small-link handling from
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Set, Tuple
+from typing import List, Set
 
 import numpy as np
 
 # Reuse the battle-tested numerics/logic from the sibling module in this package
 from . import meshkernel_orthogonalize_3 as mk3
+from .geometry import build_edges_from_tria as _build_edges_from_tria
 
 
 @dataclass
@@ -27,51 +28,6 @@ class TriaOrthoResult:
     max_cosphi: float
     n_small_flow_links: int
     n_zones_orthogonalized: int
-
-
-def _build_edges_from_tria(tria: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Build (edge_nodes, edge_faces) from triangles.
-
-    Parameters
-    ----------
-    tria : (T,3) int array, 0-based.
-
-    Returns
-    -------
-    edge_nodes : (E,2) int64
-    edge_faces : (E,2) int64 (right face = -1 for boundary)
-    """
-    tria = np.asarray(tria, dtype=np.int64)
-    if tria.ndim != 2 or tria.shape[1] != 3:
-        raise ValueError("tria must be an array of shape (T,3) with 0-based indices")
-
-    # Map undirected edge -> (n1,n2,eidx) and faces
-    edge_map: Dict[Tuple[int, int], int] = {}
-    edge_nodes: List[Tuple[int, int]] = []
-    edge_faces = []  # list of [f_left, f_right]
-
-    def _add_edge(a: int, b: int, f: int) -> None:
-        i, j = (a, b) if a < b else (b, a)
-        key = (i, j)
-        if key in edge_map:
-            eidx = edge_map[key]
-            # fill second face slot if available
-            if edge_faces[eidx][1] == -1:
-                edge_faces[eidx][1] = f
-        else:
-            eidx = len(edge_nodes)
-            edge_map[key] = eidx
-            edge_nodes.append((i, j))
-            edge_faces.append([f, -1])
-
-    for f in range(tria.shape[0]):
-        a, b, c = int(tria[f, 0]), int(tria[f, 1]), int(tria[f, 2])
-        _add_edge(a, b, f)
-        _add_edge(b, c, f)
-        _add_edge(c, a, f)
-
-    return np.asarray(edge_nodes, dtype=np.int64), np.asarray(edge_faces, dtype=np.int64)
 
 
 def orthogonalize_tria_mesh(
@@ -84,6 +40,7 @@ def orthogonalize_tria_mesh(
     max_global_iter: int = 8,
     smooth_iter: int = 16,
     enable_edge_flips: bool = True,
+    verbose: bool = True,
 ) -> TriaOrthoResult:
     """
     Orthogonalize a pure triangle mesh using the V3 zone logic.
@@ -217,6 +174,7 @@ def orthogonalize_tria_mesh(
                 n_inner=max(1, int(smooth_iter)),
                 small_edges_global=small_edges_arr,
                 removesmalllinkstrsh=removesmalllinkstrsh,
+                verbose=verbose,
             )
             n_zones_orthogonalized += 1
             visited_faces_global.update(faces_zone)

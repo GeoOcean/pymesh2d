@@ -23,23 +23,22 @@ import numpy as np
 from netCDF4 import Dataset
 
 from ..geomesh_util.grd_util import adcirc2DFlowFM
+from .constants import (
+    EARTH_RADIUS,
+    DEG2RAD,
+    RAD2DEG,
+    EARTH_RADIUS_DEG2RAD,
+    EARTH_RADIUS_SQ,
+    DTOL_POLE,
+    CIRCUM_PARALLEL_MIN_FACES,
+    DEFAULT_ORTHO_ALPHA,
+)
+from .geometry import build_edges_from_tria as _build_edges_from_tria
 
 
 # ---------------------------------------------------------------------------
-# Orthogonality: constants, UGRID load, geometry, circumcenter, cosphi (1-based internally).
+# Orthogonality: UGRID load, geometry, circumcenter, cosphi (1-based internally).
 # ---------------------------------------------------------------------------
-
-# Constants (aligned with Delft physicalconsts)
-EARTH_RADIUS = 6378137.0
-DEG2RAD = np.pi / 180.0
-EARTH_RADIUS_DEG2RAD = EARTH_RADIUS * DEG2RAD
-EARTH_RADIUS_SQ = EARTH_RADIUS * EARTH_RADIUS
-DTOL_POLE = 1.0e-6
-RAD2DEG = 180.0 / np.pi
-
-# Toggle verbose "[ZONE] ..." logs during orthogonalization.
-# The ortho+merge pipeline can set this to False to keep output compact.
-VERBOSE_ZONE_LOGS: bool = True
 
 
 def _ugrid_fill_value(var) -> int:
@@ -92,38 +91,6 @@ def _load_ugrid(netcdf_path: str) -> Tuple:
                 out[valid] = edge_faces[valid] + 1
                 edge_faces = out
     return node_x, node_y, face_nodes, edge_nodes, edge_faces, face_x_file, face_y_file
-
-
-def _build_edges_from_tria(tria: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Build (edge_nodes, edge_faces) from 0-based triangles."""
-    tria = np.asarray(tria, dtype=np.int64)
-    if tria.ndim != 2 or tria.shape[1] != 3:
-        raise ValueError("tria must be an array of shape (T,3) with 0-based indices")
-
-    edge_map: Dict[Tuple[int, int], int] = {}
-    edge_nodes: List[Tuple[int, int]] = []
-    edge_faces: List[List[int]] = []
-
-    def _add_edge(a: int, b: int, f: int) -> None:
-        i, j = (a, b) if a < b else (b, a)
-        key = (i, j)
-        if key in edge_map:
-            eidx = edge_map[key]
-            if edge_faces[eidx][1] == -1:
-                edge_faces[eidx][1] = f
-        else:
-            eidx = len(edge_nodes)
-            edge_map[key] = eidx
-            edge_nodes.append((i, j))
-            edge_faces.append([f, -1])
-
-    for f in range(tria.shape[0]):
-        a, b, c = int(tria[f, 0]), int(tria[f, 1]), int(tria[f, 2])
-        _add_edge(a, b, f)
-        _add_edge(b, c, f)
-        _add_edge(c, a, f)
-
-    return np.asarray(edge_nodes, dtype=np.int64), np.asarray(edge_faces, dtype=np.int64)
 
 
 def _getdx_vec(
@@ -352,10 +319,6 @@ def _segments_crossing_ratio_intersection_lonlat(
     return (float(ratio_first), np.asarray(inter, dtype=np.float64))
 
 
-# Minimum number of faces to use parallel circumcenter computation at init
-_CIRCUM_PARALLEL_MIN_FACES = 12000
-
-
 def _circumcenters_lonlat_chunk(
     vert_deg: np.ndarray,
     face_nodes: np.ndarray,
@@ -427,8 +390,8 @@ def _circumcenters_lonlat_ugrid(
     # Parallel path for full-mesh init when many faces (avoids long single-thread loop)
     use_parallel = (
         face_mask is None
-        and nface >= _CIRCUM_PARALLEL_MIN_FACES
-        and len(indices_to_compute) >= _CIRCUM_PARALLEL_MIN_FACES
+        and nface >= CIRCUM_PARALLEL_MIN_FACES
+        and len(indices_to_compute) >= CIRCUM_PARALLEL_MIN_FACES
     )
     if use_parallel:
         n_workers = min(8, max(1, (os.cpu_count() or 4) - 1))
@@ -1273,6 +1236,7 @@ def apply_combined_ortho_smoother_to_zone(
     relax: float = 0.2,
     small_edges_global: Optional[np.ndarray] = None,
     removesmalllinkstrsh: float = 0.1,
+    verbose: bool = True,
 ) -> Tuple[bool, bool]:
     """
     Combine simple (Laplacian) smoothing and orthogonality-oriented displacement,
@@ -1419,7 +1383,7 @@ def apply_combined_ortho_smoother_to_zone(
 
     # [Improvement 5] Skip [good] zones with no small links: nothing to do, avoid useless rollbacks
     if zone_already_good and n_small_zone_before == 0:
-        if VERBOSE_ZONE_LOGS:
+        if verbose:
             print(
                 f"    [ZONE] it={it} faces={len(faces_zone)} [good] skip (n_small_zone=0, nothing to do)"
             )
@@ -1437,10 +1401,10 @@ def apply_combined_ortho_smoother_to_zone(
     else:
         mu_it = mu_max
 
-    alpha = 0.025  # Base amplitude of ortho displacement per edge (conservative to avoid overshoot)
+    alpha = DEFAULT_ORTHO_ALPHA  # Base amplitude of ortho displacement per edge
     tag = "good" if zone_already_good else "bad"
     # Log start for this zone (relax_zone, scale_smooth help tune when many rollbacks)
-    if VERBOSE_ZONE_LOGS:
+    if verbose:
         print(
             f"    [ZONE] it={it} faces={len(faces_zone)} [{tag}] "
             f"max|cosphi|_before={max_cosphi_before:.6f} min|cosphi|_before={min_cosphi_before:.6f} "
@@ -1783,7 +1747,7 @@ def apply_combined_ortho_smoother_to_zone(
     if not improved:
         mesh.node_x[zone_idx] = x_old
         mesh.node_y[zone_idx] = y_old
-        if VERBOSE_ZONE_LOGS:
+        if verbose:
             print(
                 f"    [ZONE] rollback [{tag}]: max_before={max_cosphi_before:.6f} "
                 f"(line_search: all factors 1.0, 0.5, 0.25 failed)"
@@ -1792,7 +1756,7 @@ def apply_combined_ortho_smoother_to_zone(
         log_small = ""
         if small_edges_global is not None and small_edges_global.size > 0:
             log_small = f" n_small_zone={n_small_zone_before}->{n_small_zone_after}"
-        if VERBOSE_ZONE_LOGS:
+        if verbose:
             print(
                 f"    [ZONE] accept [{tag}]: max_before={max_cosphi_before:.6f} "
                 f"max_after={max_cosphi_after:.6f} "
@@ -1841,6 +1805,7 @@ def orthogonalize_netcdf(
     max_global_iter: int = 10,
     smooth_iter: int = 4,
     merge_small_links: bool = False,
+    verbose: bool = True,
 ) -> float:
     """
     Orthogonalize a *_net.nc* file by zones until max(|cosphi|) < `cosphi_threshold`
@@ -1867,6 +1832,8 @@ def orthogonalize_netcdf(
     merge_small_links : bool
         If True and small links remain after ortho, run pymesh2d merge_circumcenters
         on the output file to merge triangle pairs into quads (default False).
+    verbose : bool
+        If True (default), print per-zone "[ZONE] ..." progress logs.
 
     Returns
     -------
@@ -2071,6 +2038,7 @@ def orthogonalize_netcdf(
                 n_inner=max(1, int(smooth_iter)),
                 small_edges_global=small_edges_arr,
                 removesmalllinkstrsh=removesmalllinkstrsh,
+                verbose=verbose,
             )
             if improved:
                 improved_zones += 1
