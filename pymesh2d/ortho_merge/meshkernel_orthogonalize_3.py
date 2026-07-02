@@ -256,7 +256,6 @@ def _getdy(x1: float, y1: float, x2: float, y2: float, jsferic: int = 1) -> floa
 
 # ---------------------------------------------------------------------------
 # Small flow links (Delft3D): circumcenters in lon/lat, dxlink < 0.9*thresh*0.5*(sqrt(ba1)+sqrt(ba2))
-# Same logic as circo; no import from circo to avoid circular dependency.
 # ---------------------------------------------------------------------------
 
 def _lonlat_to_local_xy(node_x: np.ndarray, node_y: np.ndarray) -> Tuple[np.ndarray, float, float]:
@@ -407,7 +406,7 @@ def _circumcenters_lonlat_ugrid(
 ) -> np.ndarray:
     """
     Circumcenters in lon/lat per face (UGRID). Boundary faces use mass center.
-    Same logic as circo circumcenters_lonlat; numberOfInteriorEdges from edge_faces.
+    numberOfInteriorEdges is derived from edge_faces.
     If face_mask is provided, only compute for faces where face_mask is True (faster for zones).
     For full-mesh (face_mask is None) with many faces, uses parallel chunks to speed up init.
     """

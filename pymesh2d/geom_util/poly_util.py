@@ -532,66 +532,6 @@ def resample_polygon_hfun(
     return poly_resampled
 
 
-def resample_polygon(polygon, spacing: float):
-    """
-    Resample a shapely Polygon (or MultiPolygon) at uniform spacing along
-    its exterior and interior boundaries.
-
-    Parameters
-    ----------
-    polygon : shapely.geometry.Polygon or MultiPolygon
-        Input polygon geometry (must be closed).
-    spacing : float
-        Desired distance between consecutive points along the boundaries.
-
-    Returns
-    -------
-    Polygon
-        Resampled polygon with the same topology (holes preserved).
-    """
-
-    # -----------------------handle MultiPolygon input
-    if polygon.geom_type == "MultiPolygon":
-        # keep largest polygon only
-        polygon = max(polygon.geoms, key=lambda p: p.area)
-
-    def resample_line(coords, spacing):
-        coords = np.asarray(coords)
-        if not np.allclose(coords[0], coords[-1]):
-            coords = np.vstack([coords, coords[0]])  # close ring if open
-        dists = np.cumsum(np.r_[0, np.sqrt(((coords[1:] - coords[:-1]) ** 2).sum(1))])
-        if dists[-1] == 0:
-            return coords
-        new_d = np.arange(0, dists[-1], spacing)
-        x = np.interp(new_d, dists, coords[:, 0])
-        y = np.interp(new_d, dists, coords[:, 1])
-        return np.c_[x, y]
-
-    # ---- Exterior ----
-    exterior = np.asarray(polygon.exterior.coords)
-    exterior_resampled = resample_line(exterior, spacing)
-
-    if len(exterior_resampled) < 4:
-        raise ValueError("Exterior ring too short to form a polygon")
-
-    # ---- Interiors ----
-    interiors_resampled = []
-    for interior in polygon.interiors:
-        ring = np.asarray(interior.coords)
-        ring_resampled = resample_line(ring, spacing)
-        if len(ring_resampled) >= 4:
-            interiors_resampled.append(ring_resampled)
-
-    # ---- Construct polygon safely ----
-    poly_new = Polygon(exterior_resampled, interiors_resampled)
-
-    # ---- Fix geometry if invalid (self-intersection, etc.) ----
-    if not poly_new.is_valid:
-        poly_new = poly_new.buffer(0)
-
-    return poly_new
-
-
 def _resample_ring_by_spacing(xy: np.ndarray, spacing: float) -> np.ndarray:
     """
     Resample un anneau (polygone fermé) pour espacer les points d'au moins `spacing`
