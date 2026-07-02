@@ -13,7 +13,7 @@ from .mesh_util.setset import setset
 from .mesh_util.tricon import tricon
 
 
-def refine(*args):
+def refine(node=None, edge=None, part=None, opts=None, hfun=None, *harg):
     """
     Perform (Frontal)-Delaunay-refinement for two-dimensional polygonal geometries.
 
@@ -108,29 +108,13 @@ def refine(*args):
     Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
 
-    # -------------------------------- init variables
-    node = np.array([])
-    PSLG = np.array([])
-    part = []
-    opts = {}
-    hfun = []
-    harg = []
+    # -------------------------------- default argument values
+    node = np.array([]) if node is None else node
+    PSLG = np.array([]) if edge is None else edge
+    part = [] if part is None else part
+    hfun = [] if hfun is None else hfun
 
-    # -------------------------------- extract args
-    if len(args) >= 1:
-        node = args[0]
-    if len(args) >= 2:
-        PSLG = args[1]
-    if len(args) >= 3:
-        part = args[2]
-    if len(args) >= 4:
-        opts = args[3]
-    if len(args) >= 5:
-        hfun = args[4]
-    if len(args) >= 6:
-        harg = args[5:]
-
-    opts = makeopt(opts)
+    opts = makeopt({} if opts is None else opts)
 
     # -------------------------------- default EDGE
     nnod = node.shape[0]
@@ -318,7 +302,7 @@ def cdtbal0(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
         evec = vert[conn[:, 1], :] - vert[conn[:, 0], :]
         elen = np.sqrt(np.sum(evec**2, axis=1))
 
-        # éviter les divisions par zéro comme MATLAB
+        # avoid division by zero (mirrors MATLAB's behaviour)
         eps = np.finfo(float).eps
         mask_zero = elen < eps
         if np.any(mask_zero):

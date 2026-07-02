@@ -7,7 +7,7 @@ from .mesh_cost.trideg import trideg
 from .mesh_cost.triscr import triscr
 
 
-def tricost(*args):
+def tricost(vert=None, conn=None, tria=None, tnum=None, hvrt=None):
     """
     Plot quality metrics for a 2-simplex triangulation embedded in the
     two-dimensional plane.
@@ -53,20 +53,6 @@ def tricost(*args):
     refine2 : Delaunay mesh refinement.
     smooth2 : Mesh smoothing via hill-climbing optimization.
     """
-
-    vert, conn, tria, tnum, hvrt = (None, None, None, None, None)
-
-    # --------------------------------------------- extract args
-    if len(args) >= 1:
-        vert = args[0]
-    if len(args) >= 2:
-        conn = args[1]
-    if len(args) >= 3:
-        tria = args[2]
-    if len(args) >= 4:
-        tnum = args[3]
-    if len(args) >= 5:
-        hvrt = args[4]
 
     # --------------------------------------------- basic checks
     if not all(
@@ -187,7 +173,7 @@ def deghist(dd, ty, ax=None):
 
     k = (0.60, 0.60, 0.60)
 
-    # Histogramme
+    # Histogram
     ax.bar(be, hc, width=1.05, color=k, edgecolor=k)
 
     ax.axis("tight")
@@ -197,7 +183,7 @@ def deghist(dd, ty, ax=None):
     ax.set_xlim([0, 12])
     ax.set_xlabel("", fontsize=22)
 
-    # Légende selon le type
+    # Axis label depends on the triangulation type
     if ty == "tria4":
         ax.text(-0.225, 0, r"$|d|_{\tau}$", ha="right", fontsize=22)
     elif ty == "tria3":

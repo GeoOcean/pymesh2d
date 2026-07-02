@@ -4,14 +4,14 @@ import sys
 import matplotlib.pyplot as plt
 import numpy as np
 
-from pymesh2d.hfun_util.lfshfn import lfshfn
-from pymesh2d.hfun_util.trihfn import trihfn
-from pymesh2d.mesh_util.idxtri import idxtri
-from pymesh2d.mesh_util.tridiv import tridiv
-from pymesh2d.refine import refine
-from pymesh2d.smooth import smooth
-from pymesh2d.tricost import tricost
-from pymesh2d.triread import triread
+from .hfun_util.lfshfn import lfshfn
+from .hfun_util.trihfn import trihfn
+from .mesh_util.idxtri import idxtri
+from .mesh_util.tridiv import tridiv
+from .refine import refine
+from .smooth import smooth
+from .tricost import tricost
+from .triread import triread
 
 
 def tridemo(demo):
