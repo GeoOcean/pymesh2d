@@ -2,7 +2,7 @@
 Iterative pipeline: orthogonalize <-> merge_circumcenters (with optional recovery).
 
 Part of the ``pymesh2d`` package (no dependency on scripts outside this tree).
-Used by :mod:`pymesh2d.smood` when ``use_backup_transition`` is True.
+Used by :mod:`pymesh2d.smood` as its default orthogonalization/merge pipeline.
 
 Intended process (Delft3D-FM / dual mesh)
 -----------------------------------------
