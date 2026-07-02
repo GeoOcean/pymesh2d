@@ -59,8 +59,8 @@ def refine(node=None, edge=None, part=None, opts=None, hfun=None, *harg):
     hfun : float or callable, optional
         Mesh-size function or scalar constraint.
         If `hfun` is a float, a constant mesh size is imposed globally.
-        If `hfun` is callable, it must accept coordinates `PP` (N×2 array)
-        and return corresponding mesh-size values `HH` (N×1 array).
+        If `hfun` is callable, it must accept coordinates `vert` (N×2 array)
+        and return corresponding mesh-size values `hvrt` (N×1 array).
         The function must be fully vectorized.
     *harg : tuple, optional
         Additional arguments passed to `hfun`.

@@ -50,8 +50,8 @@ def tricost(vert=None, conn=None, tria=None, tnum=None, hvrt=None):
 
     See Also
     --------
-    refine2 : Delaunay mesh refinement.
-    smooth2 : Mesh smoothing via hill-climbing optimization.
+    refine : Delaunay mesh refinement.
+    smooth : Mesh smoothing via hill-climbing optimization.
     """
 
     # --------------------------------------------- basic checks

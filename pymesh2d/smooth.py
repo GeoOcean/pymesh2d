@@ -456,7 +456,7 @@ def evalhfn(vert, edge, EMAT, hfun=None, harg=[]):
             try:
                 hvrt = np.asarray(hfun(vert, *harg)).flatten()
             except Exception:
-                # hfun peut échouer sur des sommets hors domaine (ex. bbox) -> fallback global
+                # hfun may fail on out-of-domain vertices (e.g. bbox) -> fall back to default
                 hvrt = default_hvrt.copy()
             else:
                 if hvrt.size != vert.shape[0]:
@@ -464,7 +464,7 @@ def evalhfn(vert, edge, EMAT, hfun=None, harg=[]):
                         "smooth:evalhfn - hfun must return one value per vertex, "
                         f"got size {hvrt.size} for {vert.shape[0]} vertices."
                     )
-                # Sommets hors domaine (ex. bbox) peuvent donner NaN/inf : on utilise le défaut
+                # out-of-domain vertices (e.g. bbox) may yield NaN/inf: fall back to default
                 bad = ~np.isfinite(hvrt) | (hvrt <= 0)
                 hvrt[bad] = default_hvrt[bad]
     else:

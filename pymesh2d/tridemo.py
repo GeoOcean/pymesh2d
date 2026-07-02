@@ -46,10 +46,10 @@ def tridemo(demo):
 
     See Also
     --------
-    refine2 : Delaunay-based mesh refinement.
-    smooth2 : Smoothing and optimization of triangulations.
-    tridiv2 : Triangulation division for multi-part domains.
-    fixgeo2 : Geometry correction and boundary preparation.
+    refine : Delaunay-based mesh refinement.
+    smooth : Smoothing and optimization of triangulations.
+    tridiv : Triangulation division for multi-part domains.
+    fixgeo : Geometry correction and boundary preparation.
 
     References
     ----------
@@ -270,7 +270,7 @@ def demo3():
     DEMO3 explore impact of user-defined mesh-size constraints.
     """
 
-    # équivalent de mfilename('fullpath')
+    # equivalent to MATLAB's mfilename('fullpath')
     filepath = os.path.dirname(os.path.abspath(__file__))
     meshfile = os.path.join(filepath, "poly_data", "airfoil.msh")
 
@@ -328,7 +328,7 @@ def demo4():
     DEMO4 explore impact of "hill-climbing" mesh optimisations.
     """
 
-    # Équivalent MATLAB mfilename / fileparts
+    # equivalent to MATLAB's mfilename / fileparts
     filepath = os.path.dirname(os.path.abspath(__file__))
     meshfile = os.path.join(filepath, "poly_data", "airfoil.msh")
 
@@ -372,7 +372,7 @@ def demo4():
 
     plt.title(f"MESH-OPT.: KIND=DELFRONT, |TRIA|={tnew.shape[0]}")
 
-    # ---------------------------------------------- analyse qualité
+    # ---------------------------------------------- quality analysis
     hvrt = trihfn(vert, vlfs, tlfs, slfs, hlfs)
     hnew = trihfn(vnew, vlfs, tlfs, slfs, hlfs)
 

@@ -1,9 +1,7 @@
 """
 Delft3D-FM UGRID (xarray) builders, mixed tri/quad connectivity, and ADCIRC helpers.
 
-This is the canonical copy used by :mod:`pymesh2d.smood`, ``merge_circumcenters``,
-and scripts under ``ortogonalisation/``. The sibling file ``ortogonalisation/grd_util.py``
-re-exports this module for legacy ``import grd_util``.
+Used by :mod:`pymesh2d.smood` and ``merge_circumcenters``.
 """
 from datetime import datetime
 
@@ -755,7 +753,7 @@ def export_to_grd(
 
     # --- 3. Write to file
     with open(filename, "w") as f:
-        # En-tête
+        # --- Header
         f.write(f"{crs}\n")
         f.write(f"{tria.shape[0]} {vert.shape[0]}\n")
 

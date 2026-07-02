@@ -29,8 +29,8 @@ def idxtri(vert, tria):
 
     See Also
     --------
-    trihfn2 : evaluate a mesh-size function on a triangulation.
-    lfshfn2 : compute local feature-size estimates.
+    trihfn : evaluate a mesh-size function on a triangulation.
+    lfshfn : compute local feature-size estimates.
     maketree : build an AABB tree for general rectangular bounds.
 
     References
