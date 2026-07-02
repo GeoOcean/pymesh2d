@@ -1,9 +1,16 @@
-import os
 import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
 
+from .demo_cases import (
+    circle_in_box_geometry,
+    demo_data_path,
+    hfun8,
+    internal_constraint_geometry,
+    multi_part_geometry,
+    square_with_hole_geometry,
+)
 from .hfun_util.lfshfn import lfshfn
 from .hfun_util.trihfn import trihfn
 from .mesh_util.idxtri import idxtri
@@ -108,34 +115,7 @@ def demo0():
     )
 
     # ------------------------------------------- setup geometry
-    node = np.array(
-        [  # list of xy "node" coordinates
-            [0, 0],  # outer square
-            [9, 0],
-            [9, 9],
-            [0, 9],
-            [4, 4],  # inner square
-            [5, 4],
-            [5, 5],
-            [4, 5],
-        ]
-    )
-
-    edge = (
-        np.array(
-            [  # list of "edges" between nodes
-                [1, 2],  # outer square
-                [2, 3],
-                [3, 4],
-                [4, 1],
-                [5, 6],  # inner square
-                [6, 7],
-                [7, 8],
-                [8, 5],
-            ]
-        )
-        - 1
-    )
+    node, edge = square_with_hole_geometry()
     opts = {}
     # ------------------------------------------- call mesh-gen.
     vert, etri, tria, tnum = refine(node, edge, [], opts)
@@ -165,8 +145,7 @@ def demo1():
     DEMO1 explore impact of RHO2 threshold on mesh density/quality
     """
 
-    filepath = os.path.dirname(os.path.abspath(__file__))
-    meshfile = os.path.join(filepath, "poly_data", "lake.msh")
+    meshfile = demo_data_path("lake.msh")
 
     node, edge, _, _ = triread(meshfile)
 
@@ -222,8 +201,7 @@ def demo2():
     DEMO2 explore impact of refinement "KIND" on mesh quality/density.
     """
 
-    filepath = os.path.dirname(os.path.abspath(__file__))
-    meshfile = os.path.join(filepath, "poly_data", "lake.msh")
+    meshfile = demo_data_path("lake.msh")
 
     node, edge, _, _ = triread(meshfile)
 
@@ -270,9 +248,7 @@ def demo3():
     DEMO3 explore impact of user-defined mesh-size constraints.
     """
 
-    # equivalent to MATLAB's mfilename('fullpath')
-    filepath = os.path.dirname(os.path.abspath(__file__))
-    meshfile = os.path.join(filepath, "poly_data", "airfoil.msh")
+    meshfile = demo_data_path("airfoil.msh")
 
     node, edge, _, _ = triread(meshfile)
 
@@ -328,9 +304,7 @@ def demo4():
     DEMO4 explore impact of "hill-climbing" mesh optimisations.
     """
 
-    # equivalent to MATLAB's mfilename / fileparts
-    filepath = os.path.dirname(os.path.abspath(__file__))
-    meshfile = os.path.join(filepath, "poly_data", "airfoil.msh")
+    meshfile = demo_data_path("airfoil.msh")
 
     node, edge, _, _ = triread(meshfile)
 
@@ -394,54 +368,7 @@ def demo5():
     )
 
     # ---------------------------------------------- create geometry
-
-    nod1 = np.array([[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]])
-
-    edg1 = np.array([[0, 1], [1, 2], [2, 3], [3, 0]], dtype=int)
-    tag1 = np.zeros((edg1.shape[0], 1), dtype=int)
-
-    nod2 = np.array([[0.1, 0.0], [0.8, 0.0], [0.8, 0.8], [0.1, 0.8]])
-
-    edg2 = np.array([[0, 1], [1, 2], [2, 3], [3, 0]], dtype=int)
-    tag2 = np.ones((edg2.shape[0], 1), dtype=int)
-
-    # Circle geometry
-    adel = 2.0 * np.pi / 64.0
-    amin = 0.0
-    amax = 2.0 * np.pi - adel
-
-    ang = np.arange(amin, amax + adel / 2, adel)
-    xcir = 0.33 * np.cos(ang) - 0.33
-    ycir = 0.33 * np.sin(ang) - 0.25
-    ncir = np.column_stack((xcir, ycir))
-
-    numc = ncir.shape[0]
-    ecir = np.column_stack((np.arange(numc - 1), np.arange(1, numc)))
-    ecir = np.vstack((ecir, [numc - 1, 0]))
-    tagc = np.full((ecir.shape[0], 1), 2, dtype=int)
-
-    # ---------------------------------------------- merge geometries
-
-    # offset inner square indices
-    edg2 = edg2 + nod1.shape[0]
-    edge = np.vstack((np.hstack((edg1, tag1)), np.hstack((edg2, tag2))))
-    node = np.vstack((nod1, nod2))
-
-    # offset circle indices
-    ecir = ecir + node.shape[0]
-    edge = np.vstack((edge, np.hstack((ecir, tagc))))
-    node = np.vstack((node, ncir))
-
-    # ---------------------------------------------- define parts
-
-    edge_tag = edge[:, 2].astype(int)
-    part = [
-        np.where((edge_tag == 0) | (edge_tag == 1) | (edge_tag == 2))[0],
-        np.where(edge_tag == 1)[0],
-        np.where(edge_tag == 2)[0],
-    ]
-
-    edge = edge[:, :2].astype(int)
+    node, edge, part = multi_part_geometry()
 
     # ---------------------------------------------- size function
 
@@ -493,61 +420,13 @@ def demo6():
     )
 
     # ---------------------------------------------- create geom.
-    node = np.array(
-        [
-            [-1.0, -1.0],
-            [1.0, -1.0],
-            [1.0, 1.0],
-            [-1.0, 1.0],
-            [0.0, 0.0],
-            [0.2, 0.7],
-            [0.6, 0.2],
-            [0.4, 0.8],
-            [0.0, 0.5],
-            [-0.7, 0.3],
-            [-0.1, 0.1],
-            [-0.6, 0.5],
-            [-0.9, -0.8],
-            [-0.6, -0.7],
-            [-0.3, -0.6],
-            [0.0, -0.5],
-            [0.3, -0.4],
-            [-0.3, 0.4],
-            [-0.1, 0.3],
-        ]
-    )
-
-    edge = np.array(
-        [
-            [0, 1],
-            [1, 2],
-            [2, 3],
-            [3, 0],
-            [4, 5],
-            [4, 6],
-            [4, 7],
-            [4, 8],
-            [4, 9],
-            [4, 10],
-            [4, 11],
-            [4, 12],
-            [4, 13],
-            [4, 14],
-            [4, 15],
-            [4, 16],
-            [4, 17],
-            [4, 18],
-        ]
-    )
-    """
-    the geometry must be split into its "exterior" and "int-
-    erior" components using the optional PART argument. Each
-    PART{I} specified should define the "exterior" boundary
-    of a polygonal region. "Interior" constraints should not
-    be referenced by any polygon in PART -- they are imposed
-    as isolated edge constraints.
-    """
-    part = [np.array([0, 1, 2, 3])]
+    # the geometry must be split into its "exterior" and "int-
+    # erior" components using the optional PART argument. Each
+    # PART{I} specified should define the "exterior" boundary
+    # of a polygonal region. "Interior" constraints should not
+    # be referenced by any polygon in PART -- they are imposed
+    # as isolated edge constraints.
+    node, edge, part = internal_constraint_geometry()
 
     # ---------------------------------------------- do size-fun.
     hmax = 0.175
@@ -579,9 +458,7 @@ def demo7():
     DEMO7 investigate the use of quadtree-type mesh refinement.
     """
 
-    filename = __file__
-    filepath = "/".join(filename.split("/")[:-1])
-    meshfile = f"{filepath}/poly_data/channel.msh"
+    meshfile = demo_data_path("channel.msh")
 
     node, edge, _, _ = triread(meshfile)
 
@@ -639,26 +516,7 @@ def demo8():
     """
 
     # ---------------------------------------------- create geom.
-    node = np.array([[-1.0, -1.0], [3.0, -1.0], [3.0, 1.0], [-1.0, 1.0]])
-    edge = np.array([[0, 1], [1, 2], [2, 3], [3, 0]])
-
-    adel = 2.0 * np.pi / 64.0
-    amin = 0.0 * np.pi
-    amax = 2.0 * np.pi - adel
-
-    angles = np.arange(amin, amax + adel, adel)
-    xcir = 0.20 * np.cos(angles)
-    ycir = 0.20 * np.sin(angles)
-    ncir = np.column_stack([xcir, ycir])
-    numc = ncir.shape[0]
-
-    ecir = np.zeros((numc, 2), dtype=int)
-    ecir[:, 0] = np.arange(numc)
-    ecir[:, 1] = np.roll(ecir[:, 0], -1)
-
-    ecir = ecir + node.shape[0]
-    edge = np.vstack([edge, ecir])
-    node = np.vstack([node, ncir])
+    node, edge = circle_in_box_geometry()
 
     # ---------------------------------------------- do mesh-gen.
     hfun = hfun8
@@ -697,42 +555,13 @@ def demo8():
     plt.show()
 
 
-def hfun8(test):
-    """
-    HFUN8 : user-defined mesh-size function for DEMO-8.
-
-    Parameters
-    ----------
-    test : ndarray of shape (N,2)
-        Coordinates (x,y) at which the mesh-size function is evaluated.
-
-    Returns
-    -------
-    hfun : ndarray of shape (N,)
-        Mesh-size values at input points.
-    """
-    hmax = 0.05
-    hmin = 0.01
-
-    xmid = 0.0
-    ymid = 0.0
-
-    hcir = np.exp(-0.5 * (test[:, 0] - xmid) ** 2 - 2.0 * (test[:, 1] - ymid) ** 2)
-
-    hfun = hmax - (hmax - hmin) * hcir
-
-    return hfun
-
-
 def demo9():
     """
     DEMO9 larger-scale problem, mesh refinement + optimisation.
     """
 
     # ------------------------------------------- load geometry
-    filename = __file__  # current file path
-    filepath = "/".join(filename.split("/")[:-1])
-    meshfile = f"{filepath}/poly_data/islands.msh"
+    meshfile = demo_data_path("islands.msh")
 
     # Load input mesh geometry
     node, edge, _, _ = triread(meshfile)
@@ -767,9 +596,7 @@ def demo10():
     """
 
     # ------------------------------------------- load geometry
-    filename = __file__
-    filepath = "/".join(filename.split("/")[:-1])
-    meshfile = f"{filepath}/poly_data/river.msh"
+    meshfile = demo_data_path("river.msh")
 
     node, edge, _, _ = triread(meshfile)
 

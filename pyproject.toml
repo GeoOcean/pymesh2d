@@ -60,3 +60,6 @@ local_scheme = "no-local-version"
 
 [tool.setuptools.packages.find]
 exclude = ["assets", "assets.*"]
+
+[tool.setuptools.package-data]
+pymesh2d = ["poly_data/*.msh"]

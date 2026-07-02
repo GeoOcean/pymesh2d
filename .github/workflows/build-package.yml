@@ -21,7 +21,6 @@ jobs:
       - name: Install Dependencies
         run: |
           pip install build setuptools-scm twine
-          conda install -c conda-forge conda-build anaconda-client
 
       - name: Get Version
         id: get_version
