@@ -6,7 +6,7 @@ Small, dependency-free geometric/topological helpers shared across the
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Tuple
 
 import numpy as np
 
@@ -14,6 +14,11 @@ import numpy as np
 def build_edges_from_tria(tria: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
     Build (edge_nodes, edge_faces) from 0-based triangles.
+
+    Edges are numbered by first occurrence in face-then-edge traversal order,
+    each edge as (min_node, max_node); an edge's two faces are in traversal
+    order (right face = -1 for boundary), with any further faces of a
+    non-manifold edge ignored.
 
     Parameters
     ----------
@@ -28,27 +33,33 @@ def build_edges_from_tria(tria: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     if tria.ndim != 2 or tria.shape[1] != 3:
         raise ValueError("tria must be an array of shape (T,3) with 0-based indices")
 
-    edge_map: Dict[Tuple[int, int], int] = {}
-    edge_nodes: List[Tuple[int, int]] = []
-    edge_faces: List[List[int]] = []
+    n_faces = tria.shape[0]
+    if n_faces == 0:
+        return np.zeros((0, 2), dtype=np.int64), np.zeros((0, 2), dtype=np.int64)
+    # Half-edges in traversal order: (a,b), (b,c), (c,a) per face.
+    he_a = tria[:, [0, 1, 2]].ravel()
+    he_b = tria[:, [1, 2, 0]].ravel()
+    he_f = np.repeat(np.arange(n_faces, dtype=np.int64), 3)
+    lo = np.minimum(he_a, he_b)
+    hi = np.maximum(he_a, he_b)
+    key = lo * np.int64(max(int(tria.max(initial=-1)) + 2, 1)) + hi
 
-    def _add_edge(a: int, b: int, f: int) -> None:
-        i, j = (a, b) if a < b else (b, a)
-        key = (i, j)
-        if key in edge_map:
-            eidx = edge_map[key]
-            if edge_faces[eidx][1] == -1:
-                edge_faces[eidx][1] = f
-        else:
-            eidx = len(edge_nodes)
-            edge_map[key] = eidx
-            edge_nodes.append((i, j))
-            edge_faces.append([f, -1])
+    _, first_pos, inverse = np.unique(key, return_index=True, return_inverse=True)
+    insertion = np.argsort(first_pos, kind="stable")
+    rank = np.empty(insertion.size, dtype=np.int64)
+    rank[insertion] = np.arange(insertion.size)
+    edge_id = rank[inverse]
 
-    for f in range(tria.shape[0]):
-        a, b, c = int(tria[f, 0]), int(tria[f, 1]), int(tria[f, 2])
-        _add_edge(a, b, f)
-        _add_edge(b, c, f)
-        _add_edge(c, a, f)
+    edge_nodes = np.column_stack([lo[first_pos][insertion], hi[first_pos][insertion]])
+    edge_faces = np.full((edge_nodes.shape[0], 2), -1, dtype=np.int64)
+    pos = np.argsort(edge_id, kind="stable")
+    sid = edge_id[pos]
+    is_first = np.r_[True, sid[1:] != sid[:-1]]
+    starts = np.flatnonzero(is_first)
+    edge_faces[sid[starts], 0] = he_f[pos[starts]]
+    seconds = starts + 1
+    seconds = seconds[seconds < sid.size]
+    seconds = seconds[~is_first[seconds]]
+    edge_faces[sid[seconds], 1] = he_f[pos[seconds]]
 
-    return np.asarray(edge_nodes, dtype=np.int64), np.asarray(edge_faces, dtype=np.int64)
+    return edge_nodes, edge_faces

@@ -566,9 +566,6 @@ def build_ugrid_arrays_mixed(NODE: np.ndarray, faces_list: list) -> dict:
     # - face_nodes / edge_faces are int32 with `_FillValue=-999`.
     #   Xarray will typically decode -999 -> NaN depending on how the file is read.
     FILL = np.int32(-999)
-    # Build faces in CCW order to match UGRID expectations and
-    # Delft3D-FM polygon orientation conventions.
-    faces_list_ccw: list[np.ndarray] = []
 
     face_nodes = np.full((n_faces, 4), FILL, dtype=np.int32)
     face_x = np.zeros(n_faces, dtype=np.float64)
@@ -576,71 +573,107 @@ def build_ugrid_arrays_mixed(NODE: np.ndarray, faces_list: list) -> dict:
     face_x_bnd = np.zeros((n_faces, 4), dtype=np.float64)
     face_y_bnd = np.zeros((n_faces, 4), dtype=np.float64)
 
-    def _polygon_centroid_xy(xx: np.ndarray, yy: np.ndarray) -> tuple[float, float]:
-        """
-        Area-weighted polygon centroid (shoelace formula).
-        Falls back to vertex mean for near-degenerate polygons.
-        """
-        cross = xx * np.roll(yy, -1) - np.roll(xx, -1) * yy
-        area2 = np.sum(cross)
-        if abs(area2) < 1e-30:
-            return float(np.mean(xx)), float(np.mean(yy))
-        cx = np.sum((xx + np.roll(xx, -1)) * cross) / (3.0 * area2)
-        cy = np.sum((yy + np.roll(yy, -1)) * cross) / (3.0 * area2)
-        return float(cx), float(cy)
+    faces_norm = [np.asarray(f, dtype=np.int32).reshape(-1) for f in faces_list]
+    nv_arr = np.fromiter((f.size for f in faces_norm), dtype=np.int64, count=n_faces)
 
-    for i, f in enumerate(faces_list):
-        f = np.asarray(f, dtype=np.int32).reshape(-1)
-        nv = len(f)
+    # Half-edges of all faces (built CCW), in face-then-edge traversal order.
+    he_v1_parts: list[np.ndarray] = []
+    he_v2_parts: list[np.ndarray] = []
+    he_fi_parts: list[np.ndarray] = []
+    he_k_parts: list[np.ndarray] = []
 
-        # Signed area in current vertex order.
-        # For convex polygons this reliably detects CW/CCW orientation.
+    # Vectorized per group of equal vertex count (3 or 4).
+    for nv in np.unique(nv_arr):
+        nv = int(nv)
+        gidx = np.where(nv_arr == nv)[0]
+        fv = np.vstack([faces_norm[i] for i in gidx])
+        x = node_x[fv]
+        y = node_y[fv]
+        kp1 = (np.arange(nv) + 1) % nv
         if nv >= 3:
-            x = node_x[f]
-            y = node_y[f]
-            area2 = 0.5 * (np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
-            if area2 < 0.0:
-                f = f[::-1]
+            # Signed area in current vertex order; build faces in CCW order to
+            # match UGRID expectations and Delft3D-FM polygon orientation
+            # conventions. For convex polygons this reliably detects CW/CCW.
+            d1 = np.zeros(gidx.size, dtype=np.float64)
+            d2 = np.zeros(gidx.size, dtype=np.float64)
+            for k in range(nv):
+                d1 += x[:, k] * y[:, kp1[k]]
+                d2 += y[:, k] * x[:, kp1[k]]
+            flip = 0.5 * (d1 - d2) < 0.0
+            if np.any(flip):
+                fv[flip] = fv[flip, ::-1]
+                x = node_x[fv]
+                y = node_y[fv]
 
-        faces_list_ccw.append(f)
-
-        face_nodes[i, :nv] = f + 1
-        if nv == 3:
-            face_nodes[i, 3] = FILL
-        fx, fy = _polygon_centroid_xy(node_x[f], node_y[f])
-        face_x[i] = fx
-        face_y[i] = fy
-        face_x_bnd[i, :nv] = node_x[f]
-        face_y_bnd[i, :nv] = node_y[f]
-        if nv == 3:
-            face_x_bnd[i, 3] = np.nan
-            face_y_bnd[i, 3] = np.nan
-
-    # Build unique edges and edge->face mapping
-    edge_set = {}
-    for fi, f in enumerate(faces_list_ccw):
-        f = np.asarray(f, dtype=np.int32)
-        nv = len(f)
+        face_nodes[gidx[:, None], np.arange(nv)] = fv + 1
+        # Area-weighted polygon centroid (shoelace formula), with a fallback
+        # to the vertex mean for near-degenerate polygons.
+        cross = np.empty_like(x)
         for k in range(nv):
-            v1, v2 = f[k], f[(k + 1) % nv]
-            key = (min(v1, v2), max(v1, v2))
-            if key not in edge_set:
-                edge_set[key] = []
-            edge_set[key].append(fi)
+            cross[:, k] = x[:, k] * y[:, kp1[k]] - x[:, kp1[k]] * y[:, k]
+        area2 = np.zeros(gidx.size, dtype=np.float64)
+        sx = np.zeros(gidx.size, dtype=np.float64)
+        sy = np.zeros(gidx.size, dtype=np.float64)
+        for k in range(nv):
+            area2 += cross[:, k]
+            sx += (x[:, k] + x[:, kp1[k]]) * cross[:, k]
+            sy += (y[:, k] + y[:, kp1[k]]) * cross[:, k]
+        degenerate = np.abs(area2) < 1e-30
+        den = np.where(degenerate, 1.0, 3.0 * area2)
+        face_x[gidx] = np.where(degenerate, np.mean(x, axis=1), sx / den)
+        face_y[gidx] = np.where(degenerate, np.mean(y, axis=1), sy / den)
+        face_x_bnd[gidx[:, None], np.arange(nv)] = x
+        face_y_bnd[gidx[:, None], np.arange(nv)] = y
+        if nv == 3:
+            face_x_bnd[gidx, 3] = np.nan
+            face_y_bnd[gidx, 3] = np.nan
 
-    edges = np.array(list(edge_set.keys()), dtype=np.int32)
+        he_v1_parts.append(fv.ravel())
+        he_v2_parts.append(fv[:, kp1].ravel())
+        he_fi_parts.append(np.repeat(gidx, nv))
+        he_k_parts.append(np.tile(np.arange(nv), gidx.size))
+
+    # Build unique edges and edge->face mapping. Edges are numbered by first
+    # occurrence in face-then-edge traversal order, and each edge's faces are
+    # kept in traversal order (same as the historical dict-based loop).
+    if not he_v1_parts:
+        he_v1_parts = [np.zeros(0, dtype=np.int64)]
+        he_v2_parts = [np.zeros(0, dtype=np.int64)]
+        he_fi_parts = [np.zeros(0, dtype=np.int64)]
+        he_k_parts = [np.zeros(0, dtype=np.int64)]
+    he_v1 = np.concatenate(he_v1_parts).astype(np.int64)
+    he_v2 = np.concatenate(he_v2_parts).astype(np.int64)
+    he_fi = np.concatenate(he_fi_parts)
+    he_k = np.concatenate(he_k_parts)
+    order = np.lexsort((he_k, he_fi))
+    he_v1, he_v2, he_fi = he_v1[order], he_v2[order], he_fi[order]
+    lo = np.minimum(he_v1, he_v2)
+    hi = np.maximum(he_v1, he_v2)
+    key = lo * np.int64(n_nodes + 1) + hi
+    _, first_pos, inverse = np.unique(key, return_index=True, return_inverse=True)
+    insertion = np.argsort(first_pos, kind="stable")
+    rank = np.empty(insertion.size, dtype=np.int64)
+    rank[insertion] = np.arange(insertion.size)
+    edge_id = rank[inverse]
+
+    edges = np.column_stack(
+        [lo[first_pos][insertion], hi[first_pos][insertion]]
+    ).astype(np.int32)
     edge_node = edges + 1
     # GUI padding for boundary edges:
     # In the working Delft3D-FM GUI export, missing neighbor faces in
     # `mesh2d_edge_faces(:, 1)` are encoded as 0 (NOT as `_FillValue`).
     # Using 0 instead of `_FillValue` makes UGRID import validation pass.
     edge_face = np.zeros((len(edges), 2), dtype=np.int32)
-    for i, (v1, v2) in enumerate(edges):
-        faces = edge_set[(v1, v2)]
-        if len(faces) >= 1:
-            edge_face[i, 0] = faces[0] + 1
-        if len(faces) >= 2:
-            edge_face[i, 1] = faces[1] + 1
+    pos = np.argsort(edge_id, kind="stable")
+    sid = edge_id[pos]
+    is_first = np.r_[True, sid[1:] != sid[:-1]]
+    starts = np.flatnonzero(is_first)
+    edge_face[sid[starts], 0] = he_fi[pos[starts]] + 1
+    seconds = starts + 1
+    seconds = seconds[seconds < sid.size]
+    seconds = seconds[~is_first[seconds]]
+    edge_face[sid[seconds], 1] = he_fi[pos[seconds]] + 1
 
     edge_x = (node_x[edges[:, 0]] + node_x[edges[:, 1]]) / 2
     edge_y = (node_y[edges[:, 0]] + node_y[edges[:, 1]]) / 2

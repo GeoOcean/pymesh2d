@@ -13,9 +13,7 @@ V3: v2 + pymesh2d-inspired small-link fixes (flip, circumcenter-direction, aggre
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
-import os
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 from collections import deque
 
@@ -30,7 +28,6 @@ from .constants import (
     EARTH_RADIUS_DEG2RAD,
     EARTH_RADIUS_SQ,
     DTOL_POLE,
-    CIRCUM_PARALLEL_MIN_FACES,
     DEFAULT_ORTHO_ALPHA,
 )
 from .geometry import build_edges_from_tria as _build_edges_from_tria
@@ -122,6 +119,24 @@ def _getdy_vec(
     return (EARTH_RADIUS_DEG2RAD * (y2 - y1)).astype(np.float64)
 
 
+def _gather_face_node_coords(
+    node_x: np.ndarray,
+    node_y: np.ndarray,
+    face_nodes: np.ndarray,
+    faces: np.ndarray,
+    n: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Coordinates of the valid (1-based, > 0) nodes of `faces`, which must all
+    have exactly `n` valid nodes. Returns (xv, yv), each (len(faces), n),
+    with the valid nodes of each row in their original order.
+    """
+    sub = face_nodes[faces, :]
+    order = np.argsort(sub <= 0, axis=1, kind="stable")
+    idx = np.take_along_axis(sub, order[:, :n], axis=1) - 1
+    return node_x[idx].astype(np.float64), node_y[idx].astype(np.float64)
+
+
 def _face_centers(
     node_x: np.ndarray,
     node_y: np.ndarray,
@@ -138,44 +153,51 @@ def _face_centers(
         face_x = np.zeros(n_faces, dtype=np.float64)
         face_y = np.zeros(n_faces, dtype=np.float64)
         faces_to_do = np.arange(n_faces)
-    for f in faces_to_do:
-        nodes = face_nodes[f, :]
-        nodes = nodes[nodes > 0]
-        if nodes.size == 0:
+    if faces_to_do.size == 0:
+        return face_x, face_y
+    counts = np.sum(face_nodes[faces_to_do, :] > 0, axis=1)
+    # Vectorized per group of equal node count (faces with 0 nodes keep the
+    # initial fill value, as in the historical per-face loop).
+    for n in np.unique(counts):
+        if n == 0:
             continue
-        idx = nodes - 1
-        xin = node_x[idx].astype(float)
-        yin = node_y[idx].astype(float)
-        n = xin.size
-        x, y0 = xin.copy(), yin[np.argmin(np.abs(yin))]
-        x0 = np.min(x)
-        if np.max(x) - x0 > 180.0:
-            x = np.where(x < np.max(x) - 180.0, x + 360.0, x)
-            x0 = np.min(x)
-        area = xcg = ycg = 0.0
+        faces = faces_to_do[counts == n]
+        xin, yin = _gather_face_node_coords(node_x, node_y, face_nodes, faces, int(n))
+        y0 = yin[np.arange(faces.size), np.argmin(np.abs(yin), axis=1)]
+        x = xin.copy()
+        xmax = np.max(x, axis=1)
+        wrap = (xmax - np.min(x, axis=1)) > 180.0
+        if np.any(wrap):
+            x = np.where(wrap[:, None] & (x < (xmax - 180.0)[:, None]), x + 360.0, x)
+        x0 = np.min(x, axis=1)
+        dxs = np.empty_like(x)
+        dys = np.empty_like(x)
+        for i in range(n):
+            dxs[:, i] = _getdx_vec(x0, y0, x[:, i], yin[:, i], 1)
+            dys[:, i] = _getdy_vec(x0, y0, x[:, i], yin[:, i], 1)
+        area = np.zeros(faces.size, dtype=np.float64)
+        xcg = np.zeros(faces.size, dtype=np.float64)
+        ycg = np.zeros(faces.size, dtype=np.float64)
         for i in range(n):
             ip1 = (i + 1) % n
-            dx0 = _getdx(x0, y0, x[i], yin[i], 1)
-            dy0 = _getdy(x0, y0, x[i], yin[i], 1)
-            dx1 = _getdx(x0, y0, x[ip1], yin[ip1], 1)
-            dy1 = _getdy(x0, y0, x[ip1], yin[ip1], 1)
-            xc, yc = 0.5 * (dx0 + dx1), 0.5 * (dy0 + dy1)
-            dxe = _getdx(x[i], yin[i], x[ip1], yin[ip1], 1)
-            dye = _getdy(x[i], yin[i], x[ip1], yin[ip1], 1)
+            xc = 0.5 * (dxs[:, i] + dxs[:, ip1])
+            yc = 0.5 * (dys[:, i] + dys[:, ip1])
+            dxe = _getdx_vec(x[:, i], yin[:, i], x[:, ip1], yin[:, ip1], 1)
+            dye = _getdy_vec(x[:, i], yin[:, i], x[:, ip1], yin[:, ip1], 1)
             dsx, dsy = dye, -dxe
             xds = xc * dsx + yc * dsy
             area += 0.5 * xds
             xcg += xds * xc
             ycg += xds * yc
-        if abs(area) < 1e-8:
-            face_x[f], face_y[f] = xin.mean(), yin.mean()
-            continue
-        area = np.sign(area) * max(abs(area), 1e-8)
-        fac = 1.0 / (3.0 * area)
-        xcg *= fac
-        ycg *= fac
-        face_y[f] = y0 + ycg / EARTH_RADIUS_DEG2RAD
-        face_x[f] = x0 + xcg / (EARTH_RADIUS_DEG2RAD * np.cos(face_y[f] * DEG2RAD))
+        degenerate = np.abs(area) < 1e-8
+        area_safe = np.where(
+            degenerate, 1.0, np.sign(area) * np.maximum(np.abs(area), 1e-8)
+        )
+        fac = 1.0 / (3.0 * area_safe)
+        fy = y0 + (ycg * fac) / EARTH_RADIUS_DEG2RAD
+        fx = x0 + (xcg * fac) / (EARTH_RADIUS_DEG2RAD * np.cos(fy * DEG2RAD))
+        face_x[faces] = np.where(degenerate, np.mean(xin, axis=1), fx)
+        face_y[faces] = np.where(degenerate, np.mean(yin, axis=1), fy)
     return face_x, face_y
 
 
@@ -197,6 +219,17 @@ def _cart3dtospher(xx: float, yy: float, zz: float, xref_deg: float) -> Tuple[fl
     y1 = np.arctan2(zz, np.sqrt(xx * xx + yy * yy)) * raddeg
     x1 = x1 + np.round((xref_deg - x1) / 360.0) * 360.0
     return float(x1), float(y1)
+
+
+def _cart3dtospher_vec(
+    xx: np.ndarray, yy: np.ndarray, zz: np.ndarray, xref_deg: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Vectorized `_cart3dtospher`: all args (N,) -> (lon_deg, lat_deg)."""
+    raddeg = 180.0 / np.pi
+    x1 = np.arctan2(yy, xx) * raddeg
+    y1 = np.arctan2(zz, np.sqrt(xx * xx + yy * yy)) * raddeg
+    x1 = x1 + np.round((xref_deg - x1) / 360.0) * 360.0
+    return x1, y1
 
 
 def _getdx(x1: float, y1: float, x2: float, y2: float, jsferic: int = 1) -> float:
@@ -231,11 +264,10 @@ def _lonlat_to_local_xy(node_x: np.ndarray, node_y: np.ndarray) -> Tuple[np.ndar
     node_y = np.asarray(node_y, dtype=np.float64)
     x0 = float(np.nanmean(node_x))
     y0 = float(np.nanmean(node_y))
-    dx = np.empty_like(node_x)
-    dy = np.empty_like(node_y)
-    for i in range(node_x.size):
-        dx[i] = _getdx(x0, y0, node_x[i], node_y[i], 1)
-        dy[i] = _getdy(x0, y0, node_x[i], node_y[i], 1)
+    x0_arr = np.full_like(node_x, x0)
+    y0_arr = np.full_like(node_y, y0)
+    dx = _getdx_vec(x0_arr, y0_arr, node_x, node_y, 1)
+    dy = _getdy_vec(x0_arr, y0_arr, node_x, node_y, 1)
     vert_xy = np.column_stack([dx, dy])
     return vert_xy, x0, y0
 
@@ -319,46 +351,136 @@ def _segments_crossing_ratio_intersection_lonlat(
     return (float(ratio_first), np.asarray(inter, dtype=np.float64))
 
 
-def _circumcenters_lonlat_chunk(
-    vert_deg: np.ndarray,
-    face_nodes: np.ndarray,
+def _point_in_triangle_winding_lonlat_vec(
+    px: np.ndarray,
+    py: np.ndarray,
+    v0: np.ndarray,
+    v1: np.ndarray,
+    v2: np.ndarray,
+) -> np.ndarray:
+    """Vectorized `_point_in_triangle_winding_lonlat`: (F,) points vs (F,2) vertices."""
+    tol = 1e-12
+    winding = np.zeros(px.shape[0], dtype=np.int64)
+    on_edge = np.zeros(px.shape[0], dtype=bool)
+    for va, vb in ((v0, v1), (v1, v2), (v2, v0)):
+        cp = (vb[:, 0] - va[:, 0]) * (py - va[:, 1]) - (vb[:, 1] - va[:, 1]) * (
+            px - va[:, 0]
+        )
+        on_edge |= np.abs(cp) <= tol
+        up = va[:, 1] <= py
+        winding += (up & (vb[:, 1] > py) & (cp > 0)).astype(np.int64)
+        winding -= (~up & (vb[:, 1] <= py) & (cp < 0)).astype(np.int64)
+    return on_edge | (winding != 0)
+
+
+def _circumcenters_lonlat_compact(
+    v0: np.ndarray,
+    v1: np.ndarray,
+    v2: np.ndarray,
     num_interior: np.ndarray,
-    face_indices: np.ndarray,
 ) -> np.ndarray:
     """
-    Worker for parallel circumcenters: compute for faces in face_indices only.
-    Returns array of shape (len(face_indices), 2). Used at init when nface is large.
+    Circumcenters in lon/lat for triangles given by vertex coordinates
+    (each (F, 2), all valid). Faces with num_interior == 0 (boundary) use the
+    mass center; circumcenters outside their triangle are pulled inside.
+    Returns (F, 2).
     """
-    tria = face_nodes[:, :3]
-    out_chunk = np.zeros((len(face_indices), 2), dtype=np.float64)
-    for pos, t_idx in enumerate(face_indices):
-        i0, i1, i2 = tria[t_idx, 0], tria[t_idx, 1], tria[t_idx, 2]
-        if i0 < 0 or i1 < 0 or i2 < 0:
-            out_chunk[pos] = np.nan
-            continue
-        v0 = vert_deg[int(i0)]
-        v1 = vert_deg[int(i1)]
-        v2 = vert_deg[int(i2)]
-        if num_interior[t_idx] == 0:
-            out_chunk[pos] = np.mean([v0, v1, v2], axis=0)
-            continue
-        circum = _circumcenter_of_triangle_lonlat(v0, v1, v2)
-        mass = np.mean([v0, v1, v2], axis=0)
-        if _point_in_triangle_winding_lonlat(circum, v0, v1, v2):
-            out_chunk[pos] = circum
-            continue
+    out = np.empty((v0.shape[0], 2), dtype=np.float64)
+    mass = (v0 + v1 + v2) / 3.0
+
+    boundary = num_interior == 0
+    out[boundary] = mass[boundary]
+
+    keep = np.where(~boundary)[0]
+    if keep.size == 0:
+        return out
+    v0, v1, v2, mass = v0[keep], v1[keep], v2[keep], mass[keep]
+
+    # Vectorized `_circumcenter_of_triangle_lonlat`.
+    x1, y1 = v0[:, 0], v0[:, 1]
+    dx2 = _getdx_vec(x1, y1, v1[:, 0], v1[:, 1], 1)
+    dy2 = _getdy_vec(x1, y1, v1[:, 0], v1[:, 1], 1)
+    dx3 = _getdx_vec(x1, y1, v2[:, 0], v2[:, 1], 1)
+    dy3 = _getdy_vec(x1, y1, v2[:, 0], v2[:, 1], 1)
+    den = dy2 * dx3 - dy3 * dx2
+    den_ok = np.abs(den) > 1e-20
+    z = np.where(
+        den_ok,
+        (dx2 * (dx2 - dx3) + dy2 * (dy2 - dy3)) / np.where(den_ok, den, 1.0),
+        0.0,
+    )
+    phi = (y1 + v1[:, 1] + v2[:, 1]) / 3.0
+    xf = 1.0 / np.cos(phi * DEG2RAD)
+    circum = np.column_stack(
+        [
+            x1 + xf * 0.5 * (dx3 - z * dy3) * RAD2DEG / EARTH_RADIUS,
+            y1 + 0.5 * (dy3 + z * dx3) * RAD2DEG / EARTH_RADIUS,
+        ]
+    )
+
+    inside = _point_in_triangle_winding_lonlat_vec(
+        circum[:, 0], circum[:, 1], v0, v1, v2
+    )
+    out[keep[inside]] = circum[inside]
+
+    # Pull-inside for circumcenters outside their triangle: first crossing of
+    # the mass-center -> circumcenter segment with a triangle edge wins (as
+    # `_segments_crossing_ratio_intersection_lonlat`), else the mass center.
+    o = np.where(~inside)[0]
+    if o.size > 0:
+        p1 = mass[o]
+        p2 = circum[o]
+        x21 = _getdx_vec(p1[:, 0], p1[:, 1], p2[:, 0], p2[:, 1], 1)
+        y21 = _getdy_vec(p1[:, 0], p1[:, 1], p2[:, 0], p2[:, 1], 1)
+        vs = (v0[o], v1[o], v2[o])
+        result = p1.copy()
+        found = np.zeros(o.size, dtype=bool)
         for n in range(3):
-            next_n = (n + 1) % 3
-            va = vert_deg[tria[t_idx, n]]
-            vb = vert_deg[tria[t_idx, next_n]]
-            hit = _segments_crossing_ratio_intersection_lonlat(mass, circum, va, vb)
-            if hit is not None:
-                _, inter = hit
-                out_chunk[pos] = inter
-                break
-        else:
-            out_chunk[pos] = mass
-    return out_chunk
+            p3 = vs[n]
+            p4 = vs[(n + 1) % 3]
+            x43 = _getdx_vec(p3[:, 0], p3[:, 1], p4[:, 0], p4[:, 1], 1)
+            y43 = _getdy_vec(p3[:, 0], p3[:, 1], p4[:, 0], p4[:, 1], 1)
+            x31 = _getdx_vec(p1[:, 0], p1[:, 1], p3[:, 0], p3[:, 1], 1)
+            y31 = _getdy_vec(p1[:, 0], p1[:, 1], p3[:, 0], p3[:, 1], 1)
+            det = x43 * y21 - y43 * x21
+            max_val = np.maximum.reduce(
+                [np.abs(x21), np.abs(y21), np.abs(x43), np.abs(y43)]
+            )
+            max_val = np.maximum(max_val, 1e-30)
+            hit = np.abs(det) >= np.maximum(1e-10 * max_val, 1e-15)
+            det_safe = np.where(hit, det, 1.0)
+            ratio_second = (y31 * x21 - x31 * y21) / det_safe
+            ratio_first = (y31 * x43 - x31 * y43) / det_safe
+            hit &= (
+                (0.0 <= ratio_first)
+                & (ratio_first <= 1.0)
+                & (0.0 <= ratio_second)
+                & (ratio_second <= 1.0)
+            )
+            take = hit & ~found
+            if np.any(take):
+                inter = p1 + ratio_first[:, None] * (p2 - p1)
+                result[take] = inter[take]
+                found |= take
+        out[keep[o]] = result
+
+    return out
+
+
+def _num_interior_edges_per_face(edge_faces: np.ndarray, nface: int) -> np.ndarray:
+    """Number of interior edges (edge with two distinct valid faces) per face."""
+    interior = (
+        (edge_faces[:, 0] >= 0)
+        & (edge_faces[:, 1] >= 0)
+        & (edge_faces[:, 0] != edge_faces[:, 1])
+    )
+    counts = np.bincount(
+        np.concatenate(
+            [edge_faces[interior, 0], edge_faces[interior, 1]]
+        ).astype(np.intp),
+        minlength=nface,
+    )
+    return counts.astype(np.int32)
 
 
 def _circumcenters_lonlat_ugrid(
@@ -371,76 +493,29 @@ def _circumcenters_lonlat_ugrid(
     Circumcenters in lon/lat per face (UGRID). Boundary faces use mass center.
     numberOfInteriorEdges is derived from edge_faces.
     If face_mask is provided, only compute for faces where face_mask is True (faster for zones).
-    For full-mesh (face_mask is None) with many faces, uses parallel chunks to speed up init.
     """
     nface = face_nodes.shape[0]
-    n_edges = edge_faces.shape[0]
-    # Number of interior edges per face (edge with two valid faces)
-    num_interior = np.zeros(nface, dtype=np.int32)
-    for e in range(n_edges):
-        f1, f2 = edge_faces[e, 0], edge_faces[e, 1]
-        if f1 >= 0 and f2 >= 0 and f1 != f2:
-            num_interior[int(f1)] += 1
-            num_interior[int(f2)] += 1
+    num_interior = _num_interior_edges_per_face(edge_faces, nface)
 
     out = np.full((nface, 2), np.nan, dtype=np.float64) if face_mask is not None else np.zeros((nface, 2), dtype=np.float64)
     tria = face_nodes[:, :3]
     indices_to_compute = np.where(face_mask)[0] if face_mask is not None else np.arange(nface, dtype=np.int64)
-
-    # Parallel path for full-mesh init when many faces (avoids long single-thread loop)
-    use_parallel = (
-        face_mask is None
-        and nface >= CIRCUM_PARALLEL_MIN_FACES
-        and len(indices_to_compute) >= CIRCUM_PARALLEL_MIN_FACES
-    )
-    if use_parallel:
-        n_workers = min(8, max(1, (os.cpu_count() or 4) - 1))
-        chunks = np.array_split(indices_to_compute, n_workers)
-        chunks = [c for c in chunks if c.size > 0]
-        if len(chunks) <= 1:
-            use_parallel = False
-    if use_parallel:
-        with ProcessPoolExecutor(max_workers=len(chunks)) as executor:
-            futures = [
-                executor.submit(_circumcenters_lonlat_chunk, vert_deg, face_nodes, num_interior, chunk)
-                for chunk in chunks
-            ]
-            for chunk, fut in zip(chunks, futures):
-                out[chunk] = fut.result()
+    if indices_to_compute.size == 0:
         return out
 
-    for t_idx in indices_to_compute:
-        i0, i1, i2 = tria[t_idx, 0], tria[t_idx, 1], tria[t_idx, 2]
-        if i0 < 0 or i1 < 0 or i2 < 0:
-            out[t_idx] = np.nan
-            continue
-        v0 = vert_deg[int(i0)]
-        v1 = vert_deg[int(i1)]
-        v2 = vert_deg[int(i2)]
+    t_nodes = tria[indices_to_compute]
+    invalid = np.any(t_nodes < 0, axis=1)
+    out[indices_to_compute[invalid]] = np.nan
 
-        if num_interior[t_idx] == 0:
-            out[t_idx] = np.mean([v0, v1, v2], axis=0)
-            continue
-
-        circum = _circumcenter_of_triangle_lonlat(v0, v1, v2)
-        mass = np.mean([v0, v1, v2], axis=0)
-
-        if _point_in_triangle_winding_lonlat(circum, v0, v1, v2):
-            out[t_idx] = circum
-            continue
-
-        for n in range(3):
-            next_n = (n + 1) % 3
-            va = vert_deg[tria[t_idx, n]]
-            vb = vert_deg[tria[t_idx, next_n]]
-            hit = _segments_crossing_ratio_intersection_lonlat(mass, circum, va, vb)
-            if hit is not None:
-                _, inter = hit
-                out[t_idx] = inter
-                break
-        else:
-            out[t_idx] = mass
-
+    faces = indices_to_compute[~invalid]
+    if faces.size == 0:
+        return out
+    out[faces] = _circumcenters_lonlat_compact(
+        vert_deg[tria[faces, 0]],
+        vert_deg[tria[faces, 1]],
+        vert_deg[tria[faces, 2]],
+        num_interior[faces],
+    )
     return out
 
 
@@ -465,54 +540,78 @@ def compute_small_links_from_arrays(
     if nface == 0 or n_edges == 0:
         return 0, np.array([], dtype=np.int64)
 
-    vert_deg = np.column_stack([node_x, node_y])
-    vert_xy, _x0, _y0 = _lonlat_to_local_xy(node_x, node_y)
+    no_small = (0, np.array([], dtype=np.int64))
     edges_to_test = (
         np.asarray(edge_indices, dtype=np.int64).ravel()
         if edge_indices is not None
         else np.arange(n_edges, dtype=np.int64)
     )
-    # When testing only a subset of edges, compute circumcenters only for adjacent faces (big speedup)
-    face_mask = None
-    if edge_indices is not None and edges_to_test.size > 0:
-        face_mask = np.zeros(nface, dtype=bool)
-        for e in edges_to_test:
-            if e < 0 or e >= n_edges:
-                continue
-            f1, f2 = edge_faces[e, 0], edge_faces[e, 1]
-            if f1 >= 0:
-                face_mask[int(f1)] = True
-            if f2 >= 0:
-                face_mask[int(f2)] = True
-    circum_ll = _circumcenters_lonlat_ugrid(vert_deg, face_nodes, edge_faces, face_mask=face_mask)
+    ee = edges_to_test[(edges_to_test >= 0) & (edges_to_test < n_edges)]
+    if ee.size == 0:
+        return no_small
+    f1 = edge_faces[ee, 0].astype(np.int64)
+    f2 = edge_faces[ee, 1].astype(np.int64)
+    ok = (f1 >= 0) & (f2 >= 0) & (f1 != f2) & (f1 < nface) & (f2 < nface)
+    if not np.any(ok):
+        return no_small
 
+    # Work only on the faces adjacent to the tested edges (big speedup when
+    # testing a small subset).
     tria = face_nodes[:, :3]
-    valid_tria = (tria[:, 0] >= 0) & (tria[:, 1] >= 0) & (tria[:, 2] >= 0)
-    ba = np.zeros(nface, dtype=np.float64)
-    ba[valid_tria] = np.abs(_triarea_2d(vert_xy, tria[valid_tria]))
-    small_edges: List[int] = []
-    for e in edges_to_test:
-        if e < 0 or e >= n_edges:
-            continue
-        f1, f2 = edge_faces[e, 0], edge_faces[e, 1]
-        if f1 < 0 or f2 < 0 or f1 == f2:
-            continue
-        f1, f2 = int(f1), int(f2)
-        if f1 >= nface or f2 >= nface or not valid_tria[f1] or not valid_tria[f2]:
-            continue
-        c1, c2 = circum_ll[f1], circum_ll[f2]
-        if np.any(np.isnan(c1)) or np.any(np.isnan(c2)):
-            continue
-        dx = _getdx(c1[0], c1[1], c2[0], c2[1], 1)
-        dy = _getdy(c1[0], c1[1], c2[0], c2[1], 1)
-        dxlink = np.sqrt(dx * dx + dy * dy)
-        sqrt_ba1 = np.sqrt(max(ba[f1], 1e-20))
-        sqrt_ba2 = np.sqrt(max(ba[f2], 1e-20))
-        dxlim = 0.9 * removesmalllinkstrsh * 0.5 * (sqrt_ba1 + sqrt_ba2)
-        if dxlink < dxlim:
-            small_edges.append(e)
+    cand = np.unique(np.concatenate([f1[ok], f2[ok]]))
+    valid_cand = (tria[cand] >= 0).all(axis=1)
+    rows = np.where(ok)[0]
+    g1 = np.searchsorted(cand, f1[rows])
+    g2 = np.searchsorted(cand, f2[rows])
+    keep = valid_cand[g1] & valid_cand[g2]
+    rows = rows[keep]
+    if rows.size == 0:
+        return no_small
 
-    return len(small_edges), np.array(small_edges, dtype=np.int64)
+    faces_needed = cand[valid_cand]
+    pos_in_needed = np.cumsum(valid_cand) - 1
+    g1 = pos_in_needed[g1[keep]]
+    g2 = pos_in_needed[g2[keep]]
+
+    # Circumcenters (lon/lat) of the needed faces.
+    num_interior = _num_interior_edges_per_face(edge_faces, nface)
+    t0, t1, t2 = tria[faces_needed, 0], tria[faces_needed, 1], tria[faces_needed, 2]
+    circ = _circumcenters_lonlat_compact(
+        np.column_stack([node_x[t0], node_y[t0]]),
+        np.column_stack([node_x[t1], node_y[t1]]),
+        np.column_stack([node_x[t2], node_y[t2]]),
+        num_interior[faces_needed],
+    )
+
+    # Face areas in local planar coordinates (as `_lonlat_to_local_xy` +
+    # `_triarea_2d`, computed only for the nodes of the needed faces; the
+    # reference point stays the full-mesh mean).
+    x0 = float(np.nanmean(node_x))
+    y0 = float(np.nanmean(node_y))
+    nodes_used = np.unique(np.concatenate([t0, t1, t2]))
+    x0a = np.full(nodes_used.size, x0)
+    y0a = np.full(nodes_used.size, y0)
+    ux = _getdx_vec(x0a, y0a, node_x[nodes_used], node_y[nodes_used], 1)
+    uy = _getdy_vec(x0a, y0a, node_x[nodes_used], node_y[nodes_used], 1)
+    q0 = np.searchsorted(nodes_used, t0)
+    q1 = np.searchsorted(nodes_used, t1)
+    q2 = np.searchsorted(nodes_used, t2)
+    ev12x, ev12y = ux[q1] - ux[q0], uy[q1] - uy[q0]
+    ev13x, ev13y = ux[q2] - ux[q0], uy[q2] - uy[q0]
+    ba = np.abs(0.5 * (ev12x * ev13y - ev12y * ev13x))
+
+    c1 = circ[g1]
+    c2 = circ[g2]
+    good = ~np.any(np.isnan(c1), axis=1) & ~np.any(np.isnan(c2), axis=1)
+    dx = _getdx_vec(c1[:, 0], c1[:, 1], c2[:, 0], c2[:, 1], 1)
+    dy = _getdy_vec(c1[:, 0], c1[:, 1], c2[:, 0], c2[:, 1], 1)
+    dxlink = np.sqrt(dx * dx + dy * dy)
+    sqrt_ba1 = np.sqrt(np.maximum(ba[g1], 1e-20))
+    sqrt_ba2 = np.sqrt(np.maximum(ba[g2], 1e-20))
+    dxlim = 0.9 * removesmalllinkstrsh * 0.5 * (sqrt_ba1 + sqrt_ba2)
+    small_edges = ee[rows[good & (dxlink < dxlim)]]
+
+    return int(small_edges.size), small_edges.astype(np.int64)
 
 
 def _signed_area_tri_deg(node_x: np.ndarray, node_y: np.ndarray, i: int, j: int, k: int) -> float:
@@ -777,6 +876,170 @@ def _circumcenter3d(xv: np.ndarray, yv: np.ndarray) -> Tuple[float, float]:
     return _cart3dtospher(xxc, yyc, zzc, float(np.max(xv)))
 
 
+def _circumcenters3d_batch(xv: np.ndarray, yv: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Batched `_circumcenter3d` for faces with an equal node count.
+    xv, yv: (F, N) in deg -> (xz, yz), each (F,) in deg.
+
+    Runs the same constrained Newton iteration as the scalar version, with a
+    per-face active mask so each face performs the identical update sequence.
+    """
+    F, N = xv.shape
+    if F == 0:
+        return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
+    if N < 2:
+        return xv[:, 0].astype(np.float64), yv[:, 0].astype(np.float64)
+    xx = _sphertocart3d_vec(xv.ravel(), yv.ravel()).reshape(F, N, 3)
+    xxc = np.mean(xx[:, :, 0], axis=1)
+    yyc = np.mean(xx[:, :, 1], axis=1)
+    zzc = np.mean(xx[:, :, 2], axis=1)
+    dtol, deps, maxiter = 1e-8, 1e-8, 100
+    ip1 = (np.arange(N) + 1) % N
+    ttx = xx[:, ip1, 0] - xx[:, :, 0]
+    tty = xx[:, ip1, 1] - xx[:, :, 1]
+    ttz = xx[:, ip1, 2] - xx[:, :, 2]
+    ds = np.sqrt(ttx * ttx + tty * tty + ttz * ttz)
+    valid = ds >= dtol
+    dsi = np.where(valid, 1.0 / np.where(valid, ds, 1.0), 0.0)
+    ttx = ttx * dsi
+    tty = tty * dsi
+    ttz = ttz * dsi
+    xxe = 0.5 * (xx[:, :, 0] + xx[:, ip1, 0])
+    yye = 0.5 * (xx[:, :, 1] + xx[:, ip1, 1])
+    zze = 0.5 * (xx[:, :, 2] + xx[:, ip1, 2])
+    # The A-matrix tangent terms are invariant across Newton iterations:
+    # sequential accumulation over nodes, same summation order as the scalar
+    # loop (invalid edges have tt == 0, so their terms are 0).
+    a00_full = np.zeros(F)
+    a01_full = np.zeros(F)
+    a02_full = np.zeros(F)
+    a11_full = np.zeros(F)
+    a12_full = np.zeros(F)
+    a22_full = np.zeros(F)
+    for i in range(N):
+        a00_full += ttx[:, i] * ttx[:, i]
+        a01_full += ttx[:, i] * tty[:, i]
+        a02_full += ttx[:, i] * ttz[:, i]
+        a11_full += tty[:, i] * tty[:, i]
+        a12_full += tty[:, i] * ttz[:, i]
+        a22_full += ttz[:, i] * ttz[:, i]
+
+    lam = np.zeros(F, dtype=np.float64)
+    active = np.ones(F, dtype=bool)
+    # For small batches, gathering the active lanes costs more than computing
+    # discarded updates for converged ones; updates are masked either way.
+    gather = F >= 64
+    for _ in range(maxiter):
+        if not np.any(active):
+            break
+        if gather:
+            act = np.where(active)[0]
+            tx, ty, tz = ttx[act], tty[act], ttz[act]
+            xe, ye, ze = xxe[act], yye[act], zze[act]
+            cx, cy, cz = xxc[act], yyc[act], zzc[act]
+            lam_a = lam[act]
+            a00, a01, a02 = a00_full[act], a01_full[act], a02_full[act]
+            a11, a12, a22 = a11_full[act], a12_full[act], a22_full[act]
+        else:
+            act = None
+            tx, ty, tz = ttx, tty, ttz
+            xe, ye, ze = xxe, yye, zze
+            cx, cy, cz = xxc, yyc, zzc
+            lam_a = lam
+            a00, a01, a02 = a00_full, a01_full, a02_full
+            a11, a12, a22 = a11_full, a12_full, a22_full
+        na = cx.shape[0]
+        r0 = np.zeros(na)
+        r1 = np.zeros(na)
+        r2 = np.zeros(na)
+        for i in range(N):
+            dinpr = (
+                (cx - xe[:, i]) * tx[:, i]
+                + (cy - ye[:, i]) * ty[:, i]
+                + (cz - ze[:, i]) * tz[:, i]
+            )
+            r0 -= dinpr * tx[:, i]
+            r1 -= dinpr * ty[:, i]
+            r2 -= dinpr * tz[:, i]
+        A = np.zeros((na, 4, 4))
+        A[:, 0, 0] = a00 - 2 * lam_a
+        A[:, 1, 1] = a11 - 2 * lam_a
+        A[:, 2, 2] = a22 - 2 * lam_a
+        A[:, 0, 1] = A[:, 1, 0] = a01
+        A[:, 0, 2] = A[:, 2, 0] = a02
+        A[:, 1, 2] = A[:, 2, 1] = a12
+        A[:, 0, 3] = A[:, 3, 0] = -2 * cx
+        A[:, 1, 3] = A[:, 3, 1] = -2 * cy
+        A[:, 2, 3] = A[:, 3, 2] = -2 * cz
+        rhs = np.empty((na, 4))
+        rhs[:, 0] = r0 + 2 * lam_a * cx
+        rhs[:, 1] = r1 + 2 * lam_a * cy
+        rhs[:, 2] = r2 + 2 * lam_a * cz
+        rhs[:, 3] = cx * cx + cy * cy + cz * cz - EARTH_RADIUS_SQ
+        solved = np.ones(na, dtype=bool)
+        try:
+            sol = np.linalg.solve(A, rhs[:, :, None])[:, :, 0]
+        except np.linalg.LinAlgError:
+            # Some face has a singular system: solve per face; a singular face
+            # stops iterating with its current center (as in the scalar code).
+            sol = np.zeros((na, 4))
+            for j in range(na):
+                try:
+                    sol[j] = np.linalg.solve(A[j], rhs[j])
+                except np.linalg.LinAlgError:
+                    solved[j] = False
+        conv = sol[:, 0] ** 2 + sol[:, 1] ** 2 + sol[:, 2] ** 2 < deps
+        if act is not None:
+            upd = act[solved]
+            xxc[upd] += sol[solved, 0]
+            yyc[upd] += sol[solved, 1]
+            zzc[upd] += sol[solved, 2]
+            lam[upd] += sol[solved, 3]
+            active[act[~solved]] = False
+            active[act[solved & conv]] = False
+        else:
+            upd = active & solved
+            xxc = np.where(upd, xxc + sol[:, 0], xxc)
+            yyc = np.where(upd, yyc + sol[:, 1], yyc)
+            zzc = np.where(upd, zzc + sol[:, 2], zzc)
+            lam = np.where(upd, lam + sol[:, 3], lam)
+            active &= solved & ~conv
+    return _cart3dtospher_vec(xxc, yyc, zzc, np.max(xv, axis=1))
+
+
+def _point_in_polygon_vec(
+    px: np.ndarray,
+    py: np.ndarray,
+    xv: np.ndarray,
+    yv: np.ndarray,
+    x0: np.ndarray,
+    y0: np.ndarray,
+) -> np.ndarray:
+    """Vectorized `_point_in_polygon`: (F,) points vs (F, N) polygons."""
+    F, N = xv.shape
+    if N < 3:
+        return np.zeros(F, dtype=bool)
+    dxp = _getdx_vec(x0, y0, px, py, 1)
+    dyp = _getdy_vec(x0, y0, px, py, 1)
+    dxs = np.empty_like(xv)
+    dys = np.empty_like(yv)
+    for i in range(N):
+        dxs[:, i] = _getdx_vec(x0, y0, xv[:, i], yv[:, i], 1)
+        dys[:, i] = _getdy_vec(x0, y0, xv[:, i], yv[:, i], 1)
+    count = np.zeros(F, dtype=np.int64)
+    for i in range(N):
+        ip1 = (i + 1) % N
+        dy_i = dys[:, i]
+        dy_ip1 = dys[:, ip1]
+        crosses = ((dy_i <= dyp) & (dyp < dy_ip1)) | ((dy_ip1 <= dyp) & (dyp < dy_i))
+        crosses &= np.abs(dy_ip1 - dy_i) >= 1e-12
+        denom = np.where(crosses, dy_ip1 - dy_i, 1.0)
+        t = (dyp - dy_i) / denom
+        x_cross = dxs[:, i] + t * (dxs[:, ip1] - dxs[:, i])
+        count += (crosses & (x_cross > dxp)).astype(np.int64)
+    return (count % 2) == 1
+
+
 def _face_centers_circumcenter3d(
     node_x: np.ndarray,
     node_y: np.ndarray,
@@ -794,61 +1057,93 @@ def _face_centers_circumcenter3d(
     if face_mask is not None:
         face_x = np.full(n_faces, np.nan, dtype=np.float64)
         face_y = np.full(n_faces, np.nan, dtype=np.float64)
+        faces_to_do = np.where(face_mask)[0]
     else:
         face_x = np.zeros(n_faces, dtype=np.float64)
         face_y = np.zeros(n_faces, dtype=np.float64)
-    for f in range(n_faces):
-        if face_mask is not None and not face_mask[f]:
+        faces_to_do = np.arange(n_faces)
+    if faces_to_do.size == 0:
+        return face_x, face_y
+    counts = np.sum(face_nodes[faces_to_do, :] > 0, axis=1)
+
+    for n in np.unique(counts):
+        faces = faces_to_do[counts == n]
+        if n == 0:
+            face_x[faces] = mass_x[faces]
+            face_y[faces] = mass_y[faces]
             continue
-        nodes = face_nodes[f, :]
-        nodes = nodes[nodes > 0]
-        if nodes.size < 2:
-            if nodes.size == 1:
-                i = int(nodes[0]) - 1
-                face_x[f], face_y[f] = node_x[i], node_y[i]
-            else:
-                face_x[f], face_y[f] = mass_x[f], mass_y[f]
+        if n == 1:
+            xv1, yv1 = _gather_face_node_coords(node_x, node_y, face_nodes, faces, 1)
+            face_x[faces] = xv1[:, 0]
+            face_y[faces] = yv1[:, 0]
             continue
-        idx = (nodes - 1).astype(np.intp)
-        xv = node_x[idx].astype(np.float64)
-        yv = node_y[idx].astype(np.float64)
-        xz, yz = _circumcenter3d(xv, yv)
-        if len(xv) == 3:
-            iv = ih = -1
+        n = int(n)
+        xv, yv = _gather_face_node_coords(node_x, node_y, face_nodes, faces, n)
+        xz, yz = _circumcenters3d_batch(xv, yv)
+        if n == 3:
+            # Axis-aligned right triangles: use the circumcenter of the
+            # bounding rectangle (as in Delft).
+            has_v = np.zeros(faces.size, dtype=bool)
+            has_h = np.zeros(faces.size, dtype=bool)
             for k in range(3):
                 k2 = (k + 1) % 3
-                if abs(xv[k] - xv[k2]) < 1e-10:
-                    iv = k
-                if abs(yv[k] - yv[k2]) < 1e-10:
-                    ih = k
-            if iv >= 0 and ih >= 0:
-                xh = np.array([xv.min(), xv.max(), xv.max(), xv.min()])
-                yh = np.array([yv.min(), yv.min(), yv.max(), yv.max()])
-                xz, yz = _circumcenter3d(xh, yh)
+                has_v |= np.abs(xv[:, k] - xv[:, k2]) < 1e-10
+                has_h |= np.abs(yv[:, k] - yv[:, k2]) < 1e-10
+            rect = has_v & has_h
+            if np.any(rect):
+                xmin = xv[rect].min(axis=1)
+                xmax = xv[rect].max(axis=1)
+                ymin = yv[rect].min(axis=1)
+                ymax = yv[rect].max(axis=1)
+                xh = np.column_stack([xmin, xmax, xmax, xmin])
+                yh = np.column_stack([ymin, ymin, ymax, ymax])
+                xz[rect], yz[rect] = _circumcenters3d_batch(xh, yh)
         if 0 <= dcenterinside <= 1:
-            x0, y0 = float(np.min(xv)), float(yv[np.argmin(np.abs(yv))])
-            if not _point_in_polygon(xz, yz, xv, yv, x0, y0):
-                best_t, xcr, ycr = 2.0, xz, yz
-                for i in range(len(xv)):
-                    ip1 = (i + 1) % len(xv)
-                    hit = _segment_edge_intersect(
-                        mass_x[f],
-                        mass_y[f],
-                        xz,
-                        yz,
-                        xv[i],
-                        yv[i],
-                        xv[ip1],
-                        yv[ip1],
-                        x0,
-                        y0,
+            x0 = np.min(xv, axis=1)
+            y0 = yv[np.arange(faces.size), np.argmin(np.abs(yv), axis=1)]
+            inside = _point_in_polygon_vec(xz, yz, xv, yv, x0, y0)
+            # Pull-inside for the centers outside their face: intersect the
+            # mass-center -> circumcenter segment with each face edge and keep
+            # the crossing with the smallest ratio (as `_segment_edge_intersect`).
+            out = np.where(~inside)[0]
+            if out.size > 0:
+                x0o, y0o = x0[out], y0[out]
+                dx1 = _getdx_vec(x0o, y0o, mass_x[faces[out]], mass_y[faces[out]], 1)
+                dy1 = _getdy_vec(x0o, y0o, mass_x[faces[out]], mass_y[faces[out]], 1)
+                dx2 = _getdx_vec(x0o, y0o, xz[out], yz[out], 1)
+                dy2 = _getdy_vec(x0o, y0o, xz[out], yz[out], 1)
+                dxs = np.empty((out.size, n))
+                dys = np.empty((out.size, n))
+                for i in range(n):
+                    dxs[:, i] = _getdx_vec(x0o, y0o, xv[out, i], yv[out, i], 1)
+                    dys[:, i] = _getdy_vec(x0o, y0o, xv[out, i], yv[out, i], 1)
+                best_t = np.full(out.size, 2.0)
+                xcr = xz[out].copy()
+                ycr = yz[out].copy()
+                for i in range(n):
+                    ip1 = (i + 1) % n
+                    dxa, dya = dxs[:, i], dys[:, i]
+                    dxb, dyb = dxs[:, ip1], dys[:, ip1]
+                    den = (dx2 - dx1) * (dyb - dya) - (dy2 - dy1) * (dxb - dxa)
+                    hit = np.abs(den) >= 1e-15
+                    den_safe = np.where(hit, den, 1.0)
+                    t = ((dxa - dx1) * (dyb - dya) - (dya - dy1) * (dxb - dxa)) / den_safe
+                    s = ((dxa - dx1) * (dy2 - dy1) - (dya - dy1) * (dx2 - dx1)) / den_safe
+                    hit &= (0 <= t) & (t <= 1) & (0 <= s) & (s <= 1)
+                    xcr_l = dx1 + t * (dx2 - dx1)
+                    ycr_l = dy1 + t * (dy2 - dy1)
+                    ycr_deg = y0o + ycr_l / EARTH_RADIUS_DEG2RAD
+                    xcr_deg = x0o + xcr_l / (
+                        EARTH_RADIUS_DEG2RAD * np.cos(ycr_deg * DEG2RAD)
                     )
-                    if hit is not None:
-                        xcr_i, ycr_i, t = hit
-                        if t < best_t:
-                            best_t, xcr, ycr = t, xcr_i, ycr_i
-                xz, yz = xcr, ycr
-        face_x[f], face_y[f] = xz, yz
+                    upd = hit & (t < best_t)
+                    best_t = np.where(upd, t, best_t)
+                    xcr = np.where(upd, xcr_deg, xcr)
+                    ycr = np.where(upd, ycr_deg, ycr)
+                xz[out] = xcr
+                yz[out] = ycr
+        face_x[faces] = xz
+        face_y[faces] = yz
     return face_x, face_y
 
 
@@ -969,6 +1264,20 @@ def compute_cosphi_abs_from_arrays(
         raise ValueError(
             "use_file_centers=True is not supported in this in-memory variant."
         )
+    if edge_indices is not None and edge_faces is not None:
+        # Fast path: compute face centers/cosphi only for the requested edges
+        # (0-based throughout; same formulas as the full path).
+        cosphi_abs = _cosphi_abs_for_edges(
+            node_x,
+            node_y,
+            face_nodes,
+            edge_nodes,
+            edge_faces,
+            edge_indices,
+            use_circumcenter_3d=use_circumcenter_3d,
+        )
+        return _to_1b(edge_nodes), _to_1b(edge_faces), cosphi_abs
+
     # Convert to 1-based for orthogonality helpers (unchanged formulas)
     face_nodes = _to_1b(face_nodes)
     edge_nodes = _to_1b(edge_nodes)
@@ -1059,6 +1368,74 @@ def compute_cosphi_abs_from_arrays(
     return edge_nodes, edge_faces, cosphi_abs
 
 
+def _cosphi_abs_for_edges(
+    node_x: np.ndarray,
+    node_y: np.ndarray,
+    face_nodes: np.ndarray,
+    edge_nodes: np.ndarray,
+    edge_faces: np.ndarray,
+    edge_indices: np.ndarray,
+    use_circumcenter_3d: bool = True,
+) -> np.ndarray:
+    """
+    |cosphi| restricted to `edge_indices` (0-based inputs, invalid = -1),
+    computing face centers only for the adjacent faces. Returns a full-length
+    (n_edges,) array, NaN outside the requested edges — the same values the
+    full `compute_cosphi_abs_from_arrays` produces for those edges.
+    """
+    n_faces = face_nodes.shape[0]
+    n_edges = edge_nodes.shape[0]
+    cosphi_abs = np.full(n_edges, np.nan, dtype=np.float64)
+
+    edge_indices = np.asarray(edge_indices, dtype=np.int64).ravel()
+    idx = np.unique(edge_indices[(edge_indices >= 0) & (edge_indices < n_edges)])
+    if idx.size == 0:
+        return cosphi_abs
+    k3 = edge_nodes[idx, 0]
+    k4 = edge_nodes[idx, 1]
+    f1 = edge_faces[idx, 0]
+    f2 = edge_faces[idx, 1]
+    valid = (
+        (k3 >= 0) & (k4 >= 0) & (f1 >= 0) & (f2 >= 0) & (f1 != f2)
+        & (f1 < n_faces) & (f2 < n_faces)
+    )
+    idx, k3, k4, f1, f2 = idx[valid], k3[valid], k4[valid], f1[valid], f2[valid]
+    if idx.size == 0:
+        return cosphi_abs
+
+    faces_needed = np.unique(np.concatenate([f1, f2]))
+    sub_face_nodes_1b = _to_1b(np.asarray(face_nodes)[faces_needed])
+    if use_circumcenter_3d:
+        fx, fy = _face_centers_circumcenter3d(node_x, node_y, sub_face_nodes_1b)
+    else:
+        fx, fy = _face_centers(node_x, node_y, sub_face_nodes_1b)
+    p1 = np.searchsorted(faces_needed, f1)
+    p2 = np.searchsorted(faces_needed, f2)
+
+    if not use_circumcenter_3d:
+        opp = _opposite_sides_vec(
+            node_x[k3], node_y[k3], node_x[k4], node_y[k4],
+            fx[p1], fy[p1], fx[p2], fy[p2],
+        )
+        idx, k3, k4, p1, p2 = idx[opp], k3[opp], k4[opp], p1[opp], p2[opp]
+        if idx.size == 0:
+            return cosphi_abs
+
+    dx_edge = _getdx_vec(node_x[k3], node_y[k3], node_x[k4], node_y[k4], 1)
+    dy_edge = _getdy_vec(node_x[k3], node_y[k3], node_x[k4], node_y[k4], 1)
+    d = np.hypot(dx_edge, dy_edge)
+    valid_d = d >= 1.0e-6
+    idx, k3, k4, p1, p2 = idx[valid_d], k3[valid_d], k4[valid_d], p1[valid_d], p2[valid_d]
+    if idx.size == 0:
+        return cosphi_abs
+
+    cosphi_abs[idx] = _dcosphi_sph_vec(
+        fx[p1], fy[p1], fx[p2], fy[p2],
+        node_x[k3], node_y[k3], node_x[k4], node_y[k4],
+    )
+    return cosphi_abs
+
+
 # ---------------------------------------------------------------------------
 # Utility structures for zones
 # ---------------------------------------------------------------------------
@@ -1106,51 +1483,34 @@ def _classify_zone_nodes(
             np.empty(0, dtype=np.int64),
         )
 
-    zone_nodes_set: Set[int] = set(int(n) for n in zone_nodes.tolist())
+    max_node = int(max(int(zone_nodes.max()), int(edge_nodes.max()), int(face_nodes.max())))
+    in_zone = np.zeros(max_node + 2, dtype=bool)
+    in_zone[zone_nodes] = True
 
-    node_to_faces = _build_node_to_faces(face_nodes)
+    # Node appears in a face outside the zone -> boundary.
+    zone_face_mask = np.zeros(face_nodes.shape[0], dtype=bool)
+    zone_face_mask[np.fromiter(faces_zone, dtype=np.int64, count=len(faces_zone))] = True
+    out_nodes = face_nodes[~zone_face_mask, :].ravel()
+    out_nodes = out_nodes[out_nodes >= 0]
+    appears_outside = np.zeros(max_node + 2, dtype=bool)
+    appears_outside[out_nodes] = True
 
-    # Build node -> edge indices mapping
-    max_node = int(max(zone_nodes.max(), edge_nodes.max()))
-    node_to_edges: List[List[int]] = [[] for _ in range(max_node + 1)]
-    for e in range(edge_nodes.shape[0]):
-        n1, n2 = edge_nodes[e, :]
-        if n1 >= 0:
-            node_to_edges[int(n1)].append(e)
-        if n2 >= 0:
-            node_to_edges[int(n2)].append(e)
+    # Node connected by an edge to a node outside the zone -> boundary.
+    n1 = edge_nodes[:, 0]
+    n2 = edge_nodes[:, 1]
+    ok = (n1 >= 0) & (n2 >= 0)
+    n1c = np.where(ok, n1, max_node + 1)
+    n2c = np.where(ok, n2, max_node + 1)
+    edge_to_outside = np.zeros(max_node + 2, dtype=bool)
+    m1 = ok & in_zone[n1c] & ~in_zone[n2c]
+    m2 = ok & in_zone[n2c] & ~in_zone[n1c]
+    edge_to_outside[n1c[m1]] = True
+    edge_to_outside[n2c[m2]] = True
 
-    internal_nodes: Set[int] = set()
-    boundary_nodes: Set[int] = set()
-
-    for nid in zone_nodes_set:
-        faces_n = set(node_to_faces[nid])
-        # if node appears in a face outside the zone -> boundary
-        if not faces_n.issubset(faces_zone):
-            boundary_nodes.add(nid)
-            continue
-
-        # if connected by an edge to a node outside the zone -> boundary
-        is_boundary = False
-        for eidx in node_to_edges[nid]:
-            n1, n2 = edge_nodes[eidx, :]
-            other = int(n2 if n1 == nid else n1)
-            if other not in zone_nodes_set and other >= 0:
-                is_boundary = True
-                break
-
-        if is_boundary:
-            boundary_nodes.add(nid)
-        else:
-            internal_nodes.add(nid)
-
-    # For safety, any zone node not internal is set as boundary
-    for nid in zone_nodes_set:
-        if nid not in internal_nodes and nid not in boundary_nodes:
-            boundary_nodes.add(nid)
-
-    internal = np.array(sorted(list(internal_nodes)), dtype=np.int64)
-    boundary = np.array(sorted(list(boundary_nodes)), dtype=np.int64)
+    zone_sorted = np.sort(np.asarray(zone_nodes, dtype=np.int64))
+    is_boundary_sorted = (appears_outside | edge_to_outside)[zone_sorted]
+    internal = zone_sorted[~is_boundary_sorted]
+    boundary = zone_sorted[is_boundary_sorted]
     return internal, boundary
 
 
@@ -1265,24 +1625,26 @@ def apply_combined_ortho_smoother_to_zone(
     zone_set: Set[int] = set(int(n) for n in zone_nodes.tolist())
     neighbors: Dict[int, Set[int]] = {int(n): set() for n in zone_nodes.tolist()}
     all_neighbors: Dict[int, Set[int]] = {int(n): set() for n in zone_nodes.tolist()}
-    edges_in_zone: List[int] = []
-    ring_edges: List[int] = []
-    for e in range(mesh.edge_nodes.shape[0]):
-        n1, n2 = mesh.edge_nodes[e, :]
-        if n1 < 0 or n2 < 0:
-            continue
-        g1 = int(n1)
-        g2 = int(n2)
-        if g1 in zone_set and g2 in zone_set:
-            neighbors[g1].add(g2)
-            neighbors[g2].add(g1)
-            edges_in_zone.append(e)
-        elif (g1 in zone_set) ^ (g2 in zone_set):
-            # Edge crossing the zone boundary: part of the "crown" for acceptance tests
-            ring_edges.append(e)
-        if g1 in zone_set:
+    en1 = mesh.edge_nodes[:, 0]
+    en2 = mesh.edge_nodes[:, 1]
+    ok_e = (en1 >= 0) & (en2 >= 0)
+    zmask = np.zeros(int(max(zone_nodes.max(), en1.max(initial=0), en2.max(initial=0))) + 2, dtype=bool)
+    zmask[zone_nodes] = True
+    in1 = ok_e & zmask[np.where(ok_e, en1, -1)]
+    in2 = ok_e & zmask[np.where(ok_e, en2, -1)]
+    edges_in_zone: List[int] = np.where(in1 & in2)[0].tolist()
+    ring_edges: List[int] = np.where(in1 ^ in2)[0].tolist()
+    for e in edges_in_zone:
+        g1 = int(en1[e])
+        g2 = int(en2[e])
+        neighbors[g1].add(g2)
+        neighbors[g2].add(g1)
+    for e in np.where(in1 | in2)[0]:
+        g1 = int(en1[e])
+        g2 = int(en2[e])
+        if in1[e]:
             all_neighbors[g1].add(g2)
-        if g2 in zone_set:
+        if in2[e]:
             all_neighbors[g2].add(g1)
     # Out-of-zone neighbors for boundary nodes (for weighted Laplacian)
     neighbors_out: Dict[int, Set[int]] = {}
@@ -1493,15 +1855,14 @@ def apply_combined_ortho_smoother_to_zone(
                         if move4:
                             trial_x[g4] = x4 + step * ux
                             trial_y[g4] = y4 + step * uy
-                        _, _, cosphi_trial = compute_cosphi_abs_from_arrays(
+                        cosphi_trial = _cosphi_abs_for_edges(
                             trial_x,
                             trial_y,
                             mesh.face_nodes,
                             mesh.edge_nodes,
                             mesh.edge_faces,
-                            use_file_centers=False,
+                            np.array([e]),
                             use_circumcenter_3d=True,
-                            edge_indices=np.array([e]),
                         )
                         new_val = float(np.abs(cosphi_trial[e]))
                         if not np.isfinite(new_val):
@@ -1669,15 +2030,14 @@ def apply_combined_ortho_smoother_to_zone(
     for factor in (1.0, 0.5, 0.25):
         mesh.node_x[zone_idx] = x_old + factor * delta_x
         mesh.node_y[zone_idx] = y_old + factor * delta_y
-        _, _, cosphi_after = compute_cosphi_abs_from_arrays(
+        cosphi_after = _cosphi_abs_for_edges(
             mesh.node_x,
             mesh.node_y,
             mesh.face_nodes,
             mesh.edge_nodes,
             mesh.edge_faces,
-            use_file_centers=False,
+            eval_edges_arr,
             use_circumcenter_3d=True,
-            edge_indices=eval_edges_arr,
         )
         cos_zone_after = np.abs(cosphi_after[eval_edges_arr])
         mask_after = np.isfinite(cos_zone_after)
