@@ -32,6 +32,9 @@ def _ortho_merge_pipeline(vert, conn, tria, tnum, opts):
         opts.get("require_both_criteria", DEFAULT_REQUIRE_STRICT_DUAL)
     )
 
+    # jsferic=1 -> spherical (lon/lat degrees); jsferic=0 -> planar x/y.
+    jsferic = 1 if bool(opts.get("spherical", True)) else 0
+
     do_log = not np.isinf(opts.get("disp", 4))
 
     # Initial snapshot (triangle proxy: 1 mixed-face row per input triangle).
@@ -52,6 +55,7 @@ def _ortho_merge_pipeline(vert, conn, tria, tnum, opts):
             quad_face_mask,
             cosphi_threshold=cosphi_threshold,
             removesmalllinkstrsh=removesmalllinkstrsh,
+            jsferic=jsferic,
         )
         print_stats(
             [
@@ -94,6 +98,7 @@ def _ortho_merge_pipeline(vert, conn, tria, tnum, opts):
         recovery_global_iter_growth=int(opts.get("recovery_global_iter_growth", 1)),
         on_state=_on_state if do_log else None,
         verbose=False,
+        jsferic=jsferic,
     )
 
     # Final snapshot (triangle proxy built from mixed faces).
@@ -129,6 +134,7 @@ def _ortho_merge_pipeline(vert, conn, tria, tnum, opts):
             quad_face_mask,
             cosphi_threshold=cosphi_threshold,
             removesmalllinkstrsh=removesmalllinkstrsh,
+            jsferic=jsferic,
         )
 
         last_zones = int(getattr(stats[-1], "n_zones_orthogonalized", 0)) if stats else 0
@@ -224,6 +230,7 @@ def _ortho_merge_pipeline(vert, conn, tria, tnum, opts):
                 quad_face_mask_for_dual,
                 cosphi_threshold=cosphi_threshold,
                 removesmalllinkstrsh=removesmalllinkstrsh,
+                jsferic=jsferic,
             )
             if (float(max_c_now) <= cosphi_threshold + 1.0e-9) and (
                 int(n_small_now) == 0
@@ -249,6 +256,7 @@ def _ortho_merge_pipeline(vert, conn, tria, tnum, opts):
                 ),
                 enable_edge_flips=bool(opts.get("enable_edge_flips", True)),
                 verbose=False,
+                jsferic=jsferic,
             )
             vert_out = ortho_res.vert
             tria_out = ortho_res.tria
@@ -307,6 +315,11 @@ def smood(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg
           recovery cycles (0 = disabled). Still raises if criteria are unmet.
         - 'preserve_merged_quads' : bool, default = False
           If True, store mixed face-node rows on ``opts['_mixed_face_nodes_0b']`` for UGRID export.
+        - 'spherical' : bool, default = True
+          If True, ``vert`` is treated as lon/lat degrees and all orthogonality/small-link
+          geometry uses the Delft3D spherical (jsferic=1) formulas. Set False for a mesh
+          already in a projected planar CRS (metres); geometry then uses plain 2D
+          (jsferic=0) distances and circumcenters.
         - 'disp' : int or float, default = 4
           Display frequency for iteration progress. Set to `np.inf` for quiet execution.
     hfun : callable, optional
@@ -592,5 +605,12 @@ def makeopt_smood(opts=None):
     else:
         if not isinstance(opts["preserve_merged_quads"], bool):
             raise TypeError("smood:incorrectInputClass - Incorrect input class.")
+
+    # --------------------------- SPHERICAL
+    if "spherical" not in opts:
+        opts["spherical"] = True
+    else:
+        if not isinstance(opts["spherical"], bool):
+            raise TypeError("smood:incorrectInputClass - spherical must be bool.")
 
     return opts

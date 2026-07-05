@@ -147,6 +147,7 @@ def dual_criteria_on_fan_mesh(
     *,
     cosphi_threshold: float,
     removesmalllinkstrsh: float,
+    jsferic: int = 1,
 ) -> Tuple[bool, float, int]:
     """
     Returns (ok, max_abs_cosphi, n_small_flow_links) using meshkernel definitions
@@ -169,6 +170,7 @@ def dual_criteria_on_fan_mesh(
         edge_faces,
         use_file_centers=False,
         use_circumcenter_3d=True,
+        jsferic=jsferic,
     )
     # MeshKernel small-flow-links should ignore edges internal to a quad in the
     # original mixed mesh. In the triangle-proxy, those correspond to the shared
@@ -200,6 +202,7 @@ def dual_criteria_on_fan_mesh(
         edge_faces,
         removesmalllinkstrsh=float(removesmalllinkstrsh),
         edge_indices=keep_edge_indices,
+        jsferic=jsferic,
     )
 
     ok = (max_c <= float(cosphi_threshold) + 1.0e-9) and (int(n_small) == 0)
@@ -228,6 +231,7 @@ def ortho_merge_iterate_dataset(
     recovery_global_iter_growth: int = 1,
     on_state: Optional[Callable[[OrthoMergeStats], None]] = None,
     verbose: bool = True,
+    jsferic: int = 1,
 ) -> tuple:
     """
     Iteratively apply (**orthogonalize → merge_circumcenters**) on a UGRID dataset.
@@ -319,6 +323,7 @@ def ortho_merge_iterate_dataset(
             smooth_iter=si,
             enable_edge_flips=enable_edge_flips,
             verbose=verbose,
+            jsferic=jsferic,
         )
 
         NODE = np.column_stack([ortho_res.vert[:, 0], ortho_res.vert[:, 1], node_z])
@@ -328,7 +333,9 @@ def ortho_merge_iterate_dataset(
         nfaces_before = int(
             ds_after_ortho.sizes.get("mesh2d_nFaces", ds_after_ortho["mesh2d_face_nodes"].shape[0])
         )
-        ds_merged = merge_circumcenters(ds_after_ortho, removesmalllinkstrsh=removesmalllinkstrsh)
+        ds_merged = merge_circumcenters(
+            ds_after_ortho, removesmalllinkstrsh=removesmalllinkstrsh, jsferic=jsferic
+        )
         nfaces_after = int(ds_merged.sizes.get("mesh2d_nFaces", ds_merged["mesh2d_face_nodes"].shape[0]))
         merged_this_iter = max(0, nfaces_before - nfaces_after)
 
@@ -410,6 +417,7 @@ def ortho_merge_iterate_dataset(
             quad_face_mask,
             cosphi_threshold=cosphi_threshold,
             removesmalllinkstrsh=removesmalllinkstrsh,
+            jsferic=jsferic,
         )
         max_rec = max(0, int(max_recovery_iterations))
         stall_need = int(recovery_stagnation_break)
@@ -455,6 +463,7 @@ def ortho_merge_iterate_dataset(
                 quad_face_mask,
                 cosphi_threshold=cosphi_threshold,
                 removesmalllinkstrsh=removesmalllinkstrsh,
+                jsferic=jsferic,
             )
             r += 1
             if stall_need > 0:
@@ -529,6 +538,7 @@ def ortho_merge_iterate_tria(
     recovery_global_iter_growth: int = 1,
     on_state: Optional[Callable[[OrthoMergeStats], None]] = None,
     verbose: bool = True,
+    jsferic: int = 1,
 ) -> tuple:
     """
     Convenience wrapper that starts from a pure triangle mesh (vert, tria).
@@ -593,6 +603,7 @@ def ortho_merge_iterate_tria(
         recovery_global_iter_growth=recovery_global_iter_growth,
         on_state=on_state,
         verbose=verbose,
+        jsferic=jsferic,
     )
 
     vert_out = np.column_stack(

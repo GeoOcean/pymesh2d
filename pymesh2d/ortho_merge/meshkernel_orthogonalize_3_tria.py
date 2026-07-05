@@ -41,6 +41,7 @@ def orthogonalize_tria_mesh(
     smooth_iter: int = 16,
     enable_edge_flips: bool = True,
     verbose: bool = True,
+    jsferic: int = 1,
 ) -> TriaOrthoResult:
     """
     Orthogonalize a pure triangle mesh using the V3 zone logic.
@@ -51,6 +52,8 @@ def orthogonalize_tria_mesh(
       local edge flips inside convex quads (still triangles).
     - No merging into quads is performed here.
     - This uses the same cosphi/small-link definitions as `meshkernel_orthogonalize_3.py`.
+    - ``jsferic=1`` treats ``vert`` as lon/lat degrees (spherical); ``jsferic=0``
+      treats it as planar x/y.
     """
     vert = np.asarray(vert, dtype=np.float64)
     if vert.ndim != 2 or vert.shape[1] != 2:
@@ -85,6 +88,7 @@ def orthogonalize_tria_mesh(
             mesh.edge_faces,
             use_file_centers=False,
             use_circumcenter_3d=True,
+            jsferic=jsferic,
         )
         mask = ~np.isnan(cosphi_abs)
         if not np.any(mask):
@@ -99,6 +103,7 @@ def orthogonalize_tria_mesh(
             mesh.edge_nodes,
             mesh.edge_faces,
             removesmalllinkstrsh=removesmalllinkstrsh,
+            jsferic=jsferic,
         )
 
         # Optional: edge flips pre-pass (still triangles)
@@ -111,6 +116,7 @@ def orthogonalize_tria_mesh(
                 flip_candidates,
                 removesmalllinkstrsh,
                 max_cosphi_allowed=(cosphi_threshold if n_small == 0 else None),
+                jsferic=jsferic,
             )
             # After flips, recompute edges & faces because topology changed
             # (face_nodes changed, but edge_nodes/edge_faces are now stale)
@@ -124,6 +130,7 @@ def orthogonalize_tria_mesh(
                 mesh.edge_faces,
                 use_file_centers=False,
                 use_circumcenter_3d=True,
+                jsferic=jsferic,
             )
             mask = ~np.isnan(cosphi_abs)
             max_cosphi = float(np.nanmax(cosphi_abs[mask])) if np.any(mask) else max_cosphi
@@ -134,6 +141,7 @@ def orthogonalize_tria_mesh(
                 mesh.edge_nodes,
                 mesh.edge_faces,
                 removesmalllinkstrsh=removesmalllinkstrsh,
+                jsferic=jsferic,
             )
 
         if max_cosphi <= cosphi_threshold and n_small == 0:
@@ -175,6 +183,7 @@ def orthogonalize_tria_mesh(
                 small_edges_global=small_edges_arr,
                 removesmalllinkstrsh=removesmalllinkstrsh,
                 verbose=verbose,
+                jsferic=jsferic,
             )
             n_zones_orthogonalized += 1
             visited_faces_global.update(faces_zone)
@@ -188,6 +197,7 @@ def orthogonalize_tria_mesh(
         mesh.edge_faces,
         use_file_centers=False,
         use_circumcenter_3d=True,
+        jsferic=jsferic,
     )
     mask_final = ~np.isnan(cosphi_abs_final)
     max_final = float(np.nanmax(cosphi_abs_final[mask_final])) if np.any(mask_final) else float("nan")
@@ -198,6 +208,7 @@ def orthogonalize_tria_mesh(
         mesh.edge_nodes,
         mesh.edge_faces,
         removesmalllinkstrsh=removesmalllinkstrsh,
+        jsferic=jsferic,
     )
 
     vert_out = np.column_stack([mesh.node_x, mesh.node_y]).astype(np.float64, copy=False)

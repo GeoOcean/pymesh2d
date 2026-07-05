@@ -142,8 +142,9 @@ def _face_centers(
     node_y: np.ndarray,
     face_nodes: np.ndarray,
     face_mask: Optional[np.ndarray] = None,
+    jsferic: int = 1,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Barycentric cell centers (comp_masscenter2D jsferic=1)."""
+    """Barycentric cell centers (comp_masscenter2D; jsferic=0 for planar x/y)."""
     n_faces = face_nodes.shape[0]
     if face_mask is not None:
         face_x = np.full(n_faces, np.nan, dtype=np.float64)
@@ -165,16 +166,17 @@ def _face_centers(
         xin, yin = _gather_face_node_coords(node_x, node_y, face_nodes, faces, int(n))
         y0 = yin[np.arange(faces.size), np.argmin(np.abs(yin), axis=1)]
         x = xin.copy()
-        xmax = np.max(x, axis=1)
-        wrap = (xmax - np.min(x, axis=1)) > 180.0
-        if np.any(wrap):
-            x = np.where(wrap[:, None] & (x < (xmax - 180.0)[:, None]), x + 360.0, x)
+        if jsferic == 1:
+            xmax = np.max(x, axis=1)
+            wrap = (xmax - np.min(x, axis=1)) > 180.0
+            if np.any(wrap):
+                x = np.where(wrap[:, None] & (x < (xmax - 180.0)[:, None]), x + 360.0, x)
         x0 = np.min(x, axis=1)
         dxs = np.empty_like(x)
         dys = np.empty_like(x)
         for i in range(n):
-            dxs[:, i] = _getdx_vec(x0, y0, x[:, i], yin[:, i], 1)
-            dys[:, i] = _getdy_vec(x0, y0, x[:, i], yin[:, i], 1)
+            dxs[:, i] = _getdx_vec(x0, y0, x[:, i], yin[:, i], jsferic)
+            dys[:, i] = _getdy_vec(x0, y0, x[:, i], yin[:, i], jsferic)
         area = np.zeros(faces.size, dtype=np.float64)
         xcg = np.zeros(faces.size, dtype=np.float64)
         ycg = np.zeros(faces.size, dtype=np.float64)
@@ -182,8 +184,8 @@ def _face_centers(
             ip1 = (i + 1) % n
             xc = 0.5 * (dxs[:, i] + dxs[:, ip1])
             yc = 0.5 * (dys[:, i] + dys[:, ip1])
-            dxe = _getdx_vec(x[:, i], yin[:, i], x[:, ip1], yin[:, ip1], 1)
-            dye = _getdy_vec(x[:, i], yin[:, i], x[:, ip1], yin[:, ip1], 1)
+            dxe = _getdx_vec(x[:, i], yin[:, i], x[:, ip1], yin[:, ip1], jsferic)
+            dye = _getdy_vec(x[:, i], yin[:, i], x[:, ip1], yin[:, ip1], jsferic)
             dsx, dsy = dye, -dxe
             xds = xc * dsx + yc * dsy
             area += 0.5 * xds
@@ -194,8 +196,12 @@ def _face_centers(
             degenerate, 1.0, np.sign(area) * np.maximum(np.abs(area), 1e-8)
         )
         fac = 1.0 / (3.0 * area_safe)
-        fy = y0 + (ycg * fac) / EARTH_RADIUS_DEG2RAD
-        fx = x0 + (xcg * fac) / (EARTH_RADIUS_DEG2RAD * np.cos(fy * DEG2RAD))
+        if jsferic == 1:
+            fy = y0 + (ycg * fac) / EARTH_RADIUS_DEG2RAD
+            fx = x0 + (xcg * fac) / (EARTH_RADIUS_DEG2RAD * np.cos(fy * DEG2RAD))
+        else:
+            fy = y0 + ycg * fac
+            fx = x0 + xcg * fac
         face_x[faces] = np.where(degenerate, np.mean(xin, axis=1), fx)
         face_y[faces] = np.where(degenerate, np.mean(yin, axis=1), fy)
     return face_x, face_y
@@ -258,7 +264,9 @@ def _getdy(x1: float, y1: float, x2: float, y2: float, jsferic: int = 1) -> floa
 # Small flow links (Delft3D): circumcenters in lon/lat, dxlink < 0.9*thresh*0.5*(sqrt(ba1)+sqrt(ba2))
 # ---------------------------------------------------------------------------
 
-def _lonlat_to_local_xy(node_x: np.ndarray, node_y: np.ndarray) -> Tuple[np.ndarray, float, float]:
+def _lonlat_to_local_xy(
+    node_x: np.ndarray, node_y: np.ndarray, jsferic: int = 1
+) -> Tuple[np.ndarray, float, float]:
     """Lon/lat (deg) -> local planar (m) around reference (x0,y0) using _getdx/_getdy."""
     node_x = np.asarray(node_x, dtype=np.float64)
     node_y = np.asarray(node_y, dtype=np.float64)
@@ -266,8 +274,8 @@ def _lonlat_to_local_xy(node_x: np.ndarray, node_y: np.ndarray) -> Tuple[np.ndar
     y0 = float(np.nanmean(node_y))
     x0_arr = np.full_like(node_x, x0)
     y0_arr = np.full_like(node_y, y0)
-    dx = _getdx_vec(x0_arr, y0_arr, node_x, node_y, 1)
-    dy = _getdy_vec(x0_arr, y0_arr, node_x, node_y, 1)
+    dx = _getdx_vec(x0_arr, y0_arr, node_x, node_y, jsferic)
+    dy = _getdy_vec(x0_arr, y0_arr, node_x, node_y, jsferic)
     vert_xy = np.column_stack([dx, dy])
     return vert_xy, x0, y0
 
@@ -378,12 +386,13 @@ def _circumcenters_lonlat_compact(
     v1: np.ndarray,
     v2: np.ndarray,
     num_interior: np.ndarray,
+    jsferic: int = 1,
 ) -> np.ndarray:
     """
-    Circumcenters in lon/lat for triangles given by vertex coordinates
-    (each (F, 2), all valid). Faces with num_interior == 0 (boundary) use the
-    mass center; circumcenters outside their triangle are pulled inside.
-    Returns (F, 2).
+    Circumcenters in lon/lat (or planar x/y for jsferic=0) for triangles given
+    by vertex coordinates (each (F, 2), all valid). Faces with
+    num_interior == 0 (boundary) use the mass center; circumcenters outside
+    their triangle are pulled inside. Returns (F, 2).
     """
     out = np.empty((v0.shape[0], 2), dtype=np.float64)
     mass = (v0 + v1 + v2) / 3.0
@@ -396,12 +405,13 @@ def _circumcenters_lonlat_compact(
         return out
     v0, v1, v2, mass = v0[keep], v1[keep], v2[keep], mass[keep]
 
-    # Vectorized `_circumcenter_of_triangle_lonlat`.
+    # Vectorized `_circumcenter_of_triangle_lonlat` (MeshKernel formula; the
+    # planar variant is the same construction without the metric conversions).
     x1, y1 = v0[:, 0], v0[:, 1]
-    dx2 = _getdx_vec(x1, y1, v1[:, 0], v1[:, 1], 1)
-    dy2 = _getdy_vec(x1, y1, v1[:, 0], v1[:, 1], 1)
-    dx3 = _getdx_vec(x1, y1, v2[:, 0], v2[:, 1], 1)
-    dy3 = _getdy_vec(x1, y1, v2[:, 0], v2[:, 1], 1)
+    dx2 = _getdx_vec(x1, y1, v1[:, 0], v1[:, 1], jsferic)
+    dy2 = _getdy_vec(x1, y1, v1[:, 0], v1[:, 1], jsferic)
+    dx3 = _getdx_vec(x1, y1, v2[:, 0], v2[:, 1], jsferic)
+    dy3 = _getdy_vec(x1, y1, v2[:, 0], v2[:, 1], jsferic)
     den = dy2 * dx3 - dy3 * dx2
     den_ok = np.abs(den) > 1e-20
     z = np.where(
@@ -409,14 +419,22 @@ def _circumcenters_lonlat_compact(
         (dx2 * (dx2 - dx3) + dy2 * (dy2 - dy3)) / np.where(den_ok, den, 1.0),
         0.0,
     )
-    phi = (y1 + v1[:, 1] + v2[:, 1]) / 3.0
-    xf = 1.0 / np.cos(phi * DEG2RAD)
-    circum = np.column_stack(
-        [
-            x1 + xf * 0.5 * (dx3 - z * dy3) * RAD2DEG / EARTH_RADIUS,
-            y1 + 0.5 * (dy3 + z * dx3) * RAD2DEG / EARTH_RADIUS,
-        ]
-    )
+    if jsferic == 1:
+        phi = (y1 + v1[:, 1] + v2[:, 1]) / 3.0
+        xf = 1.0 / np.cos(phi * DEG2RAD)
+        circum = np.column_stack(
+            [
+                x1 + xf * 0.5 * (dx3 - z * dy3) * RAD2DEG / EARTH_RADIUS,
+                y1 + 0.5 * (dy3 + z * dx3) * RAD2DEG / EARTH_RADIUS,
+            ]
+        )
+    else:
+        circum = np.column_stack(
+            [
+                x1 + 0.5 * (dx3 - z * dy3),
+                y1 + 0.5 * (dy3 + z * dx3),
+            ]
+        )
 
     inside = _point_in_triangle_winding_lonlat_vec(
         circum[:, 0], circum[:, 1], v0, v1, v2
@@ -430,18 +448,18 @@ def _circumcenters_lonlat_compact(
     if o.size > 0:
         p1 = mass[o]
         p2 = circum[o]
-        x21 = _getdx_vec(p1[:, 0], p1[:, 1], p2[:, 0], p2[:, 1], 1)
-        y21 = _getdy_vec(p1[:, 0], p1[:, 1], p2[:, 0], p2[:, 1], 1)
+        x21 = _getdx_vec(p1[:, 0], p1[:, 1], p2[:, 0], p2[:, 1], jsferic)
+        y21 = _getdy_vec(p1[:, 0], p1[:, 1], p2[:, 0], p2[:, 1], jsferic)
         vs = (v0[o], v1[o], v2[o])
         result = p1.copy()
         found = np.zeros(o.size, dtype=bool)
         for n in range(3):
             p3 = vs[n]
             p4 = vs[(n + 1) % 3]
-            x43 = _getdx_vec(p3[:, 0], p3[:, 1], p4[:, 0], p4[:, 1], 1)
-            y43 = _getdy_vec(p3[:, 0], p3[:, 1], p4[:, 0], p4[:, 1], 1)
-            x31 = _getdx_vec(p1[:, 0], p1[:, 1], p3[:, 0], p3[:, 1], 1)
-            y31 = _getdy_vec(p1[:, 0], p1[:, 1], p3[:, 0], p3[:, 1], 1)
+            x43 = _getdx_vec(p3[:, 0], p3[:, 1], p4[:, 0], p4[:, 1], jsferic)
+            y43 = _getdy_vec(p3[:, 0], p3[:, 1], p4[:, 0], p4[:, 1], jsferic)
+            x31 = _getdx_vec(p1[:, 0], p1[:, 1], p3[:, 0], p3[:, 1], jsferic)
+            y31 = _getdy_vec(p1[:, 0], p1[:, 1], p3[:, 0], p3[:, 1], jsferic)
             det = x43 * y21 - y43 * x21
             max_val = np.maximum.reduce(
                 [np.abs(x21), np.abs(y21), np.abs(x43), np.abs(y43)]
@@ -488,6 +506,7 @@ def _circumcenters_lonlat_ugrid(
     face_nodes: np.ndarray,
     edge_faces: np.ndarray,
     face_mask: Optional[np.ndarray] = None,
+    jsferic: int = 1,
 ) -> np.ndarray:
     """
     Circumcenters in lon/lat per face (UGRID). Boundary faces use mass center.
@@ -515,6 +534,7 @@ def _circumcenters_lonlat_ugrid(
         vert_deg[tria[faces, 1]],
         vert_deg[tria[faces, 2]],
         num_interior[faces],
+        jsferic=jsferic,
     )
     return out
 
@@ -527,11 +547,13 @@ def compute_small_links_from_arrays(
     edge_faces: np.ndarray,
     removesmalllinkstrsh: float = 0.11,
     edge_indices: Optional[np.ndarray] = None,
+    jsferic: int = 1,
 ) -> Tuple[int, np.ndarray]:
     """
     Small flow links (Delft3D): dxlink < 0.9*removesmalllinkstrsh*0.5*(sqrt(ba1)+sqrt(ba2)).
     Inputs 0-based (invalid = -1). Returns (n_small, edge_indices_of_small_links).
     If edge_indices is provided, only those edges are tested (returned small_edges are a subset).
+    Coordinates are lon/lat degrees for jsferic=1, planar x/y for jsferic=0.
     """
     node_x = np.asarray(node_x, dtype=np.float64).ravel()
     node_y = np.asarray(node_y, dtype=np.float64).ravel()
@@ -581,6 +603,7 @@ def compute_small_links_from_arrays(
         np.column_stack([node_x[t1], node_y[t1]]),
         np.column_stack([node_x[t2], node_y[t2]]),
         num_interior[faces_needed],
+        jsferic=jsferic,
     )
 
     # Face areas in local planar coordinates (as `_lonlat_to_local_xy` +
@@ -591,8 +614,8 @@ def compute_small_links_from_arrays(
     nodes_used = np.unique(np.concatenate([t0, t1, t2]))
     x0a = np.full(nodes_used.size, x0)
     y0a = np.full(nodes_used.size, y0)
-    ux = _getdx_vec(x0a, y0a, node_x[nodes_used], node_y[nodes_used], 1)
-    uy = _getdy_vec(x0a, y0a, node_x[nodes_used], node_y[nodes_used], 1)
+    ux = _getdx_vec(x0a, y0a, node_x[nodes_used], node_y[nodes_used], jsferic)
+    uy = _getdy_vec(x0a, y0a, node_x[nodes_used], node_y[nodes_used], jsferic)
     q0 = np.searchsorted(nodes_used, t0)
     q1 = np.searchsorted(nodes_used, t1)
     q2 = np.searchsorted(nodes_used, t2)
@@ -603,8 +626,8 @@ def compute_small_links_from_arrays(
     c1 = circ[g1]
     c2 = circ[g2]
     good = ~np.any(np.isnan(c1), axis=1) & ~np.any(np.isnan(c2), axis=1)
-    dx = _getdx_vec(c1[:, 0], c1[:, 1], c2[:, 0], c2[:, 1], 1)
-    dy = _getdy_vec(c1[:, 0], c1[:, 1], c2[:, 0], c2[:, 1], 1)
+    dx = _getdx_vec(c1[:, 0], c1[:, 1], c2[:, 0], c2[:, 1], jsferic)
+    dy = _getdy_vec(c1[:, 0], c1[:, 1], c2[:, 0], c2[:, 1], jsferic)
     dxlink = np.sqrt(dx * dx + dy * dy)
     sqrt_ba1 = np.sqrt(np.maximum(ba[g1], 1e-20))
     sqrt_ba2 = np.sqrt(np.maximum(ba[g2], 1e-20))
@@ -678,6 +701,7 @@ def try_flip_small_flow_edges_ugrid(
     small_edges_arr: np.ndarray,
     removesmalllinkstrsh: float,
     max_flip_iter: int = 20,
+    jsferic: int = 1,
 ) -> int:
     """
     Repeatedly try to flip small flow edges (convex quad). After each flip, recompute small links.
@@ -701,6 +725,7 @@ def try_flip_small_flow_edges_ugrid(
             mesh.edge_nodes,
             mesh.edge_faces,
             removesmalllinkstrsh=removesmalllinkstrsh,
+            jsferic=jsferic,
         )
         if small_edges_arr.size == 0:
             break
@@ -713,6 +738,7 @@ def try_flip_candidate_edges_ugrid(
     removesmalllinkstrsh: float,
     max_flip_iter: int = 20,
     max_cosphi_allowed: Optional[float] = None,
+    jsferic: int = 1,
 ) -> int:
     """
     Try to flip a set of candidate edges.
@@ -749,6 +775,7 @@ def try_flip_candidate_edges_ugrid(
             mesh.edge_nodes,
             mesh.edge_faces,
             removesmalllinkstrsh=removesmalllinkstrsh,
+            jsferic=jsferic,
         )
 
     return total_flipped
@@ -1007,6 +1034,55 @@ def _circumcenters3d_batch(xv: np.ndarray, yv: np.ndarray) -> Tuple[np.ndarray, 
     return _cart3dtospher_vec(xxc, yyc, zzc, np.max(xv, axis=1))
 
 
+def _circumcenters2d_batch(xv: np.ndarray, yv: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Planar (jsferic=0) counterpart of `_circumcenters3d_batch` for faces with
+    an equal node count. xv, yv: (F, N) in x/y -> (xz, yz), each (F,).
+
+    The circumcenter is the least-squares intersection of the edge
+    perpendicular bisectors: minimize sum_i ((c - e_i) . t_i)^2 over edge
+    midpoints e_i and unit tangents t_i (exact circumcenter for triangles).
+    Degenerate faces (collinear or too-short edges) fall back to the vertex
+    mean, like the spherical version's singular-system fallback.
+    """
+    F, N = xv.shape
+    if F == 0:
+        return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
+    if N < 2:
+        return xv[:, 0].astype(np.float64), yv[:, 0].astype(np.float64)
+    dtol = 1e-8
+    ip1 = (np.arange(N) + 1) % N
+    ttx = xv[:, ip1] - xv
+    tty = yv[:, ip1] - yv
+    ds = np.sqrt(ttx * ttx + tty * tty)
+    valid = ds >= dtol
+    dsi = np.where(valid, 1.0 / np.where(valid, ds, 1.0), 0.0)
+    ttx = ttx * dsi
+    tty = tty * dsi
+    xxe = 0.5 * (xv + xv[:, ip1])
+    yye = 0.5 * (yv + yv[:, ip1])
+    a00 = np.zeros(F)
+    a01 = np.zeros(F)
+    a11 = np.zeros(F)
+    b0 = np.zeros(F)
+    b1 = np.zeros(F)
+    for i in range(N):
+        a00 += ttx[:, i] * ttx[:, i]
+        a01 += ttx[:, i] * tty[:, i]
+        a11 += tty[:, i] * tty[:, i]
+        einpr = xxe[:, i] * ttx[:, i] + yye[:, i] * tty[:, i]
+        b0 += einpr * ttx[:, i]
+        b1 += einpr * tty[:, i]
+    det = a00 * a11 - a01 * a01
+    ok = np.abs(det) >= 1e-12
+    det_safe = np.where(ok, det, 1.0)
+    cx = (b0 * a11 - b1 * a01) / det_safe
+    cy = (a00 * b1 - a01 * b0) / det_safe
+    mean_x = np.mean(xv, axis=1)
+    mean_y = np.mean(yv, axis=1)
+    return np.where(ok, cx, mean_x), np.where(ok, cy, mean_y)
+
+
 def _point_in_polygon_vec(
     px: np.ndarray,
     py: np.ndarray,
@@ -1014,18 +1090,19 @@ def _point_in_polygon_vec(
     yv: np.ndarray,
     x0: np.ndarray,
     y0: np.ndarray,
+    jsferic: int = 1,
 ) -> np.ndarray:
     """Vectorized `_point_in_polygon`: (F,) points vs (F, N) polygons."""
     F, N = xv.shape
     if N < 3:
         return np.zeros(F, dtype=bool)
-    dxp = _getdx_vec(x0, y0, px, py, 1)
-    dyp = _getdy_vec(x0, y0, px, py, 1)
+    dxp = _getdx_vec(x0, y0, px, py, jsferic)
+    dyp = _getdy_vec(x0, y0, px, py, jsferic)
     dxs = np.empty_like(xv)
     dys = np.empty_like(yv)
     for i in range(N):
-        dxs[:, i] = _getdx_vec(x0, y0, xv[:, i], yv[:, i], 1)
-        dys[:, i] = _getdy_vec(x0, y0, xv[:, i], yv[:, i], 1)
+        dxs[:, i] = _getdx_vec(x0, y0, xv[:, i], yv[:, i], jsferic)
+        dys[:, i] = _getdy_vec(x0, y0, xv[:, i], yv[:, i], jsferic)
     count = np.zeros(F, dtype=np.int64)
     for i in range(N):
         ip1 = (i + 1) % N
@@ -1046,13 +1123,17 @@ def _face_centers_circumcenter3d(
     face_nodes: np.ndarray,
     dcenterinside: float = 1.0,
     face_mask: Optional[np.ndarray] = None,
+    jsferic: int = 1,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Centers = 3D circumcenter, with pull-inside when outside cell (as in Delft).
+    Centers = 3D circumcenter (planar 2D circumcenter for jsferic=0), with
+    pull-inside when outside cell (as in Delft).
     If face_mask is provided, only compute for faces where face_mask[f] is True;
     others are left as nan.
     """
-    mass_x, mass_y = _face_centers(node_x, node_y, face_nodes, face_mask=face_mask)
+    mass_x, mass_y = _face_centers(
+        node_x, node_y, face_nodes, face_mask=face_mask, jsferic=jsferic
+    )
     n_faces = face_nodes.shape[0]
     if face_mask is not None:
         face_x = np.full(n_faces, np.nan, dtype=np.float64)
@@ -1079,7 +1160,10 @@ def _face_centers_circumcenter3d(
             continue
         n = int(n)
         xv, yv = _gather_face_node_coords(node_x, node_y, face_nodes, faces, n)
-        xz, yz = _circumcenters3d_batch(xv, yv)
+        if jsferic == 1:
+            xz, yz = _circumcenters3d_batch(xv, yv)
+        else:
+            xz, yz = _circumcenters2d_batch(xv, yv)
         if n == 3:
             # Axis-aligned right triangles: use the circumcenter of the
             # bounding rectangle (as in Delft).
@@ -1097,26 +1181,29 @@ def _face_centers_circumcenter3d(
                 ymax = yv[rect].max(axis=1)
                 xh = np.column_stack([xmin, xmax, xmax, xmin])
                 yh = np.column_stack([ymin, ymin, ymax, ymax])
-                xz[rect], yz[rect] = _circumcenters3d_batch(xh, yh)
+                if jsferic == 1:
+                    xz[rect], yz[rect] = _circumcenters3d_batch(xh, yh)
+                else:
+                    xz[rect], yz[rect] = _circumcenters2d_batch(xh, yh)
         if 0 <= dcenterinside <= 1:
             x0 = np.min(xv, axis=1)
             y0 = yv[np.arange(faces.size), np.argmin(np.abs(yv), axis=1)]
-            inside = _point_in_polygon_vec(xz, yz, xv, yv, x0, y0)
+            inside = _point_in_polygon_vec(xz, yz, xv, yv, x0, y0, jsferic=jsferic)
             # Pull-inside for the centers outside their face: intersect the
             # mass-center -> circumcenter segment with each face edge and keep
             # the crossing with the smallest ratio (as `_segment_edge_intersect`).
             out = np.where(~inside)[0]
             if out.size > 0:
                 x0o, y0o = x0[out], y0[out]
-                dx1 = _getdx_vec(x0o, y0o, mass_x[faces[out]], mass_y[faces[out]], 1)
-                dy1 = _getdy_vec(x0o, y0o, mass_x[faces[out]], mass_y[faces[out]], 1)
-                dx2 = _getdx_vec(x0o, y0o, xz[out], yz[out], 1)
-                dy2 = _getdy_vec(x0o, y0o, xz[out], yz[out], 1)
+                dx1 = _getdx_vec(x0o, y0o, mass_x[faces[out]], mass_y[faces[out]], jsferic)
+                dy1 = _getdy_vec(x0o, y0o, mass_x[faces[out]], mass_y[faces[out]], jsferic)
+                dx2 = _getdx_vec(x0o, y0o, xz[out], yz[out], jsferic)
+                dy2 = _getdy_vec(x0o, y0o, xz[out], yz[out], jsferic)
                 dxs = np.empty((out.size, n))
                 dys = np.empty((out.size, n))
                 for i in range(n):
-                    dxs[:, i] = _getdx_vec(x0o, y0o, xv[out, i], yv[out, i], 1)
-                    dys[:, i] = _getdy_vec(x0o, y0o, xv[out, i], yv[out, i], 1)
+                    dxs[:, i] = _getdx_vec(x0o, y0o, xv[out, i], yv[out, i], jsferic)
+                    dys[:, i] = _getdy_vec(x0o, y0o, xv[out, i], yv[out, i], jsferic)
                 best_t = np.full(out.size, 2.0)
                 xcr = xz[out].copy()
                 ycr = yz[out].copy()
@@ -1132,10 +1219,14 @@ def _face_centers_circumcenter3d(
                     hit &= (0 <= t) & (t <= 1) & (0 <= s) & (s <= 1)
                     xcr_l = dx1 + t * (dx2 - dx1)
                     ycr_l = dy1 + t * (dy2 - dy1)
-                    ycr_deg = y0o + ycr_l / EARTH_RADIUS_DEG2RAD
-                    xcr_deg = x0o + xcr_l / (
-                        EARTH_RADIUS_DEG2RAD * np.cos(ycr_deg * DEG2RAD)
-                    )
+                    if jsferic == 1:
+                        ycr_deg = y0o + ycr_l / EARTH_RADIUS_DEG2RAD
+                        xcr_deg = x0o + xcr_l / (
+                            EARTH_RADIUS_DEG2RAD * np.cos(ycr_deg * DEG2RAD)
+                        )
+                    else:
+                        ycr_deg = y0o + ycr_l
+                        xcr_deg = x0o + xcr_l
                     upd = hit & (t < best_t)
                     best_t = np.where(upd, t, best_t)
                     xcr = np.where(upd, xcr_deg, xcr)
@@ -1176,6 +1267,33 @@ def _dcosphi_sph_vec(
     return np.abs(cosphi)
 
 
+def _dcosphi_flat_vec(
+    x1: np.ndarray,
+    y1: np.ndarray,
+    x2: np.ndarray,
+    y2: np.ndarray,
+    x3: np.ndarray,
+    y3: np.ndarray,
+    x4: np.ndarray,
+    y4: np.ndarray,
+) -> np.ndarray:
+    """Planar (jsferic=0) counterpart of `_dcosphi_sph_vec`: |cos(phi)| in 2D."""
+    d1x = x2 - x1
+    d1y = y2 - y1
+    d2x = x4 - x3
+    d2y = y4 - y3
+    r1 = np.sqrt(d1x * d1x + d1y * d1y)
+    r2 = np.sqrt(d2x * d2x + d2y * d2y)
+    dot = d1x * d2x + d1y * d2y
+    cosphi = np.where(
+        (r1 > 0) & (r2 > 0),
+        dot / np.where((r1 > 0) & (r2 > 0), r1 * r2, 1.0),
+        0.0,
+    )
+    cosphi = np.clip(cosphi, -1.0, 1.0)
+    return np.abs(cosphi)
+
+
 def _opposite_sides_vec(
     xk3: np.ndarray,
     yk3: np.ndarray,
@@ -1185,15 +1303,16 @@ def _opposite_sides_vec(
     yc1: np.ndarray,
     xc2: np.ndarray,
     yc2: np.ndarray,
+    jsferic: int = 1,
 ) -> np.ndarray:
     """Vectorized version of _opposite_sides. Returns bool (n_edges,)."""
-    ex = _getdx_vec(xk3, yk3, xk4, yk4, 1)
-    ey = _getdy_vec(xk3, yk3, xk4, yk4, 1)
-    c1 = ex * _getdy_vec(xk3, yk3, xc1, yc1, 1) - ey * _getdx_vec(
-        xk3, yk3, xc1, yc1, 1
+    ex = _getdx_vec(xk3, yk3, xk4, yk4, jsferic)
+    ey = _getdy_vec(xk3, yk3, xk4, yk4, jsferic)
+    c1 = ex * _getdy_vec(xk3, yk3, xc1, yc1, jsferic) - ey * _getdx_vec(
+        xk3, yk3, xc1, yc1, jsferic
     )
-    c2 = ex * _getdy_vec(xk3, yk3, xc2, yc2, 1) - ey * _getdx_vec(
-        xk3, yk3, xc2, yc2, 1
+    c2 = ex * _getdy_vec(xk3, yk3, xc2, yc2, jsferic) - ey * _getdx_vec(
+        xk3, yk3, xc2, yc2, jsferic
     )
     return c1 * c2 < 0.0
 
@@ -1254,11 +1373,13 @@ def compute_cosphi_abs_from_arrays(
     use_file_centers: bool = False,
     use_circumcenter_3d: bool = True,
     edge_indices: Optional[np.ndarray] = None,
+    jsferic: int = 1,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Compute |cosphi| for edges. Inputs 0-based (invalid = -1).
     If edge_indices is provided (0-based), only compute for those edges (and only
     the face centers needed). Returns (edge_nodes, edge_faces, cosphi_abs).
+    Coordinates are lon/lat degrees for jsferic=1, planar x/y for jsferic=0.
     """
     if use_file_centers:
         raise ValueError(
@@ -1275,6 +1396,7 @@ def compute_cosphi_abs_from_arrays(
             edge_faces,
             edge_indices,
             use_circumcenter_3d=use_circumcenter_3d,
+            jsferic=jsferic,
         )
         return _to_1b(edge_nodes), _to_1b(edge_faces), cosphi_abs
 
@@ -1305,11 +1427,11 @@ def compute_cosphi_abs_from_arrays(
 
     if use_circumcenter_3d:
         face_x, face_y = _face_centers_circumcenter3d(
-            node_x, node_y, face_nodes, face_mask=face_mask
+            node_x, node_y, face_nodes, face_mask=face_mask, jsferic=jsferic
         )
     else:
         face_x, face_y = _face_centers(
-            node_x, node_y, face_nodes, face_mask=face_mask
+            node_x, node_y, face_nodes, face_mask=face_mask, jsferic=jsferic
         )
 
     cosphi_abs = np.full(n_edges, np.nan, dtype=np.float64)
@@ -1340,14 +1462,15 @@ def compute_cosphi_abs_from_arrays(
             face_y[f1i],
             face_x[f2i],
             face_y[f2i],
+            jsferic=jsferic,
         )
         idx = idx[opp]
         k3i, k4i, f1i, f2i = k3i[opp], k4i[opp], f1i[opp], f2i[opp]
         if idx.size == 0:
             return edge_nodes, edge_faces, cosphi_abs
 
-    dx_edge = _getdx_vec(node_x[k3i], node_y[k3i], node_x[k4i], node_y[k4i], 1)
-    dy_edge = _getdy_vec(node_x[k3i], node_y[k3i], node_x[k4i], node_y[k4i], 1)
+    dx_edge = _getdx_vec(node_x[k3i], node_y[k3i], node_x[k4i], node_y[k4i], jsferic)
+    dy_edge = _getdy_vec(node_x[k3i], node_y[k3i], node_x[k4i], node_y[k4i], jsferic)
     d = np.hypot(dx_edge, dy_edge)
     valid_d = d >= 1.0e-6
     idx = idx[valid_d]
@@ -1355,7 +1478,8 @@ def compute_cosphi_abs_from_arrays(
     if idx.size == 0:
         return edge_nodes, edge_faces, cosphi_abs
 
-    cosphi_abs[idx] = _dcosphi_sph_vec(
+    dcosphi = _dcosphi_sph_vec if jsferic == 1 else _dcosphi_flat_vec
+    cosphi_abs[idx] = dcosphi(
         face_x[f1i],
         face_y[f1i],
         face_x[f2i],
@@ -1376,6 +1500,7 @@ def _cosphi_abs_for_edges(
     edge_faces: np.ndarray,
     edge_indices: np.ndarray,
     use_circumcenter_3d: bool = True,
+    jsferic: int = 1,
 ) -> np.ndarray:
     """
     |cosphi| restricted to `edge_indices` (0-based inputs, invalid = -1),
@@ -1406,9 +1531,11 @@ def _cosphi_abs_for_edges(
     faces_needed = np.unique(np.concatenate([f1, f2]))
     sub_face_nodes_1b = _to_1b(np.asarray(face_nodes)[faces_needed])
     if use_circumcenter_3d:
-        fx, fy = _face_centers_circumcenter3d(node_x, node_y, sub_face_nodes_1b)
+        fx, fy = _face_centers_circumcenter3d(
+            node_x, node_y, sub_face_nodes_1b, jsferic=jsferic
+        )
     else:
-        fx, fy = _face_centers(node_x, node_y, sub_face_nodes_1b)
+        fx, fy = _face_centers(node_x, node_y, sub_face_nodes_1b, jsferic=jsferic)
     p1 = np.searchsorted(faces_needed, f1)
     p2 = np.searchsorted(faces_needed, f2)
 
@@ -1416,20 +1543,22 @@ def _cosphi_abs_for_edges(
         opp = _opposite_sides_vec(
             node_x[k3], node_y[k3], node_x[k4], node_y[k4],
             fx[p1], fy[p1], fx[p2], fy[p2],
+            jsferic=jsferic,
         )
         idx, k3, k4, p1, p2 = idx[opp], k3[opp], k4[opp], p1[opp], p2[opp]
         if idx.size == 0:
             return cosphi_abs
 
-    dx_edge = _getdx_vec(node_x[k3], node_y[k3], node_x[k4], node_y[k4], 1)
-    dy_edge = _getdy_vec(node_x[k3], node_y[k3], node_x[k4], node_y[k4], 1)
+    dx_edge = _getdx_vec(node_x[k3], node_y[k3], node_x[k4], node_y[k4], jsferic)
+    dy_edge = _getdy_vec(node_x[k3], node_y[k3], node_x[k4], node_y[k4], jsferic)
     d = np.hypot(dx_edge, dy_edge)
     valid_d = d >= 1.0e-6
     idx, k3, k4, p1, p2 = idx[valid_d], k3[valid_d], k4[valid_d], p1[valid_d], p2[valid_d]
     if idx.size == 0:
         return cosphi_abs
 
-    cosphi_abs[idx] = _dcosphi_sph_vec(
+    dcosphi = _dcosphi_sph_vec if jsferic == 1 else _dcosphi_flat_vec
+    cosphi_abs[idx] = dcosphi(
         fx[p1], fy[p1], fx[p2], fy[p2],
         node_x[k3], node_y[k3], node_x[k4], node_y[k4],
     )
@@ -1597,6 +1726,7 @@ def apply_combined_ortho_smoother_to_zone(
     small_edges_global: Optional[np.ndarray] = None,
     removesmalllinkstrsh: float = 0.1,
     verbose: bool = True,
+    jsferic: int = 1,
 ) -> Tuple[bool, bool]:
     """
     Combine simple (Laplacian) smoothing and orthogonality-oriented displacement,
@@ -1678,6 +1808,7 @@ def apply_combined_ortho_smoother_to_zone(
             mesh.edge_faces,
             removesmalllinkstrsh=removesmalllinkstrsh,
             edge_indices=edges_in_zone_arr,
+            jsferic=jsferic,
         )
         n_small_zone_before = len(small_zone_list)
 
@@ -1863,6 +1994,7 @@ def apply_combined_ortho_smoother_to_zone(
                             mesh.edge_faces,
                             np.array([e]),
                             use_circumcenter_3d=True,
+                            jsferic=jsferic,
                         )
                         new_val = float(np.abs(cosphi_trial[e]))
                         if not np.isfinite(new_val):
@@ -1915,6 +2047,7 @@ def apply_combined_ortho_smoother_to_zone(
                 mesh.edge_faces,
                 removesmalllinkstrsh=removesmalllinkstrsh,
                 edge_indices=edges_in_zone_arr,
+                jsferic=jsferic,
             )
             n_small_zone_current = len(small_zone_current)
             nface = mesh.face_nodes.shape[0]
@@ -1923,9 +2056,10 @@ def apply_combined_ortho_smoother_to_zone(
                 face_mask_zone[int(fid)] = True
             vert_deg = np.column_stack([mesh.node_x, mesh.node_y])
             circum_ll = _circumcenters_lonlat_ugrid(
-                vert_deg, mesh.face_nodes, mesh.edge_faces, face_mask=face_mask_zone
+                vert_deg, mesh.face_nodes, mesh.edge_faces,
+                face_mask=face_mask_zone, jsferic=jsferic,
             )
-            vert_xy, _, _ = _lonlat_to_local_xy(mesh.node_x, mesh.node_y)
+            vert_xy, _, _ = _lonlat_to_local_xy(mesh.node_x, mesh.node_y, jsferic)
             tria = mesh.face_nodes[:, :3]
             valid_t = (tria[:, 0] >= 0) & (tria[:, 1] >= 0) & (tria[:, 2] >= 0)
             ba = np.zeros(nface, dtype=np.float64)
@@ -1949,8 +2083,8 @@ def apply_combined_ortho_smoother_to_zone(
                 cc1, cc2 = circum_ll[f1], circum_ll[f2]
                 if np.any(np.isnan(cc1)) or np.any(np.isnan(cc2)):
                     continue
-                dx_m = _getdx(cc1[0], cc1[1], cc2[0], cc2[1], 1)
-                dy_m = _getdy(cc1[0], cc1[1], cc2[0], cc2[1], 1)
+                dx_m = _getdx(cc1[0], cc1[1], cc2[0], cc2[1], jsferic)
+                dy_m = _getdy(cc1[0], cc1[1], cc2[0], cc2[1], jsferic)
                 dxlink = np.sqrt(dx_m * dx_m + dy_m * dy_m)
                 if dxlink < 1e-12:
                     continue
@@ -1986,6 +2120,7 @@ def apply_combined_ortho_smoother_to_zone(
                         mesh.face_nodes, mesh.edge_nodes, mesh.edge_faces,
                         removesmalllinkstrsh=removesmalllinkstrsh,
                         edge_indices=edges_in_zone_arr,
+                        jsferic=jsferic,
                     )
                     if len(small_trial) < best_n_small:
                         best_n_small = len(small_trial)
@@ -2038,6 +2173,7 @@ def apply_combined_ortho_smoother_to_zone(
             mesh.edge_faces,
             eval_edges_arr,
             use_circumcenter_3d=True,
+            jsferic=jsferic,
         )
         cos_zone_after = np.abs(cosphi_after[eval_edges_arr])
         mask_after = np.isfinite(cos_zone_after)
@@ -2055,6 +2191,7 @@ def apply_combined_ortho_smoother_to_zone(
                 mesh.edge_faces,
                 removesmalllinkstrsh=removesmalllinkstrsh,
                 edge_indices=edges_in_zone_arr,
+                jsferic=jsferic,
             )
             n_small_za = len(small_zone_after_list)
         is_strict_improved = (

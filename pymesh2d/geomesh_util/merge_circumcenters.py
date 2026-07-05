@@ -186,6 +186,7 @@ def _rebuild_ds_from_form(ds_ori, ugrid_arrays):
 def merge_circumcenters(
     ds_ori,
     removesmalllinkstrsh=0.1,
+    jsferic=1,
 ):
     """
     Identify small flow links (circumcenters too close), merge each pair of triangles
@@ -198,6 +199,9 @@ def merge_circumcenters(
         UGRID Delft3D FM mesh (mesh2d_node_x/y/z, mesh2d_face_nodes, etc.).
     removesmalllinkstrsh : float, optional
         Threshold for small flow links (default 0.1), same as in the notebook.
+    jsferic : int, optional
+        1 (default) treats node coordinates as lon/lat degrees; 0 treats them as
+        planar x/y.
 
     Returns
     -------
@@ -230,6 +234,7 @@ def merge_circumcenters(
         edge_nodes=edge_nodes,
         edge_faces=edge_faces,
         removesmalllinkstrsh=float(removesmalllinkstrsh),
+        jsferic=jsferic,
     )
 
     if nlinktoosmall > 0:
