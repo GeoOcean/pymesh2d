@@ -1,8 +1,9 @@
 """
 Iterative pipeline: orthogonalize <-> merge_circumcenters (with optional recovery).
 
-Part of the ``pymesh2d`` package (no dependency on scripts outside this tree).
-Used by :mod:`pymesh2d.smood` as its default orthogonalization/merge pipeline.
+Used by :mod:`pymesh2d.smood` as its orthogonalization/merge pipeline. The
+underlying numeric orthogonality/small-link kernels live in
+:mod:`pymesh2d.ortho_merge.orthogonalize`.
 
 Intended process (Delft3D-FM / dual mesh)
 -----------------------------------------
@@ -10,16 +11,12 @@ Intended process (Delft3D-FM / dual mesh)
    ``merge_circumcenters`` / UGRID export: quads ``[a,v1,b,v2]`` are split on diagonal
    ``(v1,v2)`` (see ``geomesh_util.grd_util.triangulate_mixed_face_row_to_tris``), **not**
    fan-from-``a`` (diagonal ``(a,b)``), which skews the dual w.r.t. Delft3D-FM.
-2. **Remove short flow links**: ``merge_circumcenters`` merges triangle pairs into quads.
+2. **Remove short flow links**: ``merge_circumcenters`` merges triangle pairs into quads
+   (skipped when ``merge_small_links=False``: the mesh then stays pure triangles).
 3. Repeat; optional **recovery** cycles if ``max|cosφ|`` or small-link count still fails
    the dual criteria (see ``require_both_criteria``).
-4. With ``require_both_criteria=True``, **raise** if criteria are still not met after main +
-   recovery. Default **False** matches ``backup_ortho_merge_20260319_174424`` (no global dual
-   check / no recovery). Set **True** for a strict guarantee on the same triangle proxy (slower).
-
-Implementation note (package layout): the underlying numeric orthogonality/small-link code
-(``meshkernel_orthogonalize_3.py`` and ``meshkernel_orthogonalize_3_tria.py``) lives in the same
-directory as this module to keep the package root minimal.
+4. With ``require_both_criteria=True``, **raise** if criteria are still not met after the
+   main and recovery cycles. Default **False** skips the global dual check and recovery.
 """
 
 from __future__ import annotations
@@ -115,9 +112,7 @@ def _faces_with_ortho_topology(
     if tria_out.shape != tria_in.shape:
         # Unexpected: fall back to the original faces (previous behaviour).
         return faces
-    row_changed = np.any(
-        np.sort(tria_in, axis=1) != np.sort(tria_out, axis=1), axis=1
-    )
+    row_changed = np.any(np.sort(tria_in, axis=1) != np.sort(tria_out, axis=1), axis=1)
     if not np.any(row_changed):
         return faces
 
@@ -186,7 +181,9 @@ def _fan_vert_tria_from_ds(
     tri_origin_face_id: List[int] = []
 
     for fid, nodes in enumerate(faces):
-        tri_list = triangulate_mixed_face_row_to_tris(xy, np.asarray(nodes, dtype=np.int64))
+        tri_list = triangulate_mixed_face_row_to_tris(
+            xy, np.asarray(nodes, dtype=np.int64)
+        )
         for tri in tri_list:
             tris.append((int(tri[0]), int(tri[1]), int(tri[2])))
             tri_origin_face_id.append(int(fid))
@@ -211,16 +208,16 @@ def dual_criteria_on_fan_mesh(
     Returns (ok, max_abs_cosphi, n_small_flow_links) using meshkernel definitions
     on the merge-consistent triangle mesh (same proxy as ortho).
     """
-    from . import meshkernel_orthogonalize_3 as mk3
-    from .meshkernel_orthogonalize_3_tria import _build_edges_from_tria
+    from . import orthogonalize as ortho
+    from .geometry import build_edges_from_tria
 
     vert = np.asarray(vert, dtype=np.float64)
     tria = np.asarray(tria, dtype=np.int64)
     if tria.size == 0:
         return True, 0.0, 0
 
-    edge_nodes, edge_faces = _build_edges_from_tria(tria)
-    _, _, cosphi_abs = mk3.compute_cosphi_abs_from_arrays(
+    edge_nodes, edge_faces = build_edges_from_tria(tria)
+    _, _, cosphi_abs = ortho.compute_cosphi_abs_from_arrays(
         vert[:, 0],
         vert[:, 1],
         tria,
@@ -252,7 +249,7 @@ def dual_criteria_on_fan_mesh(
     max_c = float(np.nanmax(cosphi_abs[mask])) if np.any(mask) else 0.0
 
     keep_edge_indices = keep_edge_indices[~exclude_mask]
-    n_small, _ = mk3.compute_small_links_from_arrays(
+    n_small, _ = ortho.compute_small_links_from_arrays(
         vert[:, 0],
         vert[:, 1],
         tria,
@@ -307,7 +304,7 @@ def ortho_merge_iterate_dataset(
     outer_iter_max : int
         Number of outer iterations (ortho+merge cycles).
     cosphi_threshold, removesmalllinkstrsh, buffer_layers, max_global_iter, smooth_iter
-        Passed to the triangle orthogonalizer (V3 wrapper).
+        Passed to `orthogonalize_tria_mesh`.
     enable_edge_flips : bool
         Allow triangle edge flips during the ortho step.
     stop_if_no_merge : bool
@@ -319,7 +316,7 @@ def ortho_merge_iterate_dataset(
         If True, after the main loop (and optional recovery), require
         ``max|cosφ| <= cosphi_threshold`` and ``n_small_flow_links == 0`` on the
         triangle proxy (quad diagonal ``(v1,v2)``); otherwise raise ``RuntimeError``. **False** (default)
-        skips that check and recovery — same idea as ``backup_ortho_merge_20260319_174424``.
+        skips that check and recovery
     max_recovery_iterations : int
         Max extra ortho+merge cycles when criteria fail after the main loop.
         Ignored if ``require_both_criteria`` is False.
@@ -339,7 +336,7 @@ def ortho_merge_iterate_dataset(
         merge_circumcenters,
     )
 
-    from .meshkernel_orthogonalize_3_tria import orthogonalize_tria_mesh
+    from .orthogonalize import orthogonalize_tria_mesh
 
     if not isinstance(ds, xr.Dataset):
         raise TypeError("ds must be an xarray.Dataset")
@@ -372,14 +369,22 @@ def ortho_merge_iterate_dataset(
         faces = _faces_from_face_nodes(face_nodes)
         tria_for_ortho, tri_face_id = _triangulate_faces_for_ortho(vert, faces)
 
-        bl = int(buffer_layers if buffer_layers_override is None else buffer_layers_override)
-        mgi = int(max_global_iter if max_global_iter_override is None else max_global_iter_override)
+        bl = int(
+            buffer_layers if buffer_layers_override is None else buffer_layers_override
+        )
+        mgi = int(
+            max_global_iter
+            if max_global_iter_override is None
+            else max_global_iter_override
+        )
         si = int(smooth_iter if smooth_iter_override is None else smooth_iter_override)
 
         if merge_small_links:
             # Small links are removed by merge_circumcenters below; keep the
             # orthogonalizer focused on |cosphi| only.
-            ortho_smalllink_trsh = 1.0e-12 if ortho_disable_smalllink_logic else removesmalllinkstrsh
+            ortho_smalllink_trsh = (
+                1.0e-12 if ortho_disable_smalllink_logic else removesmalllinkstrsh
+            )
         else:
             # Triangles-only mode: the orthogonalizer itself must clear small
             # links (guarded flips + circumcenter-separation displacement).
@@ -400,7 +405,10 @@ def ortho_merge_iterate_dataset(
 
         NODE = np.column_stack([ortho_res.vert[:, 0], ortho_res.vert[:, 1], node_z])
         faces_after_ortho = _faces_with_ortho_topology(
-            faces, tria_for_ortho, np.asarray(ortho_res.tria, dtype=np.int64), tri_face_id
+            faces,
+            tria_for_ortho,
+            np.asarray(ortho_res.tria, dtype=np.int64),
+            tri_face_id,
         )
         ugrid_arrays = build_ugrid_arrays_mixed(NODE, faces_after_ortho)
         ds_after_ortho = _rebuild_ds_from_form(ds_in, ugrid_arrays)
@@ -409,12 +417,18 @@ def ortho_merge_iterate_dataset(
             return ds_after_ortho, ortho_res, 0, ds_before_outer
 
         nfaces_before = int(
-            ds_after_ortho.sizes.get("mesh2d_nFaces", ds_after_ortho["mesh2d_face_nodes"].shape[0])
+            ds_after_ortho.sizes.get(
+                "mesh2d_nFaces", ds_after_ortho["mesh2d_face_nodes"].shape[0]
+            )
         )
         ds_merged = merge_circumcenters(
             ds_after_ortho, removesmalllinkstrsh=removesmalllinkstrsh, jsferic=jsferic
         )
-        nfaces_after = int(ds_merged.sizes.get("mesh2d_nFaces", ds_merged["mesh2d_face_nodes"].shape[0]))
+        nfaces_after = int(
+            ds_merged.sizes.get(
+                "mesh2d_nFaces", ds_merged["mesh2d_face_nodes"].shape[0]
+            )
+        )
         merged_this_iter = max(0, nfaces_before - nfaces_after)
 
         return ds_merged, ortho_res, merged_this_iter, ds_before_outer
@@ -422,7 +436,9 @@ def ortho_merge_iterate_dataset(
     outer_stall_limit = max(0, int(outer_stagnation_break))
     outer_stall_count = 0
     for outer in range(int(outer_iter_max)):
-        ds_cur, ortho_res, merged_this_iter, ds_before_outer = _run_ortho_merge_cycle(ds_cur)
+        ds_cur, ortho_res, merged_this_iter, ds_before_outer = _run_ortho_merge_cycle(
+            ds_cur
+        )
 
         # Early stop on stagnation: if the same outer-cycle metrics repeat,
         # further global passes are unlikely to help and are expensive.
@@ -442,7 +458,9 @@ def ortho_merge_iterate_dataset(
                             max_cosphi=float(ortho_res.max_cosphi),
                             n_small_flow_links=int(ortho_res.n_small_flow_links),
                             merged_this_iter=int(merged_this_iter),
-                            n_zones_orthogonalized=int(getattr(ortho_res, "n_zones_orthogonalized", 0)),
+                            n_zones_orthogonalized=int(
+                                getattr(ortho_res, "n_zones_orthogonalized", 0)
+                            ),
                         )
                     )
                     if on_state is not None:
@@ -465,7 +483,9 @@ def ortho_merge_iterate_dataset(
                     max_cosphi=float(stats[-1].max_cosphi),
                     n_small_flow_links=int(stats[-1].n_small_flow_links),
                     merged_this_iter=0,
-                    n_zones_orthogonalized=int(getattr(ortho_res, "n_zones_orthogonalized", 0)),
+                    n_zones_orthogonalized=int(
+                        getattr(ortho_res, "n_zones_orthogonalized", 0)
+                    ),
                 )
             )
             if on_state is not None:
@@ -477,7 +497,9 @@ def ortho_merge_iterate_dataset(
                 max_cosphi=float(ortho_res.max_cosphi),
                 n_small_flow_links=int(ortho_res.n_small_flow_links),
                 merged_this_iter=int(merged_this_iter),
-                n_zones_orthogonalized=int(getattr(ortho_res, "n_zones_orthogonalized", 0)),
+                n_zones_orthogonalized=int(
+                    getattr(ortho_res, "n_zones_orthogonalized", 0)
+                ),
             )
         )
         if on_state is not None:
@@ -488,7 +510,9 @@ def ortho_merge_iterate_dataset(
             break
 
     if bool(require_both_criteria):
-        v_chk, t_chk, tri_origin_face_id, quad_face_mask = _fan_vert_tria_from_ds(ds_cur)
+        v_chk, t_chk, tri_origin_face_id, quad_face_mask = _fan_vert_tria_from_ds(
+            ds_cur
+        )
         ok, max_c, n_s = dual_criteria_on_fan_mesh(
             v_chk,
             t_chk,
@@ -506,19 +530,33 @@ def ortho_merge_iterate_dataset(
         while (not ok) and r < max_rec:
             if bool(adaptive_recovery):
                 growth_steps = 1 + r + stall
-                bl_rec = int(max(1, buffer_layers + int(recovery_buffer_growth) * growth_steps))
-                mgi_rec = int(max(1, max_global_iter + int(recovery_global_iter_growth) * growth_steps))
-                si_rec = int(max(1, smooth_iter + int(recovery_smooth_iter_growth) * growth_steps))
+                bl_rec = int(
+                    max(1, buffer_layers + int(recovery_buffer_growth) * growth_steps)
+                )
+                mgi_rec = int(
+                    max(
+                        1,
+                        max_global_iter
+                        + int(recovery_global_iter_growth) * growth_steps,
+                    )
+                )
+                si_rec = int(
+                    max(
+                        1, smooth_iter + int(recovery_smooth_iter_growth) * growth_steps
+                    )
+                )
             else:
                 bl_rec = int(buffer_layers)
                 mgi_rec = int(max_global_iter)
                 si_rec = int(smooth_iter)
 
-            ds_cur, ortho_res, merged_this_iter, ds_before_outer = _run_ortho_merge_cycle(
-                ds_cur,
-                buffer_layers_override=bl_rec,
-                max_global_iter_override=mgi_rec,
-                smooth_iter_override=si_rec,
+            ds_cur, ortho_res, merged_this_iter, ds_before_outer = (
+                _run_ortho_merge_cycle(
+                    ds_cur,
+                    buffer_layers_override=bl_rec,
+                    max_global_iter_override=mgi_rec,
+                    smooth_iter_override=si_rec,
+                )
             )
             # Recovery: no guardrail revert (keep trying); always log cycle.
             stats.append(
@@ -527,14 +565,18 @@ def ortho_merge_iterate_dataset(
                     max_cosphi=float(ortho_res.max_cosphi),
                     n_small_flow_links=int(ortho_res.n_small_flow_links),
                     merged_this_iter=int(merged_this_iter),
-                    n_zones_orthogonalized=int(getattr(ortho_res, "n_zones_orthogonalized", 0)),
+                    n_zones_orthogonalized=int(
+                        getattr(ortho_res, "n_zones_orthogonalized", 0)
+                    ),
                     recovery=True,
                     recovery_iter=r,
                 )
             )
             if on_state is not None:
                 on_state(stats[-1])
-            v_chk, t_chk, tri_origin_face_id, quad_face_mask = _fan_vert_tria_from_ds(ds_cur)
+            v_chk, t_chk, tri_origin_face_id, quad_face_mask = _fan_vert_tria_from_ds(
+                ds_cur
+            )
             ok, max_c, n_s = dual_criteria_on_fan_mesh(
                 v_chk,
                 t_chk,
@@ -568,7 +610,9 @@ def ortho_merge_iterate_dataset(
     return ds_cur, stats
 
 
-def print_stats(stats: Sequence[OrthoMergeStats], *, print_header: bool = False) -> None:
+def print_stats(
+    stats: Sequence[OrthoMergeStats], *, print_header: bool = False
+) -> None:
     """Smooth-like ortho+merge summary block (one header + progressive rows)."""
     if print_header:
         print(" -------------------------------------------------------")
@@ -660,7 +704,9 @@ def ortho_merge_iterate_tria(
     NODE = np.column_stack([vert[:, 0], vert[:, 1], node_z])
     ds0 = adcirc2DFlowFM(NODE=NODE, EDGE=tria)
     if not isinstance(ds0, xr.Dataset):
-        raise TypeError("adcirc2DFlowFM must return an xarray.Dataset in this repository")
+        raise TypeError(
+            "adcirc2DFlowFM must return an xarray.Dataset in this repository"
+        )
 
     ds_final, stats = ortho_merge_iterate_dataset(
         ds0,
@@ -704,4 +750,3 @@ def ortho_merge_iterate_tria(
         face_nodes_0b = face_nodes_1b.copy()
 
     return vert_out, face_nodes_0b, stats
-

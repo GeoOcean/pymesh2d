@@ -1,9 +1,5 @@
 """
-Named constants shared across the `ortho_merge` orthogonalization/merge pipeline.
-
-Centralizes values that were previously duplicated as magic numbers or
-module-local literals across `meshkernel_orthogonalize_3.py`, `smood.py` and
-related modules.
+Named constants shared across the ``ortho_merge`` orthogonalization/merge pipeline.
 """
 
 import numpy as np
@@ -19,10 +15,6 @@ EARTH_RADIUS_SQ = EARTH_RADIUS * EARTH_RADIUS
 # Distance-to-pole tolerance (degrees) below which pole-specific handling
 # kicks in for spherical distance/circumcenter computations.
 DTOL_POLE = 1.0e-6
-
-# Above this many faces, circumcenter computation switches to a
-# multi-process chunked implementation (see `_circumcenters_lonlat_ugrid`).
-CIRCUM_PARALLEL_MIN_FACES = 12000
 
 # Default "small flow link" threshold (Delft3D-FM convention): an internal
 # edge is flagged as a small flow link when the distance between the two

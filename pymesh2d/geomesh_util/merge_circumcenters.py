@@ -8,6 +8,7 @@ import xarray as xr
 
 from .grd_util import build_ugrid_arrays_mixed, triangulate_mixed_face_row_to_tris
 
+
 def _faces_list_from_ds(ds: xr.Dataset) -> list:
     """0-based polygon faces (len 3 or 4) from ``mesh2d_face_nodes``."""
     face_nodes_raw = np.asarray(ds["mesh2d_face_nodes"].values, dtype=np.int64)
@@ -29,7 +30,7 @@ def _faces_list_from_ds(ds: xr.Dataset) -> list:
 def _mixed_faces_to_triangles(vert_xy: np.ndarray, faces: list) -> np.ndarray:
     """
     One triangle row per sub-triangle (quad split on merge diagonal ``(v1,v2)``),
-    aligned with the triangle proxy used by ``meshkernel_orthogonalize_3``.
+    aligned with the triangle proxy used by ``pymesh2d.ortho_merge.orthogonalize``.
     """
     xy = np.asarray(vert_xy, dtype=np.float64)[:, :2]
     tris: list = []
@@ -46,7 +47,12 @@ def _mixed_faces_to_triangles(vert_xy: np.ndarray, faces: list) -> np.ndarray:
 def _signed_area_quad(vert, quad):
     """Signed area (doubled) of quadrilateral for orientation check."""
     v = vert[quad]
-    return (v[1, 0] - v[0, 0]) * (v[2, 1] - v[0, 1]) - (v[2, 0] - v[0, 0]) * (v[1, 1] - v[0, 1]) + (v[2, 0] - v[1, 0]) * (v[3, 1] - v[1, 1]) - (v[3, 0] - v[1, 0]) * (v[2, 1] - v[1, 1])
+    return (
+        (v[1, 0] - v[0, 0]) * (v[2, 1] - v[0, 1])
+        - (v[2, 0] - v[0, 0]) * (v[1, 1] - v[0, 1])
+        + (v[2, 0] - v[1, 0]) * (v[3, 1] - v[1, 1])
+        - (v[3, 0] - v[1, 0]) * (v[2, 1] - v[1, 1])
+    )
 
 
 def _merge_small_links_into_faces(tria, edge_cc, small_link_indices, vert):
@@ -90,6 +96,7 @@ def _rebuild_ds_from_form(ds_ori, ugrid_arrays):
     Build ds_final from the form of ds_ori: same structure (coords, data_vars, attrs),
     with data and dimension sizes from ugrid_arrays.
     """
+
     def _da(name, data, dims, attrs=None):
         if name in ds_ori.variables and hasattr(ds_ori.variables[name], "attrs"):
             base_attrs = dict(ds_ori.variables[name].attrs)
@@ -166,7 +173,12 @@ def _rebuild_ds_from_form(ds_ori, ugrid_arrays):
     }
 
     # Copy non-mesh variables from ds_ori (e.g. wgs84, mesh2d topology variable)
-    mesh_dims = {"mesh2d_nNodes", "mesh2d_nEdges", "mesh2d_nFaces", "mesh2d_nMax_face_nodes"}
+    mesh_dims = {
+        "mesh2d_nNodes",
+        "mesh2d_nEdges",
+        "mesh2d_nFaces",
+        "mesh2d_nMax_face_nodes",
+    }
     for k in ds_ori.variables:
         if k in coords or k in data_vars:
             continue
@@ -221,13 +233,13 @@ def merge_circumcenters(
     tria = _mixed_faces_to_triangles(vert, faces_in)
     tria = np.asarray(tria, dtype=np.int32)
 
-    # IMPORTANT: use the same small-link metric as meshkernel_orthogonalize_3,
+    # IMPORTANT: use the same small-link metric as ortho_merge.orthogonalize,
     # so our dual checks and merge decisions are consistent.
-    from ..ortho_merge import meshkernel_orthogonalize_3 as mk3
-    from ..ortho_merge.meshkernel_orthogonalize_3_tria import _build_edges_from_tria
+    from ..ortho_merge import orthogonalize as ortho
+    from ..ortho_merge.geometry import build_edges_from_tria
 
-    edge_nodes, edge_faces = _build_edges_from_tria(tria)
-    nlinktoosmall, small_edge_indices = mk3.compute_small_links_from_arrays(
+    edge_nodes, edge_faces = build_edges_from_tria(tria)
+    nlinktoosmall, small_edge_indices = ortho.compute_small_links_from_arrays(
         node_x=node_x,
         node_y=node_y,
         face_nodes=tria,

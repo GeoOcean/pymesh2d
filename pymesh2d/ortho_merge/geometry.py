@@ -1,7 +1,6 @@
 """
 Small, dependency-free geometric/topological helpers shared across the
-`ortho_merge` modules (previously duplicated verbatim in
-`meshkernel_orthogonalize_3.py` and `meshkernel_orthogonalize_3_tria.py`).
+``ortho_merge`` modules.
 """
 
 from __future__ import annotations

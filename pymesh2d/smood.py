@@ -25,9 +25,7 @@ def _ortho_merge_pipeline(vert, conn, tria, tnum, opts):
 
     outer_iter_max = max(1, int(opts.get("iter", 4)))
 
-    smalllink_trsh = float(
-        opts.get("smalllink_threshold", DEFAULT_SMALLLINK_THRESHOLD)
-    )
+    smalllink_trsh = float(opts.get("smalllink_threshold", DEFAULT_SMALLLINK_THRESHOLD))
     require_strict = bool(
         opts.get("require_both_criteria", DEFAULT_REQUIRE_STRICT_DUAL)
     )
@@ -50,7 +48,10 @@ def _ortho_merge_pipeline(vert, conn, tria, tnum, opts):
         tri_origin_face_id = np.arange(tria_in.shape[0], dtype=np.int64)
         quad_face_mask = np.zeros(tria_in.shape[0], dtype=bool)
 
-        from .ortho_merge.ortho_merge_iter import dual_criteria_on_fan_mesh, OrthoMergeStats
+        from .ortho_merge.ortho_merge_iter import (
+            dual_criteria_on_fan_mesh,
+            OrthoMergeStats,
+        )
 
         _, init_max_c, init_n_small = dual_criteria_on_fan_mesh(
             np.asarray(vert_in, dtype=np.float64),
@@ -87,7 +88,9 @@ def _ortho_merge_pipeline(vert, conn, tria, tnum, opts):
         cosphi_threshold=float(opts.get("orthogonality_threshold", 0.49)),
         removesmalllinkstrsh=smalllink_trsh,
         buffer_layers=int(opts.get("buffer_layers", 2)),
-        max_global_iter=int(opts.get("max_global_iter", int(opts.get("inner_iter", 4)) + 2)),
+        max_global_iter=int(
+            opts.get("max_global_iter", int(opts.get("inner_iter", 4)) + 2)
+        ),
         smooth_iter=int(opts.get("smooth_iter", int(opts.get("inner_iter", 4)) * 4)),
         enable_edge_flips=bool(opts.get("enable_edge_flips", True)),
         stop_if_no_merge=bool(opts.get("stop_if_no_merge", False)),
@@ -111,7 +114,10 @@ def _ortho_merge_pipeline(vert, conn, tria, tnum, opts):
         cosphi_threshold = float(opts.get("orthogonality_threshold", 0.49))
         removesmalllinkstrsh = smalllink_trsh
 
-        from .ortho_merge.ortho_merge_iter import dual_criteria_on_fan_mesh, OrthoMergeStats
+        from .ortho_merge.ortho_merge_iter import (
+            dual_criteria_on_fan_mesh,
+            OrthoMergeStats,
+        )
 
         face_nodes_0b_arr = np.asarray(face_nodes_0b, dtype=np.int64)
         vert_xy = np.asarray(vert_out, dtype=np.float64)
@@ -142,7 +148,9 @@ def _ortho_merge_pipeline(vert, conn, tria, tnum, opts):
             jsferic=jsferic,
         )
 
-        last_zones = int(getattr(stats[-1], "n_zones_orthogonalized", 0)) if stats else 0
+        last_zones = (
+            int(getattr(stats[-1], "n_zones_orthogonalized", 0)) if stats else 0
+        )
         print_stats(
             [
                 OrthoMergeStats(
@@ -156,7 +164,7 @@ def _ortho_merge_pipeline(vert, conn, tria, tnum, opts):
             print_header=False,
         )
 
-    # Optional: keep merged quads for NetCDF export (see ``preserve_merged_quads`` in ``code.py``).
+    # Optionally keep the merged mixed faces (quads) for UGRID export.
     preserve_merged_quads = bool(opts.get("preserve_merged_quads", False))
     face_nodes_arr = np.asarray(face_nodes_0b, dtype=np.int64)
 
@@ -206,7 +214,9 @@ def _ortho_merge_pipeline(vert, conn, tria, tnum, opts):
         quad_face_mask_for_dual = np.zeros(tria_out.shape[0], dtype=bool)
     else:
         tnum_out = np.asarray(new_parts, dtype=np.int64).reshape(-1, 1)
-        tri_origin_face_id_for_dual = np.asarray(tri_origin_face_id_export, dtype=np.int64)
+        tri_origin_face_id_for_dual = np.asarray(
+            tri_origin_face_id_export, dtype=np.int64
+        )
         quad_face_mask_for_dual = quad_face_mask_export
 
     # Optional post-pass: enforce dual criteria on the final triangle output.
@@ -216,7 +226,7 @@ def _ortho_merge_pipeline(vert, conn, tria, tnum, opts):
         opts.get("enforce_output_dual_criteria", bool(require_strict))
     )
     if enforce_output_dual and tria_out.size > 0:
-        from .ortho_merge.meshkernel_orthogonalize_3_tria import orthogonalize_tria_mesh
+        from .ortho_merge.orthogonalize import orthogonalize_tria_mesh
         from .ortho_merge.ortho_merge_iter import dual_criteria_on_fan_mesh
 
         post_iter = int(opts.get("post_output_ortho_iter", 3))
@@ -354,7 +364,7 @@ def smood(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg
     -----
     Delegates to :mod:`pymesh2d.ortho_merge.ortho_merge_iter` (orthogonalize on a
     merge-consistent triangle proxy, then ``merge_circumcenters``). See MeshKernel /
-    Delft3D-FM references in :mod:`pymesh2d.ortho_merge.meshkernel_orthogonalize_3`.
+    Delft3D-FM references in :mod:`pymesh2d.ortho_merge.orthogonalize`.
     """
 
     if vert is None:
@@ -402,7 +412,6 @@ def smood(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg
     if not np.isinf(opts["disp"]):
         print("\n Smooth triangulation for Delft3D-FM computation...\n")
 
-
     return _ortho_merge_pipeline(vert, conn, tria, tnum, opts)
 
 
@@ -425,7 +434,7 @@ def makeopt_smood(opts=None):
 
     # --------------------------- ITER
     if "iter" not in opts:
-        # Default pipeline: ortho <-> merge 4 outer cycles (matches prior `code.py` opts_smood).
+        # Default pipeline: 4 ortho <-> merge outer cycles.
         opts["iter"] = 4
     else:
         if not isinstance(opts["iter"], (int, float)):
@@ -440,7 +449,9 @@ def makeopt_smood(opts=None):
         if not isinstance(opts["inner_iter"], (int, float)):
             raise TypeError("smood:incorrectInputClass - Incorrect input class.")
         if opts["inner_iter"] <= 0:
-            raise ValueError("smood:invalidOptionValues - Invalid OPT.INNER_ITER selection.")
+            raise ValueError(
+                "smood:invalidOptionValues - Invalid OPT.INNER_ITER selection."
+            )
 
     # --------------------------- ORTHO_FACTOR
     if "ortho_factor" not in opts:
@@ -449,7 +460,9 @@ def makeopt_smood(opts=None):
         if not isinstance(opts["ortho_factor"], (int, float)):
             raise TypeError("smood:incorrectInputClass - Incorrect input class.")
         if not (0.0 <= opts["ortho_factor"] <= 1.0):
-            raise ValueError("smood:invalidOptionValues - ORTHO_FACTOR must be in [0, 1].")
+            raise ValueError(
+                "smood:invalidOptionValues - ORTHO_FACTOR must be in [0, 1]."
+            )
 
     # --------------------------- RELAXATION
     if "relaxation" not in opts:
@@ -458,7 +471,9 @@ def makeopt_smood(opts=None):
         if not isinstance(opts["relaxation"], (int, float)):
             raise TypeError("smood:incorrectInputClass - Incorrect input class.")
         if not (0.0 < opts["relaxation"] <= 1.0):
-            raise ValueError("smood:invalidOptionValues - RELAXATION must be in (0, 1].")
+            raise ValueError(
+                "smood:invalidOptionValues - RELAXATION must be in (0, 1]."
+            )
 
     # --------------------------- DISP
     if "disp" not in opts:
@@ -492,7 +507,9 @@ def makeopt_smood(opts=None):
         if not isinstance(opts["orthogonality_threshold"], (int, float)):
             raise TypeError("smood:incorrectInputClass - Incorrect input class.")
         if not (0.0 <= opts["orthogonality_threshold"] <= 1.0):
-            raise ValueError("smood:invalidOptionValues - ORTHOGONALITY_THRESHOLD must be in [0, 1].")
+            raise ValueError(
+                "smood:invalidOptionValues - ORTHOGONALITY_THRESHOLD must be in [0, 1]."
+            )
 
     # --------------------------- SMALLLINK_THRESHOLD
     if "smalllink_threshold" not in opts:
@@ -550,7 +567,9 @@ def makeopt_smood(opts=None):
         opts["require_both_criteria"] = DEFAULT_REQUIRE_STRICT_DUAL
     else:
         if not isinstance(opts["require_both_criteria"], bool):
-            raise TypeError("smood:incorrectInputClass - require_both_criteria must be bool.")
+            raise TypeError(
+                "smood:incorrectInputClass - require_both_criteria must be bool."
+            )
 
     if "max_recovery_iterations" not in opts:
         opts["max_recovery_iterations"] = 100
@@ -559,7 +578,9 @@ def makeopt_smood(opts=None):
             raise TypeError("smood:incorrectInputClass - Incorrect input class.")
         opts["max_recovery_iterations"] = int(opts["max_recovery_iterations"])
         if opts["max_recovery_iterations"] < 0:
-            raise ValueError("smood:invalidOptionValues - max_recovery_iterations must be >= 0.")
+            raise ValueError(
+                "smood:invalidOptionValues - max_recovery_iterations must be >= 0."
+            )
 
     if "recovery_stagnation_break" not in opts:
         opts["recovery_stagnation_break"] = 10
@@ -568,7 +589,9 @@ def makeopt_smood(opts=None):
             raise TypeError("smood:incorrectInputClass - Incorrect input class.")
         opts["recovery_stagnation_break"] = int(opts["recovery_stagnation_break"])
         if opts["recovery_stagnation_break"] < 0:
-            raise ValueError("smood:invalidOptionValues - recovery_stagnation_break must be >= 0.")
+            raise ValueError(
+                "smood:invalidOptionValues - recovery_stagnation_break must be >= 0."
+            )
 
     if "outer_stagnation_break" not in opts:
         opts["outer_stagnation_break"] = 2
@@ -577,7 +600,9 @@ def makeopt_smood(opts=None):
             raise TypeError("smood:incorrectInputClass - Incorrect input class.")
         opts["outer_stagnation_break"] = int(opts["outer_stagnation_break"])
         if opts["outer_stagnation_break"] < 0:
-            raise ValueError("smood:invalidOptionValues - outer_stagnation_break must be >= 0.")
+            raise ValueError(
+                "smood:invalidOptionValues - outer_stagnation_break must be >= 0."
+            )
 
     if "adaptive_recovery" not in opts:
         opts["adaptive_recovery"] = True
@@ -592,7 +617,9 @@ def makeopt_smood(opts=None):
             raise TypeError("smood:incorrectInputClass - Incorrect input class.")
         opts["recovery_buffer_growth"] = int(opts["recovery_buffer_growth"])
         if opts["recovery_buffer_growth"] < 0:
-            raise ValueError("smood:invalidOptionValues - recovery_buffer_growth must be >= 0.")
+            raise ValueError(
+                "smood:invalidOptionValues - recovery_buffer_growth must be >= 0."
+            )
 
     if "recovery_smooth_iter_growth" not in opts:
         opts["recovery_smooth_iter_growth"] = 6
@@ -601,7 +628,9 @@ def makeopt_smood(opts=None):
             raise TypeError("smood:incorrectInputClass - Incorrect input class.")
         opts["recovery_smooth_iter_growth"] = int(opts["recovery_smooth_iter_growth"])
         if opts["recovery_smooth_iter_growth"] < 0:
-            raise ValueError("smood:invalidOptionValues - recovery_smooth_iter_growth must be >= 0.")
+            raise ValueError(
+                "smood:invalidOptionValues - recovery_smooth_iter_growth must be >= 0."
+            )
 
     if "recovery_global_iter_growth" not in opts:
         opts["recovery_global_iter_growth"] = 1
@@ -610,7 +639,9 @@ def makeopt_smood(opts=None):
             raise TypeError("smood:incorrectInputClass - Incorrect input class.")
         opts["recovery_global_iter_growth"] = int(opts["recovery_global_iter_growth"])
         if opts["recovery_global_iter_growth"] < 0:
-            raise ValueError("smood:invalidOptionValues - recovery_global_iter_growth must be >= 0.")
+            raise ValueError(
+                "smood:invalidOptionValues - recovery_global_iter_growth must be >= 0."
+            )
 
     if "preserve_merged_quads" not in opts:
         opts["preserve_merged_quads"] = False
@@ -630,6 +661,8 @@ def makeopt_smood(opts=None):
         opts["merge_small_links"] = True
     else:
         if not isinstance(opts["merge_small_links"], bool):
-            raise TypeError("smood:incorrectInputClass - merge_small_links must be bool.")
+            raise TypeError(
+                "smood:incorrectInputClass - merge_small_links must be bool."
+            )
 
     return opts

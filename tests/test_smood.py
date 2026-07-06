@@ -7,6 +7,7 @@ deduplication of `pymesh2d.ortho_merge` / `pymesh2d.smood` internals cannot
 silently change results. Run `tests/generate_smood_reference.py` to
 (re)generate the reference after an intentional behaviour change.
 """
+
 import unittest
 
 import numpy as np
@@ -53,7 +54,7 @@ class TestSmood(unittest.TestCase):
         """
         import numpy as np
 
-        from pymesh2d.ortho_merge import meshkernel_orthogonalize_3 as mk3
+        from pymesh2d.ortho_merge import orthogonalize as ortho
         from pymesh2d.ortho_merge.geometry import build_edges_from_tria
 
         vert, conn, tria, tnum = build_smood_input()
@@ -70,10 +71,10 @@ class TestSmood(unittest.TestCase):
         # Dual criteria on the triangle output.
         tt = np.asarray(tria_s, dtype=np.int64)
         en, ef = build_edges_from_tria(tt)
-        _, _, cos = mk3.compute_cosphi_abs_from_arrays(
+        _, _, cos = ortho.compute_cosphi_abs_from_arrays(
             vert_s[:, 0], vert_s[:, 1], tt, en, ef, use_circumcenter_3d=True
         )
-        n_small, _ = mk3.compute_small_links_from_arrays(
+        n_small, _ = ortho.compute_small_links_from_arrays(
             vert_s[:, 0], vert_s[:, 1], tt, en, ef, removesmalllinkstrsh=0.11
         )
         self.assertLessEqual(float(np.nanmax(cos)), 0.49 + 1e-9)
@@ -93,7 +94,9 @@ class TestSmood(unittest.TestCase):
         m_per_deg = 111_320.0
         vert_m = np.column_stack(
             [
-                (vert[:, 0] - np.mean(vert[:, 0])) * m_per_deg * np.cos(np.radians(lat0)),
+                (vert[:, 0] - np.mean(vert[:, 0]))
+                * m_per_deg
+                * np.cos(np.radians(lat0)),
                 (vert[:, 1] - lat0) * m_per_deg,
             ]
         )

@@ -1,26 +1,27 @@
 """
-Local orthogonalization of a UGRID mesh (*_net.nc) using |cosphi| (3D circumcenter).
-V3: v2 + pymesh2d-inspired small-link fixes (flip, circumcenter-direction, aggressive, optional merge).
+Mesh orthogonalization and small-flow-link handling on in-memory arrays.
 
-- Edge flip: try flipping small-link edges (convex quad) to lengthen link without moving nodes.
-- Small-link displacement: move opposite vertices along circumcenter separation direction.
-- Aggressive mode when few/single small link remains (larger step).
-- Optional merge_circumcenters at end to convert remaining small-link pairs to quads.
-- [good] zones: skip if n_small_zone=0; line search accepts no-degradation (v2 Improvement 5).
-- All internal indexing is 0-based (invalid = -1). NetCDF load converts to 0-based.
+Ported from the Delft3D MeshKernel orthogonalizer, working directly on node
+coordinates and triangle/mixed-face connectivity (no file I/O). Orthogonality
+is measured by ``|cos(phi)|`` on flow links (edge vs. circumcenter line);
+small flow links are those whose circumcenter separation is short relative to
+the adjacent face sizes. Both are cleared by a zone smoother that combines
+Laplacian smoothing, orthogonality-oriented node moves, quality-guarded edge
+flips, and circumcenter-separation moves.
+
+Geometry works in lon/lat degrees (``jsferic=1``, spherical formulas) or in a
+projected planar CRS (``jsferic=0``). All internal indexing is 0-based, with
+-1 marking an invalid entry.
 """
 
 from __future__ import annotations
 
-import argparse
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 from collections import deque
 
 import numpy as np
-from netCDF4 import Dataset
 
-from ..geomesh_util.grd_util import adcirc2DFlowFM
 from .constants import (
     EARTH_RADIUS,
     DEG2RAD,
@@ -31,63 +32,6 @@ from .constants import (
     DEFAULT_ORTHO_ALPHA,
 )
 from .geometry import build_edges_from_tria as _build_edges_from_tria
-
-
-# ---------------------------------------------------------------------------
-# Orthogonality: UGRID load, geometry, circumcenter, cosphi (1-based internally).
-# ---------------------------------------------------------------------------
-
-
-def _ugrid_fill_value(var) -> int:
-    """Return FillValue or _FillValue for a NetCDF variable; default -1."""
-    return int(
-        getattr(var, "_FillValue", getattr(var, "FillValue", -1))
-    )
-
-
-def _load_ugrid(netcdf_path: str) -> Tuple:
-    """Load mesh2d_node_x/y, face_nodes, edge_nodes, edge_faces (1-based), face_x/y if present."""
-    with Dataset(netcdf_path, "r") as ds:
-        node_x = np.asarray(ds["mesh2d_node_x"][:], dtype=np.float64).ravel()
-        node_y = np.asarray(ds["mesh2d_node_y"][:], dtype=np.float64).ravel()
-        face_nodes = np.asarray(ds["mesh2d_face_nodes"][:], dtype=np.int64)
-        edge_nodes = np.asarray(ds["mesh2d_edge_nodes"][:], dtype=np.int64)
-        if edge_nodes.ndim == 1:
-            edge_nodes = edge_nodes.reshape(-1, 2)
-        # Normalize to 1-based so _to_0b yields correct 0-based indices
-        vfn = ds.variables["mesh2d_face_nodes"]
-        start_fn = int(getattr(vfn, "start_index", 1))
-        if start_fn == 0:
-            fill_fn = _ugrid_fill_value(vfn)
-            valid_fn = (face_nodes >= 0) & (face_nodes != fill_fn)
-            out_fn = np.zeros_like(face_nodes)
-            out_fn[valid_fn] = face_nodes[valid_fn] + 1
-            face_nodes = out_fn
-        ven = ds.variables["mesh2d_edge_nodes"]
-        start_en = int(getattr(ven, "start_index", 1))
-        if start_en == 0:
-            fill_en = _ugrid_fill_value(ven)
-            valid_en = (edge_nodes >= 0) & (edge_nodes != fill_en)
-            out_en = np.zeros_like(edge_nodes)
-            out_en[valid_en] = edge_nodes[valid_en] + 1
-            edge_nodes = out_en
-        face_x_file = face_y_file = None
-        if "mesh2d_face_x" in ds.variables and "mesh2d_face_y" in ds.variables:
-            face_x_file = np.asarray(ds["mesh2d_face_x"][:], dtype=np.float64).ravel()
-            face_y_file = np.asarray(ds["mesh2d_face_y"][:], dtype=np.float64).ravel()
-        edge_faces = None
-        if "mesh2d_edge_faces" in ds.variables:
-            edge_faces = np.asarray(ds["mesh2d_edge_faces"][:], dtype=np.int64)
-            if edge_faces.ndim == 1:
-                edge_faces = edge_faces.reshape(-1, 2)
-            start = int(getattr(ds.variables["mesh2d_edge_faces"], "start_index", 1))
-            if start == 0:
-                fill = _ugrid_fill_value(ds.variables["mesh2d_edge_faces"])
-                valid = (edge_faces >= 0) & (edge_faces != fill)
-                out = np.zeros_like(edge_faces)
-                out[valid] = edge_faces[valid] + 1
-                edge_faces = out
-    return node_x, node_y, face_nodes, edge_nodes, edge_faces, face_x_file, face_y_file
 
 
 def _getdx_vec(
@@ -170,7 +114,9 @@ def _face_centers(
             xmax = np.max(x, axis=1)
             wrap = (xmax - np.min(x, axis=1)) > 180.0
             if np.any(wrap):
-                x = np.where(wrap[:, None] & (x < (xmax - 180.0)[:, None]), x + 360.0, x)
+                x = np.where(
+                    wrap[:, None] & (x < (xmax - 180.0)[:, None]), x + 360.0, x
+                )
         x0 = np.min(x, axis=1)
         dxs = np.empty_like(x)
         dys = np.empty_like(x)
@@ -218,7 +164,9 @@ def _sphertocart3d_vec(lon_deg: np.ndarray, lat_deg: np.ndarray) -> np.ndarray:
     return np.column_stack([xx, yy, zz])
 
 
-def _cart3dtospher(xx: float, yy: float, zz: float, xref_deg: float) -> Tuple[float, float]:
+def _cart3dtospher(
+    xx: float, yy: float, zz: float, xref_deg: float
+) -> Tuple[float, float]:
     """Cartesian (meters) -> spherical (deg)."""
     raddeg = 180.0 / np.pi
     x1 = np.arctan2(yy, xx) * raddeg
@@ -263,6 +211,7 @@ def _getdy(x1: float, y1: float, x2: float, y2: float, jsferic: int = 1) -> floa
 # ---------------------------------------------------------------------------
 # Small flow links (Delft3D): circumcenters in lon/lat, dxlink < 0.9*thresh*0.5*(sqrt(ba1)+sqrt(ba2))
 # ---------------------------------------------------------------------------
+
 
 def _lonlat_to_local_xy(
     node_x: np.ndarray, node_y: np.ndarray, jsferic: int = 1
@@ -493,9 +442,9 @@ def _num_interior_edges_per_face(edge_faces: np.ndarray, nface: int) -> np.ndarr
         & (edge_faces[:, 0] != edge_faces[:, 1])
     )
     counts = np.bincount(
-        np.concatenate(
-            [edge_faces[interior, 0], edge_faces[interior, 1]]
-        ).astype(np.intp),
+        np.concatenate([edge_faces[interior, 0], edge_faces[interior, 1]]).astype(
+            np.intp
+        ),
         minlength=nface,
     )
     return counts.astype(np.int32)
@@ -518,9 +467,17 @@ def _circumcenters_lonlat_ugrid(
     if num_interior is None:
         num_interior = _num_interior_edges_per_face(edge_faces, nface)
 
-    out = np.full((nface, 2), np.nan, dtype=np.float64) if face_mask is not None else np.zeros((nface, 2), dtype=np.float64)
+    out = (
+        np.full((nface, 2), np.nan, dtype=np.float64)
+        if face_mask is not None
+        else np.zeros((nface, 2), dtype=np.float64)
+    )
     tria = face_nodes[:, :3]
-    indices_to_compute = np.where(face_mask)[0] if face_mask is not None else np.arange(nface, dtype=np.int64)
+    indices_to_compute = (
+        np.where(face_mask)[0]
+        if face_mask is not None
+        else np.arange(nface, dtype=np.int64)
+    )
     if indices_to_compute.size == 0:
         return out
 
@@ -643,7 +600,9 @@ def compute_small_links_from_arrays(
     return int(small_edges.size), small_edges.astype(np.int64)
 
 
-def _signed_area_tri_deg(node_x: np.ndarray, node_y: np.ndarray, i: int, j: int, k: int) -> float:
+def _signed_area_tri_deg(
+    node_x: np.ndarray, node_y: np.ndarray, i: int, j: int, k: int
+) -> float:
     """Signed area (doubled) of triangle (i,j,k) in lon/lat degrees. Positive = CCW."""
     xi, yi = node_x[i], node_y[i]
     xj, yj = node_x[j], node_y[j]
@@ -705,42 +664,6 @@ def try_flip_small_flow_edge_ugrid(
     return True
 
 
-def try_flip_small_flow_edges_ugrid(
-    mesh: "MeshData",
-    small_edges_arr: np.ndarray,
-    removesmalllinkstrsh: float,
-    max_flip_iter: int = 20,
-    jsferic: int = 1,
-) -> int:
-    """
-    Repeatedly try to flip small flow edges (convex quad). After each flip, recompute small links.
-    Returns total number of flips performed.
-    """
-    total_flipped = 0
-    for _ in range(max_flip_iter):
-        flipped_any = False
-        for ei in range(small_edges_arr.size):
-            e = int(small_edges_arr[ei])
-            if try_flip_small_flow_edge_ugrid(mesh, e):
-                total_flipped += 1
-                flipped_any = True
-                break
-        if not flipped_any:
-            break
-        _, small_edges_arr = compute_small_links_from_arrays(
-            mesh.node_x,
-            mesh.node_y,
-            mesh.face_nodes,
-            mesh.edge_nodes,
-            mesh.edge_faces,
-            removesmalllinkstrsh=removesmalllinkstrsh,
-            jsferic=jsferic,
-        )
-        if small_edges_arr.size == 0:
-            break
-    return total_flipped
-
-
 def _edges_among_nodes(edge_nodes: np.ndarray, nodes: np.ndarray) -> np.ndarray:
     """Indices of edges whose both endpoints are in `nodes`."""
     m = np.isin(edge_nodes[:, 0], nodes) & np.isin(edge_nodes[:, 1], nodes)
@@ -772,6 +695,7 @@ def try_flip_candidate_edges_ugrid(
         return 0
 
     total_flipped = 0
+
     def _quad_max_cosphi(quad_edges: np.ndarray) -> float:
         cos = _cosphi_abs_for_edges(
             mesh.node_x,
@@ -820,7 +744,9 @@ def try_flip_candidate_edges_ugrid(
                 continue
 
             if quad_nodes is None:
-                mesh.edge_nodes, mesh.edge_faces = _build_edges_from_tria(mesh.face_nodes[:, :3])
+                mesh.edge_nodes, mesh.edge_faces = _build_edges_from_tria(
+                    mesh.face_nodes[:, :3]
+                )
                 total_flipped += 1
                 flipped_any = True
                 break
@@ -877,7 +803,9 @@ def try_flip_candidate_edges_ugrid(
     return total_flipped
 
 
-def _point_in_polygon(px: float, py: float, xv: np.ndarray, yv: np.ndarray, x0: float, y0: float) -> bool:
+def _point_in_polygon(
+    px: float, py: float, xv: np.ndarray, yv: np.ndarray, x0: float, y0: float
+) -> bool:
     """Exact copy from meshkernel_orthogonality: ray casting in projected coords."""
     n = len(xv)
     if n < 3:
@@ -941,7 +869,9 @@ def _circumcenter3d(xv: np.ndarray, yv: np.ndarray) -> Tuple[float, float]:
     N = len(xv)
     if N < 2:
         return float(xv[0]), float(yv[0])
-    xx = _sphertocart3d_vec(np.asarray(xv, dtype=np.float64), np.asarray(yv, dtype=np.float64))
+    xx = _sphertocart3d_vec(
+        np.asarray(xv, dtype=np.float64), np.asarray(yv, dtype=np.float64)
+    )
     xxc, yyc, zzc = np.mean(xx[:, 0]), np.mean(xx[:, 1]), np.mean(xx[:, 2])
     dtol, deps, maxiter = 1e-8, 1e-8, 100
     ip1 = np.arange(N)
@@ -971,7 +901,11 @@ def _circumcenter3d(xv: np.ndarray, yv: np.ndarray) -> Tuple[float, float]:
             A[1, 1] += tty[i] * tty[i]
             A[1, 2] += tty[i] * ttz[i]
             A[2, 2] += ttz[i] * ttz[i]
-            dinpr = (xxc - xxe[i]) * ttx[i] + (yyc - yye[i]) * tty[i] + (zzc - zze[i]) * ttz[i]
+            dinpr = (
+                (xxc - xxe[i]) * ttx[i]
+                + (yyc - yye[i]) * tty[i]
+                + (zzc - zze[i]) * ttz[i]
+            )
             rhs[0] -= dinpr * ttx[i]
             rhs[1] -= dinpr * tty[i]
             rhs[2] -= dinpr * ttz[i]
@@ -999,7 +933,9 @@ def _circumcenter3d(xv: np.ndarray, yv: np.ndarray) -> Tuple[float, float]:
     return _cart3dtospher(xxc, yyc, zzc, float(np.max(xv)))
 
 
-def _circumcenters3d_batch(xv: np.ndarray, yv: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def _circumcenters3d_batch(
+    xv: np.ndarray, yv: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     Batched `_circumcenter3d` for faces with an equal node count.
     xv, yv: (F, N) in deg -> (xz, yz), each (F,) in deg.
@@ -1130,7 +1066,9 @@ def _circumcenters3d_batch(xv: np.ndarray, yv: np.ndarray) -> Tuple[np.ndarray, 
     return _cart3dtospher_vec(xxc, yyc, zzc, np.max(xv, axis=1))
 
 
-def _circumcenters2d_batch(xv: np.ndarray, yv: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def _circumcenters2d_batch(
+    xv: np.ndarray, yv: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     Planar (jsferic=0) counterpart of `_circumcenters3d_batch` for faces with
     an equal node count. xv, yv: (F, N) in x/y -> (xz, yz), each (F,).
@@ -1291,8 +1229,12 @@ def _face_centers_circumcenter3d(
             out = np.where(~inside)[0]
             if out.size > 0:
                 x0o, y0o = x0[out], y0[out]
-                dx1 = _getdx_vec(x0o, y0o, mass_x[faces[out]], mass_y[faces[out]], jsferic)
-                dy1 = _getdy_vec(x0o, y0o, mass_x[faces[out]], mass_y[faces[out]], jsferic)
+                dx1 = _getdx_vec(
+                    x0o, y0o, mass_x[faces[out]], mass_y[faces[out]], jsferic
+                )
+                dy1 = _getdy_vec(
+                    x0o, y0o, mass_x[faces[out]], mass_y[faces[out]], jsferic
+                )
                 dx2 = _getdx_vec(x0o, y0o, xz[out], yz[out], jsferic)
                 dy2 = _getdy_vec(x0o, y0o, xz[out], yz[out], jsferic)
                 dxs = np.empty((out.size, n))
@@ -1310,8 +1252,12 @@ def _face_centers_circumcenter3d(
                     den = (dx2 - dx1) * (dyb - dya) - (dy2 - dy1) * (dxb - dxa)
                     hit = np.abs(den) >= 1e-15
                     den_safe = np.where(hit, den, 1.0)
-                    t = ((dxa - dx1) * (dyb - dya) - (dya - dy1) * (dxb - dxa)) / den_safe
-                    s = ((dxa - dx1) * (dy2 - dy1) - (dya - dy1) * (dx2 - dx1)) / den_safe
+                    t = (
+                        (dxa - dx1) * (dyb - dya) - (dya - dy1) * (dxb - dxa)
+                    ) / den_safe
+                    s = (
+                        (dxa - dx1) * (dy2 - dy1) - (dya - dy1) * (dx2 - dx1)
+                    ) / den_safe
                     hit &= (0 <= t) & (t <= 1) & (0 <= s) & (s <= 1)
                     xcr_l = dx1 + t * (dx2 - dx1)
                     ycr_l = dy1 + t * (dy2 - dy1)
@@ -1444,6 +1390,7 @@ def _edge_faces_from_faces_edges(
 # Index conversion: UGRID/orthogonality use 1-based; we use 0-based internally.
 # ---------------------------------------------------------------------------
 
+
 def _to_0b(arr: np.ndarray) -> np.ndarray:
     """Convert 1-based indices to 0-based (valid: 0..n-1, invalid: -1)."""
     out = np.where(arr > 0, arr - 1, -1)
@@ -1459,6 +1406,7 @@ def _to_1b(arr: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Orthogonality: |cosphi| on in-memory arrays (0-based in, cosphi_abs out)
 # ---------------------------------------------------------------------------
+
 
 def compute_cosphi_abs_from_arrays(
     node_x: np.ndarray,
@@ -1617,8 +1565,13 @@ def _cosphi_abs_for_edges(
     f1 = edge_faces[idx, 0]
     f2 = edge_faces[idx, 1]
     valid = (
-        (k3 >= 0) & (k4 >= 0) & (f1 >= 0) & (f2 >= 0) & (f1 != f2)
-        & (f1 < n_faces) & (f2 < n_faces)
+        (k3 >= 0)
+        & (k4 >= 0)
+        & (f1 >= 0)
+        & (f2 >= 0)
+        & (f1 != f2)
+        & (f1 < n_faces)
+        & (f2 < n_faces)
     )
     idx, k3, k4, f1, f2 = idx[valid], k3[valid], k4[valid], f1[valid], f2[valid]
     if idx.size == 0:
@@ -1637,8 +1590,14 @@ def _cosphi_abs_for_edges(
 
     if not use_circumcenter_3d:
         opp = _opposite_sides_vec(
-            node_x[k3], node_y[k3], node_x[k4], node_y[k4],
-            fx[p1], fy[p1], fx[p2], fy[p2],
+            node_x[k3],
+            node_y[k3],
+            node_x[k4],
+            node_y[k4],
+            fx[p1],
+            fy[p1],
+            fx[p2],
+            fy[p2],
             jsferic=jsferic,
         )
         idx, k3, k4, p1, p2 = idx[opp], k3[opp], k4[opp], p1[opp], p2[opp]
@@ -1649,14 +1608,26 @@ def _cosphi_abs_for_edges(
     dy_edge = _getdy_vec(node_x[k3], node_y[k3], node_x[k4], node_y[k4], jsferic)
     d = np.hypot(dx_edge, dy_edge)
     valid_d = d >= 1.0e-6
-    idx, k3, k4, p1, p2 = idx[valid_d], k3[valid_d], k4[valid_d], p1[valid_d], p2[valid_d]
+    idx, k3, k4, p1, p2 = (
+        idx[valid_d],
+        k3[valid_d],
+        k4[valid_d],
+        p1[valid_d],
+        p2[valid_d],
+    )
     if idx.size == 0:
         return cosphi_abs
 
     dcosphi = _dcosphi_sph_vec if jsferic == 1 else _dcosphi_flat_vec
     cosphi_abs[idx] = dcosphi(
-        fx[p1], fy[p1], fx[p2], fy[p2],
-        node_x[k3], node_y[k3], node_x[k4], node_y[k4],
+        fx[p1],
+        fy[p1],
+        fx[p2],
+        fy[p2],
+        node_x[k3],
+        node_y[k3],
+        node_x[k4],
+        node_y[k4],
     )
     return cosphi_abs
 
@@ -1673,20 +1644,6 @@ class MeshData:
     face_nodes: np.ndarray
     edge_nodes: np.ndarray
     edge_faces: np.ndarray
-
-
-def _build_node_to_faces(face_nodes: np.ndarray) -> List[List[int]]:
-    """Node -> faces connectivity table (0-based indices)."""
-    if face_nodes.size == 0:
-        return []
-    max_node = max(0, int(face_nodes.max()))
-    mapping: List[List[int]] = [[] for _ in range(max_node + 1)]
-    n_faces = face_nodes.shape[0]
-    for f in range(n_faces):
-        for n in face_nodes[f, :]:
-            if n >= 0:
-                mapping[int(n)].append(f)
-    return mapping
 
 
 def _classify_zone_nodes(
@@ -1708,13 +1665,17 @@ def _classify_zone_nodes(
             np.empty(0, dtype=np.int64),
         )
 
-    max_node = int(max(int(zone_nodes.max()), int(edge_nodes.max()), int(face_nodes.max())))
+    max_node = int(
+        max(int(zone_nodes.max()), int(edge_nodes.max()), int(face_nodes.max()))
+    )
     in_zone = np.zeros(max_node + 2, dtype=bool)
     in_zone[zone_nodes] = True
 
     # Node appears in a face outside the zone -> boundary.
     zone_face_mask = np.zeros(face_nodes.shape[0], dtype=bool)
-    zone_face_mask[np.fromiter(faces_zone, dtype=np.int64, count=len(faces_zone))] = True
+    zone_face_mask[np.fromiter(faces_zone, dtype=np.int64, count=len(faces_zone))] = (
+        True
+    )
     out_nodes = face_nodes[~zone_face_mask, :].ravel()
     out_nodes = out_nodes[out_nodes >= 0]
     appears_outside = np.zeros(max_node + 2, dtype=bool)
@@ -1743,6 +1704,7 @@ def _classify_zone_nodes(
 # Zone graph (face adjacency, BFS, zone nodes)
 # ---------------------------------------------------------------------------
 
+
 def build_face_adjacency(edge_faces: np.ndarray, n_faces: int) -> List[List[int]]:
     """Adjacency graph (neighboring faces via a shared edge; sorted, unique)."""
     ef = np.asarray(edge_faces)
@@ -1753,15 +1715,23 @@ def build_face_adjacency(edge_faces: np.ndarray, n_faces: int) -> List[List[int]
     dst = np.concatenate([b, a])
     order = np.lexsort((dst, src))
     src, dst = src[order], dst[order]
-    keep = np.r_[True, (src[1:] != src[:-1]) | (dst[1:] != dst[:-1])] if src.size else np.zeros(0, dtype=bool)
+    keep = (
+        np.r_[True, (src[1:] != src[:-1]) | (dst[1:] != dst[:-1])]
+        if src.size
+        else np.zeros(0, dtype=bool)
+    )
     src, dst = src[keep], dst[keep]
-    counts = np.bincount(src, minlength=n_faces) if src.size else np.zeros(n_faces, dtype=np.int64)
+    counts = (
+        np.bincount(src, minlength=n_faces)
+        if src.size
+        else np.zeros(n_faces, dtype=np.int64)
+    )
     dst_list = dst.tolist()
     neigh: List[List[int]] = []
     idx = 0
     for f in range(n_faces):
         c = int(counts[f])
-        neigh.append(dst_list[idx:idx + c])
+        neigh.append(dst_list[idx : idx + c])
         idx += c
     return neigh
 
@@ -1795,30 +1765,6 @@ def zone_nodes_from_faces(face_nodes: np.ndarray, faces_zone: Set[int]) -> np.nd
     nodes = face_nodes[f_idx, :].ravel()
     nodes = nodes[nodes >= 0]
     return np.unique(nodes.astype(np.int64))
-
-
-def _triangles_from_face_nodes(face_nodes: np.ndarray) -> np.ndarray:
-    """
-    Build a triangle (EDGE) array from face_nodes (0-based; -1 = invalid).
-
-    Each polygon face (n>=3) is triangulated in fan mode around the first node.
-    Returns 0-based triangle indices as expected by adcirc2DFlowFM.
-    """
-    tris: List[Tuple[int, int, int]] = []
-    n_faces = face_nodes.shape[0]
-    for f in range(n_faces):
-        row = face_nodes[f, :]
-        nodes = row[row >= 0]
-        if nodes.size < 3:
-            continue
-        n0 = int(nodes[0])
-        for i in range(1, nodes.size - 1):
-            n1 = int(nodes[i])
-            n2 = int(nodes[i + 1])
-            tris.append((n0, n1, n2))
-    if tris:
-        return np.asarray(tris, dtype=np.int64)
-    return np.empty((0, 3), dtype=np.int64)
 
 
 def apply_combined_ortho_smoother_to_zone(
@@ -1860,14 +1806,17 @@ def apply_combined_ortho_smoother_to_zone(
     )
     internal_set: Set[int] = set(int(n) for n in internal_global.tolist())
 
-    # Neighbors in the zone (for smooth term); [Improvement 4] also all neighbors (incl. out-of-zone) for boundary
+    # Neighbors in the zone (for smooth term); also all neighbors (incl. out-of-zone) for boundary
     zone_set: Set[int] = set(int(n) for n in zone_nodes.tolist())
     neighbors: Dict[int, Set[int]] = {int(n): set() for n in zone_nodes.tolist()}
     all_neighbors: Dict[int, Set[int]] = {int(n): set() for n in zone_nodes.tolist()}
     en1 = mesh.edge_nodes[:, 0]
     en2 = mesh.edge_nodes[:, 1]
     ok_e = (en1 >= 0) & (en2 >= 0)
-    zmask = np.zeros(int(max(zone_nodes.max(), en1.max(initial=0), en2.max(initial=0))) + 2, dtype=bool)
+    zmask = np.zeros(
+        int(max(zone_nodes.max(), en1.max(initial=0), en2.max(initial=0))) + 2,
+        dtype=bool,
+    )
     zmask[zone_nodes] = True
     in1 = ok_e & zmask[np.where(ok_e, en1, -1)]
     in2 = ok_e & zmask[np.where(ok_e, en2, -1)]
@@ -1905,7 +1854,11 @@ def apply_combined_ortho_smoother_to_zone(
     else:
         eval_edges_arr = edges_in_zone_arr
     # Small-link edges in this zone (when global small list is provided)
-    small_edges_set = set(small_edges_global.tolist()) if small_edges_global is not None and small_edges_global.size > 0 else set()
+    small_edges_set = (
+        set(small_edges_global.tolist())
+        if small_edges_global is not None and small_edges_global.size > 0
+        else set()
+    )
     small_in_zone = [e for e in edges_in_zone if e in small_edges_set]
     n_small_zone_before = 0
     # Topology is fixed during this zone call: precompute the per-face interior
@@ -1982,16 +1935,20 @@ def apply_combined_ortho_smoother_to_zone(
             dist_weight[int(n)] = 1.0
 
     # When zone is already below cosphi threshold (e.g. only small-link), use smaller steps
-    # and no Laplacian (scale_smooth=0) to avoid degrading orthogonality at zone boundaries [Improvement 1]
+    # and no Laplacian (scale_smooth=0) to avoid degrading orthogonality at zone boundaries
     zone_already_good = max_cosphi_before <= cosphi_threshold
     relax_zone = 0.12 if zone_already_good else relax
     scale_smooth = 0.0 if zone_already_good else 1.0
-    # [Improvement 3] Very-good zones (max_cosphi already very low, only small-link): cap relax further
+    # Very-good zones (max_cosphi already very low, only small-link): cap relax further
     cosphi_very_good = 0.05
-    if zone_already_good and max_cosphi_before < cosphi_very_good and n_small_zone_before > 0:
+    if (
+        zone_already_good
+        and max_cosphi_before < cosphi_very_good
+        and n_small_zone_before > 0
+    ):
         relax_zone = min(relax_zone, 0.08)
 
-    # [Improvement 5] Skip [good] zones with no small links: nothing to do, avoid useless rollbacks
+    # Skip [good] zones with no small links: nothing to do, avoid useless rollbacks
     if zone_already_good and n_small_zone_before == 0:
         if verbose:
             print(
@@ -2026,7 +1983,7 @@ def apply_combined_ortho_smoother_to_zone(
         )
 
     for inner_i in range(max(1, int(n_inner))):
-        # Smooth term (local Laplacian); [Improvement 4] boundary: include out-of-zone neighbors with weight w_out
+        # Smooth term (local Laplacian); boundary: include out-of-zone neighbors with weight w_out
         dx_s = np.zeros_like(mesh.node_x)
         dy_s = np.zeros_like(mesh.node_y)
         for g in zone_nodes:
@@ -2082,7 +2039,12 @@ def apply_combined_ortho_smoother_to_zone(
                         if fe >= 0:
                             for vtx in mesh.face_nodes[fe, :3]:
                                 vtx = int(vtx)
-                                if vtx >= 0 and vtx != g3 and vtx != g4 and vtx in internal_set:
+                                if (
+                                    vtx >= 0
+                                    and vtx != g3
+                                    and vtx != g4
+                                    and vtx in internal_set
+                                ):
                                     opps.append(vtx)
                     if not (move3 or move4 or opps):
                         continue
@@ -2170,7 +2132,8 @@ def apply_combined_ortho_smoother_to_zone(
                             if improve > best_improve and new_val < base_val:
                                 best_improve = improve
                                 best_moves = [
-                                    (nd, step * udx, step * udy) for nd, udx, udy in moves
+                                    (nd, step * udx, step * udy)
+                                    for nd, udx, udy in moves
                                 ]
                                 if new_val <= cosphi_threshold:
                                     done = True
@@ -2182,14 +2145,14 @@ def apply_combined_ortho_smoother_to_zone(
                             dx_o[nd] += ddx
                             dy_o[nd] += ddy
 
-        # Small-link term [V3]: pymesh2d-style — move opposite vertices along circumcenter separation
+        # Small-link term: move opposite vertices along circumcenter separation
         dx_small = np.zeros_like(mesh.node_x)
         dy_small = np.zeros_like(mesh.node_y)
         alpha_small = 0.05
         beta_small = 0.5
         max_small_edges_per_zone = 6
         step_small = min(alpha_small * 0.12, 0.004)
-        # [V3-safe] Much less aggressive: only in fairly good zones, and smaller steps
+        # Much less aggressive: only in fairly good zones, and smaller steps
         # - Only apply when the zone is already reasonably orthogonal (max_cosphi_before <= 0.30)
         # - Softer aggressive_factor
         # - Clamp step_meters tightly to avoid overshoot and cosphi blow-up
@@ -2205,11 +2168,7 @@ def apply_combined_ortho_smoother_to_zone(
         # pipeline where remaining links were merge's job.
         if small_in_zone and (
             (smalllink_priority and zone_already_good)
-            or (
-                zone_already_good
-                and max_cosphi_before <= 0.30
-                and (inner_i % 2 == 0)
-            )
+            or (zone_already_good and max_cosphi_before <= 0.30 and (inner_i % 2 == 0))
         ):
             _, small_zone_current = compute_small_links_from_arrays(
                 mesh.node_x,
@@ -2240,8 +2199,11 @@ def apply_combined_ortho_smoother_to_zone(
             face_mask_links[link_faces_arr] = True
             vert_deg = np.column_stack([mesh.node_x, mesh.node_y])
             circum_ll = _circumcenters_lonlat_ugrid(
-                vert_deg, mesh.face_nodes, mesh.edge_faces,
-                face_mask=face_mask_links, jsferic=jsferic,
+                vert_deg,
+                mesh.face_nodes,
+                mesh.edge_faces,
+                face_mask=face_mask_links,
+                jsferic=jsferic,
                 num_interior=num_interior_pre,
             )
             tria = mesh.face_nodes[:, :3]
@@ -2257,8 +2219,12 @@ def apply_combined_ortho_smoother_to_zone(
                 nodes_lf = np.unique(tv)
                 x0a = np.full(nodes_lf.size, x0m)
                 y0a = np.full(nodes_lf.size, y0m)
-                ux = _getdx_vec(x0a, y0a, mesh.node_x[nodes_lf], mesh.node_y[nodes_lf], jsferic)
-                uy = _getdy_vec(x0a, y0a, mesh.node_x[nodes_lf], mesh.node_y[nodes_lf], jsferic)
+                ux = _getdx_vec(
+                    x0a, y0a, mesh.node_x[nodes_lf], mesh.node_y[nodes_lf], jsferic
+                )
+                uy = _getdy_vec(
+                    x0a, y0a, mesh.node_x[nodes_lf], mesh.node_y[nodes_lf], jsferic
+                )
                 q0 = np.searchsorted(nodes_lf, tv[:, 0])
                 q1 = np.searchsorted(nodes_lf, tv[:, 1])
                 q2 = np.searchsorted(nodes_lf, tv[:, 2])
@@ -2275,14 +2241,20 @@ def apply_combined_ortho_smoother_to_zone(
                 f1, f2, k3, k4 = int(f1), int(f2), int(k3), int(k4)
                 tri1 = mesh.face_nodes[f1, :3]
                 tri2 = mesh.face_nodes[f2, :3]
-                opp1 = next((int(v) for v in tri1 if v >= 0 and v != k3 and v != k4), None)
-                opp2 = next((int(v) for v in tri2 if v >= 0 and v != k3 and v != k4), None)
+                opp1 = next(
+                    (int(v) for v in tri1 if v >= 0 and v != k3 and v != k4), None
+                )
+                opp2 = next(
+                    (int(v) for v in tri2 if v >= 0 and v != k3 and v != k4), None
+                )
                 if opp1 is None or opp2 is None or opp1 == opp2:
                     continue
                 move_opp1 = opp1 in internal_set
                 move_opp2 = opp2 in internal_set
                 if not (move_opp1 or move_opp2):
-                    if smalllink_priority and (k3 in internal_set or k4 in internal_set):
+                    if smalllink_priority and (
+                        k3 in internal_set or k4 in internal_set
+                    ):
                         # Boundary-locked apexes: fall back to searching moves
                         # of the shared edge's endpoints instead.
                         opp1, opp2 = k3, k4
@@ -2303,7 +2275,9 @@ def apply_combined_ortho_smoother_to_zone(
                 dxlim = 0.9 * removesmalllinkstrsh * 0.5 * (sqrt_ba1 + sqrt_ba2)
                 if dxlink >= dxlim:
                     continue
-                max_step_meters = min(np.sqrt(max(ba[f1], 1e-20)), np.sqrt(max(ba[f2], 1e-20))) * 0.5
+                max_step_meters = (
+                    min(np.sqrt(max(ba[f1], 1e-20)), np.sqrt(max(ba[f2], 1e-20))) * 0.5
+                )
 
                 if smalllink_priority:
                     # Probe-style search: move the apexes along the edge's
@@ -2344,8 +2318,11 @@ def apply_combined_ortho_smoother_to_zone(
                                     mesh.node_x[opp2] = keep2[0] + s2 * step * axx
                                     mesh.node_y[opp2] = keep2[1] + s2 * step * axy
                                 n_tr, _ = compute_small_links_from_arrays(
-                                    mesh.node_x, mesh.node_y,
-                                    mesh.face_nodes, mesh.edge_nodes, mesh.edge_faces,
+                                    mesh.node_x,
+                                    mesh.node_y,
+                                    mesh.face_nodes,
+                                    mesh.edge_nodes,
+                                    mesh.edge_faces,
                                     removesmalllinkstrsh=removesmalllinkstrsh,
                                     edge_indices=edges_in_zone_arr,
                                     jsferic=jsferic,
@@ -2354,15 +2331,21 @@ def apply_combined_ortho_smoother_to_zone(
                                 ok_trial = int(n_tr) < n_small_zone_current
                                 if ok_trial:
                                     cq = _cosphi_abs_for_edges(
-                                        mesh.node_x, mesh.node_y,
-                                        mesh.face_nodes, mesh.edge_nodes, mesh.edge_faces,
+                                        mesh.node_x,
+                                        mesh.node_y,
+                                        mesh.face_nodes,
+                                        mesh.edge_nodes,
+                                        mesh.edge_faces,
                                         quad_edges,
                                         use_circumcenter_3d=True,
                                         jsferic=jsferic,
                                     )
                                     vals = cq[quad_edges]
                                     vals = vals[np.isfinite(vals)]
-                                    if vals.size and float(np.max(vals)) > cosphi_threshold:
+                                    if (
+                                        vals.size
+                                        and float(np.max(vals)) > cosphi_threshold
+                                    ):
                                         ok_trial = False
                                 mesh.node_x[opp1], mesh.node_y[opp1] = keep1
                                 mesh.node_x[opp2], mesh.node_y[opp2] = keep2
@@ -2383,7 +2366,9 @@ def apply_combined_ortho_smoother_to_zone(
                     continue
 
                 needed_distance = (dxlim - dxlink) * aggressive_factor
-                cc_diff_deg = np.array([cc2[0] - cc1[0], cc2[1] - cc1[1]], dtype=np.float64)
+                cc_diff_deg = np.array(
+                    [cc2[0] - cc1[0], cc2[1] - cc1[1]], dtype=np.float64
+                )
                 # Conservative step: at most 25% of needed distance, and at most half the current link length
                 step_meters = min(needed_distance * 0.25, max_step_meters, 0.5 * dxlink)
                 if step_meters < 1e-12:
@@ -2404,8 +2389,11 @@ def apply_combined_ortho_smoother_to_zone(
                         trial_x[opp2] = mesh.node_x[opp2] + d2[0]
                         trial_y[opp2] = mesh.node_y[opp2] + d2[1]
                     _, small_trial = compute_small_links_from_arrays(
-                        trial_x, trial_y,
-                        mesh.face_nodes, mesh.edge_nodes, mesh.edge_faces,
+                        trial_x,
+                        trial_y,
+                        mesh.face_nodes,
+                        mesh.edge_nodes,
+                        mesh.edge_faces,
                         removesmalllinkstrsh=removesmalllinkstrsh,
                         edge_indices=edges_in_zone_arr,
                         jsferic=jsferic,
@@ -2458,8 +2446,8 @@ def apply_combined_ortho_smoother_to_zone(
         mesh.node_x[:] = new_x
         mesh.node_y[:] = new_y
 
-    # [Improvement 2] Line search: try factors 1.0, 0.5, 0.25 on total displacement to avoid rollback
-    # [Improvement 5] For [good] zones: accept "no degradation" (max_ca <= threshold, n_small_za <= n_small_before)
+    # Line search: try factors 1.0, 0.5, 0.25 on total displacement to avoid rollback
+    # For [good] zones: accept "no degradation" (max_ca <= threshold, n_small_za <= n_small_before)
     delta_x = mesh.node_x[zone_idx].copy() - x_old
     delta_y = mesh.node_y[zone_idx].copy() - y_old
     mesh.node_x[zone_idx] = x_old
@@ -2480,98 +2468,106 @@ def apply_combined_ortho_smoother_to_zone(
     min_cosphi_after = 0.0
     n_small_zone_after = n_small_zone_before
     for cand_dx, cand_dy in delta_candidates:
-      if improved:
-          break
-      for factor in (1.0, 0.5, 0.25):
-        mesh.node_x[zone_idx] = x_old + factor * cand_dx
-        mesh.node_y[zone_idx] = y_old + factor * cand_dy
-        cosphi_after = _cosphi_abs_for_edges(
-            mesh.node_x,
-            mesh.node_y,
-            mesh.face_nodes,
-            mesh.edge_nodes,
-            mesh.edge_faces,
-            eval_edges_arr,
-            use_circumcenter_3d=True,
-            jsferic=jsferic,
-        )
-        cos_zone_after = np.abs(cosphi_after[eval_edges_arr])
-        mask_after = np.isfinite(cos_zone_after)
-        if not np.any(mask_after):
-            continue
-        max_ca = float(np.max(cos_zone_after[mask_after]))
-        min_ca = float(np.min(cos_zone_after[mask_after]))
-        n_small_za = 0
-        if small_edges_global is not None and small_edges_global.size > 0:
-            _, small_zone_after_list = compute_small_links_from_arrays(
+        if improved:
+            break
+        for factor in (1.0, 0.5, 0.25):
+            mesh.node_x[zone_idx] = x_old + factor * cand_dx
+            mesh.node_y[zone_idx] = y_old + factor * cand_dy
+            cosphi_after = _cosphi_abs_for_edges(
                 mesh.node_x,
                 mesh.node_y,
                 mesh.face_nodes,
                 mesh.edge_nodes,
                 mesh.edge_faces,
-                removesmalllinkstrsh=removesmalllinkstrsh,
-                edge_indices=edges_in_zone_arr,
+                eval_edges_arr,
+                use_circumcenter_3d=True,
                 jsferic=jsferic,
-                num_interior=num_interior_pre,
             )
-            n_small_za = len(small_zone_after_list)
-        is_strict_improved = (
-            max_ca < max_cosphi_before
-            or (
+            cos_zone_after = np.abs(cosphi_after[eval_edges_arr])
+            mask_after = np.isfinite(cos_zone_after)
+            if not np.any(mask_after):
+                continue
+            max_ca = float(np.max(cos_zone_after[mask_after]))
+            min_ca = float(np.min(cos_zone_after[mask_after]))
+            n_small_za = 0
+            if small_edges_global is not None and small_edges_global.size > 0:
+                _, small_zone_after_list = compute_small_links_from_arrays(
+                    mesh.node_x,
+                    mesh.node_y,
+                    mesh.face_nodes,
+                    mesh.edge_nodes,
+                    mesh.edge_faces,
+                    removesmalllinkstrsh=removesmalllinkstrsh,
+                    edge_indices=edges_in_zone_arr,
+                    jsferic=jsferic,
+                    num_interior=num_interior_pre,
+                )
+                n_small_za = len(small_zone_after_list)
+            is_strict_improved = max_ca < max_cosphi_before or (
                 small_edges_global is not None
                 and small_edges_global.size > 0
                 and n_small_za < n_small_zone_before
                 and max_ca <= cosphi_threshold
             )
-        )
-        if zone_already_good:
-            # For [good]: accept only if we don't degrade orthogonality near the zone boundary too much.
-            # This prevents "small-link only" actions from quietly increasing max|cosphi| in the crown.
-            ortho_slack = 0.02
-            if smalllink_priority:
-                # Clearing a link may legitimately trade |cosphi| slack below
-                # the criteria threshold; capping at max_before+0.02 vetoes
-                # valid repairs in already-very-orthogonal zones.
-                ortho_cap = cosphi_threshold
-            else:
-                ortho_cap = min(cosphi_threshold, max_cosphi_before + ortho_slack)
-            is_acceptable = (max_ca <= ortho_cap) and (n_small_za <= n_small_zone_before)
-            if is_acceptable and not improved:
-                improved = True
-                best_factor = factor
-                best_delta = (cand_dx, cand_dy)
-                max_cosphi_after = max_ca
-                min_cosphi_after = min_ca
-                n_small_zone_after = n_small_za
-            elif is_acceptable and improved:
+            if zone_already_good:
+                # For [good]: accept only if we don't degrade orthogonality near the zone boundary too much.
+                # This prevents "small-link only" actions from quietly increasing max|cosphi| in the crown.
+                ortho_slack = 0.02
                 if smalllink_priority:
-                    # Prefer clearing links first, then smaller max_ca, then larger factor
-                    better = n_small_za < n_small_zone_after or (
-                        n_small_za == n_small_zone_after
-                        and (max_ca < max_cosphi_after or (max_ca == max_cosphi_after and factor > best_factor))
-                    )
+                    # Clearing a link may legitimately trade |cosphi| slack below
+                    # the criteria threshold; capping at max_before+0.02 vetoes
+                    # valid repairs in already-very-orthogonal zones.
+                    ortho_cap = cosphi_threshold
                 else:
-                    # Prefer smaller max_ca, then smaller n_small_za, then larger factor
-                    better = max_ca < max_cosphi_after or (
-                        max_ca == max_cosphi_after
-                        and (n_small_za < n_small_zone_after or (n_small_za == n_small_zone_after and factor > best_factor))
-                    )
-                if better:
+                    ortho_cap = min(cosphi_threshold, max_cosphi_before + ortho_slack)
+                is_acceptable = (max_ca <= ortho_cap) and (
+                    n_small_za <= n_small_zone_before
+                )
+                if is_acceptable and not improved:
+                    improved = True
                     best_factor = factor
                     best_delta = (cand_dx, cand_dy)
                     max_cosphi_after = max_ca
                     min_cosphi_after = min_ca
                     n_small_zone_after = n_small_za
-        else:
-            # [bad] zone: first strict improvement wins
-            if is_strict_improved:
-                improved = True
-                best_factor = factor
-                best_delta = (cand_dx, cand_dy)
-                max_cosphi_after = max_ca
-                min_cosphi_after = min_ca
-                n_small_zone_after = n_small_za
-                break
+                elif is_acceptable and improved:
+                    if smalllink_priority:
+                        # Prefer clearing links first, then smaller max_ca, then larger factor
+                        better = n_small_za < n_small_zone_after or (
+                            n_small_za == n_small_zone_after
+                            and (
+                                max_ca < max_cosphi_after
+                                or (max_ca == max_cosphi_after and factor > best_factor)
+                            )
+                        )
+                    else:
+                        # Prefer smaller max_ca, then smaller n_small_za, then larger factor
+                        better = max_ca < max_cosphi_after or (
+                            max_ca == max_cosphi_after
+                            and (
+                                n_small_za < n_small_zone_after
+                                or (
+                                    n_small_za == n_small_zone_after
+                                    and factor > best_factor
+                                )
+                            )
+                        )
+                    if better:
+                        best_factor = factor
+                        best_delta = (cand_dx, cand_dy)
+                        max_cosphi_after = max_ca
+                        min_cosphi_after = min_ca
+                        n_small_zone_after = n_small_za
+            else:
+                # [bad] zone: first strict improvement wins
+                if is_strict_improved:
+                    improved = True
+                    best_factor = factor
+                    best_delta = (cand_dx, cand_dy)
+                    max_cosphi_after = max_ca
+                    min_cosphi_after = min_ca
+                    n_small_zone_after = n_small_za
+                    break
     if improved and zone_already_good:
         # Apply best factor (we may have tried several)
         mesh.node_x[zone_idx] = x_old + best_factor * best_delta[0]
@@ -2601,98 +2597,61 @@ def apply_combined_ortho_smoother_to_zone(
 
 
 # ---------------------------------------------------------------------------
-# Main orthogonalization loop by zones
+# Triangle-mesh entry point: orthogonalize (vert, tria) directly.
 # ---------------------------------------------------------------------------
 
 
-def _log_ortho_parameters(
-    cosphi_threshold: float,
-    removesmalllinkstrsh: float,
-    buffer_layers: int,
-    max_global_iter: int,
-    smooth_iter: float,
-) -> None:
-    """Print tunable parameters once for easy re-tuning; zone defaults are in apply_combined_ortho_smoother_to_zone."""
-    print("[ORTHO] Parameters (tune in code or extend CLI):")
-    print(
-        f"  global: cosphi_threshold={cosphi_threshold} removesmalllinkstrsh={removesmalllinkstrsh} "
-        f"buffer_layers={buffer_layers} max_global_iter={max_global_iter} smooth_iter={smooth_iter}"
-    )
-    print(
-        "  zone: relax=0.2 mu_max=0.4 n_inner=smooth_iter  "
-        "| when max_cosphi<=threshold: relax_zone=0.12 scale_smooth=0 (v2)"
-    )
-    print("  line_search=1.0,0.5,0.25 | [good] accept no-degradation (max_ca<=thr, n_small not increase)")
-    print("  Laplacian out-of-zone weight=0.3")
-    print(
-        "  zone ortho: alpha=0.025 top_loc_edges=3  "
-        "| zone small_link: step_small=0.004 beta_small=0.5 max_small_edges_per_zone=4"
-    )
-    print("  [good] = zone with max|cosphi|<=threshold (small-link only); [bad] = zone with cosphi>threshold")
+@dataclass
+class TriaOrthoResult:
+    vert: np.ndarray  # (N,2) float64
+    tria: np.ndarray  # (T,3) int64 (topology unchanged unless edge flips are enabled)
+    max_cosphi: float
+    n_small_flow_links: int
+    n_zones_orthogonalized: int
 
 
-def orthogonalize_netcdf(
-    input_path: str,
-    output_path: Optional[str] = None,
+def orthogonalize_tria_mesh(
+    vert: np.ndarray,
+    tria: np.ndarray,
+    *,
     cosphi_threshold: float = 0.49,
     removesmalllinkstrsh: float = 0.1,
     buffer_layers: int = 2,
-    max_global_iter: int = 10,
-    smooth_iter: int = 4,
-    merge_small_links: bool = False,
+    max_global_iter: int = 8,
+    smooth_iter: int = 16,
+    enable_edge_flips: bool = True,
     verbose: bool = True,
-) -> float:
+    jsferic: int = 1,
+    smalllink_priority: bool = False,
+) -> TriaOrthoResult:
     """
-    Orthogonalize a *_net.nc* file by zones until max(|cosphi|) < `cosphi_threshold`
-    (or iterations are exhausted).
+    Orthogonalize a pure triangle mesh, working directly on ``(vert, tria)``.
 
     Parameters
     ----------
-    input_path : str
-        Input UGRID NetCDF file (mesh unmodified).
-    output_path : str, optional
-        Output NetCDF file. If None, suffix `_ortho` is added before extension.
-    cosphi_threshold : float
-        Maximum acceptable threshold for |cosphi| (default 0.49).
-    removesmalllinkstrsh : float
-        Small flow links threshold for circumcenter criterion (default 0.1).
-    buffer_layers : int
-        Topological radius (number of cell layers) around each problematic
-        element (2 or 3 recommended).
-    max_global_iter : int
-        Maximum number of global iterations (recomputes cosphi after each
-        pass over all zones).
-    smooth_iter : int
-        Number of local elliptic smoothing `smooth_delft` iterations per zone.
-    merge_small_links : bool
-        If True and small links remain after ortho, run pymesh2d merge_circumcenters
-        on the output file to merge triangle pairs into quads (default False).
-    verbose : bool
-        If True (default), print per-zone "[ZONE] ..." progress logs.
+    vert : (N, 2) float array
+        Node coordinates: lon/lat degrees for ``jsferic=1``, projected x/y for
+        ``jsferic=0``.
+    tria : (T, 3) int array
+        0-based triangle connectivity.
 
-    Returns
-    -------
-    max_cosphi : float
-        Final value of max(|cosphi|) on internal edges.
+    Notes
+    -----
+    - Topology changes only when ``enable_edge_flips=True``, and only via local
+      edge flips inside convex quads (the mesh stays triangles).
+    - No merging into quads is performed here.
     """
-    if output_path is None:
-        if input_path.endswith(".nc"):
-            output_path = input_path[:-3] + "_ortho.nc"
-        else:
-            output_path = input_path + "_ortho.nc"
+    vert = np.asarray(vert, dtype=np.float64)
+    if vert.ndim != 2 or vert.shape[1] != 2:
+        raise ValueError("vert must be an array of shape (N,2)")
+    tria = np.asarray(tria, dtype=np.int64)
 
-    # Load UGRID (file is 1-based); convert to 0-based for internal use
-    print("[ORTHO] Loading mesh...")
-    node_x, node_y, fn_1b, en_1b, ef_1b, fx, fy = _load_ugrid(input_path)
-    if ef_1b is None:
-        ef_1b = _edge_faces_from_faces_edges(fn_1b, en_1b)
-    face_nodes = _to_0b(fn_1b)
-    edge_nodes = _to_0b(en_1b)
-    edge_faces = _to_0b(ef_1b)
+    face_nodes = tria.copy()
+    edge_nodes, edge_faces = _build_edges_from_tria(tria)
 
     mesh = MeshData(
-        node_x=node_x.copy(),
-        node_y=node_y.copy(),
+        node_x=vert[:, 0].copy(),
+        node_y=vert[:, 1].copy(),
         face_nodes=face_nodes,
         edge_nodes=edge_nodes,
         edge_faces=edge_faces,
@@ -2701,67 +2660,25 @@ def orthogonalize_netcdf(
     n_faces = face_nodes.shape[0]
     face_neighbors = build_face_adjacency(mesh.edge_faces, n_faces)
 
-    print("[ORTHO] Computing initial cosphi and small links...")
-    _, _, cosphi_abs0 = compute_cosphi_abs_from_arrays(
-        mesh.node_x,
-        mesh.node_y,
-        mesh.face_nodes,
-        mesh.edge_nodes,
-        mesh.edge_faces,
-        use_file_centers=False,
-        use_circumcenter_3d=True,
-    )
-    n_small0, _ = compute_small_links_from_arrays(
-        mesh.node_x,
-        mesh.node_y,
-        mesh.face_nodes,
-        mesh.edge_nodes,
-        mesh.edge_faces,
-        removesmalllinkstrsh=removesmalllinkstrsh,
-    )
-    mask0 = ~np.isnan(cosphi_abs0)
-    if np.any(mask0):
-        max0 = float(np.nanmax(cosphi_abs0[mask0]))
-        nb_bad0 = int(np.count_nonzero(cosphi_abs0[mask0] > cosphi_threshold))
-        print(
-            f"[ORTHO] Initial state: max |cosphi| = {max0:.6f} "
-            f"(threshold={cosphi_threshold:.3f}, edges > threshold = {nb_bad0}), "
-            f"n_small_flow_links = {n_small0}"
-        )
-    else:
-        print(
-            f"[ORTHO] No valid internal edge found in initial state. "
-            f"n_small_flow_links = {n_small0}"
-        )
+    # Number of zone passes run (reported for the pipeline's progress log).
+    n_zones_orthogonalized = 0
 
-    # Log all tunable parameters once for easy re-tuning (edit defaults in code or add CLI later)
-    _log_ortho_parameters(
-        cosphi_threshold=cosphi_threshold,
-        removesmalllinkstrsh=removesmalllinkstrsh,
-        buffer_layers=buffer_layers,
-        max_global_iter=max_global_iter,
-        smooth_iter=smooth_iter,
-    )
-
-    # Single loop: process bad cosphi + small-link edges together (two-phase caused phase2 never reached)
-    for it in range(max_global_iter):
+    for it in range(int(max_global_iter)):
         _, _, cosphi_abs = compute_cosphi_abs_from_arrays(
             mesh.node_x,
             mesh.node_y,
             mesh.face_nodes,
             mesh.edge_nodes,
             mesh.edge_faces,
-            use_file_centers=False,
             use_circumcenter_3d=True,
+            jsferic=jsferic,
         )
-
         mask = ~np.isnan(cosphi_abs)
         if not np.any(mask):
-            print(f"[ORTHO] Iter {it}: no valid internal edge, stop.")
             break
 
         max_cosphi = float(np.nanmax(cosphi_abs[mask]))
-        nb_bad = int(np.count_nonzero(cosphi_abs[mask] > cosphi_threshold))
+        bad_edges = np.where((mask) & (cosphi_abs > cosphi_threshold))[0]
         n_small, small_edges_arr = compute_small_links_from_arrays(
             mesh.node_x,
             mesh.node_y,
@@ -2769,82 +2686,76 @@ def orthogonalize_netcdf(
             mesh.edge_nodes,
             mesh.edge_faces,
             removesmalllinkstrsh=removesmalllinkstrsh,
+            jsferic=jsferic,
         )
-        # [V3] Try to fix small links by edge flip (convex quad) before zone smoothing.
-        # Guardrail: keep flips only if they don't worsen max|cosphi| too much.
-        if n_small > 0:
-            max_cosphi_before_flip = max_cosphi
-            face_nodes_before_flip = mesh.face_nodes.copy()
-            n_flipped = try_flip_small_flow_edges_ugrid(mesh, small_edges_arr, removesmalllinkstrsh)
-            if n_flipped > 0:
-                _, _, cosphi_abs_tmp = compute_cosphi_abs_from_arrays(
-                    mesh.node_x,
-                    mesh.node_y,
-                    mesh.face_nodes,
-                    mesh.edge_nodes,
-                    mesh.edge_faces,
-                    use_file_centers=False,
-                    use_circumcenter_3d=True,
-                )
-                mask_tmp = ~np.isnan(cosphi_abs_tmp)
-                max_cosphi_after_flip = float(np.nanmax(cosphi_abs_tmp[mask_tmp])) if np.any(mask_tmp) else max_cosphi_before_flip
-                if max_cosphi_after_flip > max_cosphi_before_flip + 0.02:
-                    # revert flips
-                    mesh.face_nodes[:] = face_nodes_before_flip
-                    print(
-                        f"[ORTHO] Iter {it}: edge flips reverted "
-                        f"(max|cosphi| {max_cosphi_before_flip:.6f} -> {max_cosphi_after_flip:.6f})"
-                    )
-                else:
-                    cosphi_abs = cosphi_abs_tmp
-                    mask = mask_tmp
-                    max_cosphi = max_cosphi_after_flip
-                    nb_bad = int(np.count_nonzero(cosphi_abs[mask] > cosphi_threshold)) if np.any(mask) else nb_bad
-                    n_small, small_edges_arr = compute_small_links_from_arrays(
-                        mesh.node_x,
-                        mesh.node_y,
-                        mesh.face_nodes,
-                        mesh.edge_nodes,
-                        mesh.edge_faces,
-                        removesmalllinkstrsh=removesmalllinkstrsh,
-                    )
-                    print(f"[ORTHO] Iter {it}: edge flips = {n_flipped}, n_small_flow_links = {n_small}")
 
-        print(
-            f"[ORTHO] Iter {it}: max |cosphi| = {max_cosphi:.6f}, "
-            f"edges > threshold = {nb_bad}, n_small_flow_links = {n_small}"
-        )
+        # Edge-flip pre-pass (still triangles). If no small links remain but
+        # orthogonality is still bad, let the problematic edges participate too.
+        if enable_edge_flips:
+            flip_candidates = small_edges_arr if n_small > 0 else bad_edges
+            # Always cap the local |cosphi| a flip may introduce: an unguarded
+            # flip can create very obtuse triangles with |cosphi| ~ 1.0 that no
+            # later node movement can repair.
+            try_flip_candidate_edges_ugrid(
+                mesh,
+                flip_candidates,
+                removesmalllinkstrsh,
+                max_cosphi_allowed=cosphi_threshold,
+                jsferic=jsferic,
+            )
+            # Topology changed: rebuild edges/faces and re-measure.
+            mesh.edge_nodes, mesh.edge_faces = _build_edges_from_tria(
+                mesh.face_nodes[:, :3]
+            )
+            face_neighbors = build_face_adjacency(mesh.edge_faces, n_faces)
+            _, _, cosphi_abs = compute_cosphi_abs_from_arrays(
+                mesh.node_x,
+                mesh.node_y,
+                mesh.face_nodes,
+                mesh.edge_nodes,
+                mesh.edge_faces,
+                use_circumcenter_3d=True,
+                jsferic=jsferic,
+            )
+            mask = ~np.isnan(cosphi_abs)
+            max_cosphi = (
+                float(np.nanmax(cosphi_abs[mask])) if np.any(mask) else max_cosphi
+            )
+            n_small, small_edges_arr = compute_small_links_from_arrays(
+                mesh.node_x,
+                mesh.node_y,
+                mesh.face_nodes,
+                mesh.edge_nodes,
+                mesh.edge_faces,
+                removesmalllinkstrsh=removesmalllinkstrsh,
+                jsferic=jsferic,
+            )
 
         if max_cosphi <= cosphi_threshold and n_small == 0:
-            print(
-                f"[ORTHO] Criterion reached (max |cosphi| <= {cosphi_threshold:.3f}, "
-                f"n_small_flow_links = 0) after {it} global iterations."
-            )
             break
 
-        bad_edges = np.where(
-            (mask) & (cosphi_abs > cosphi_threshold)
-        )[0]
-        bad_set = set(bad_edges.tolist())
-        sort_idx = np.argsort(cosphi_abs[bad_edges])[::-1] if bad_edges.size > 0 else np.array([], dtype=np.int64)
-        bad_edges_sorted = bad_edges[sort_idx] if bad_edges.size > 0 else np.array([], dtype=np.int64)
-        small_only = np.array(
-            [e for e in small_edges_arr.tolist() if e not in bad_set],
-            dtype=np.int64,
+        bad_edges = np.where((mask) & (cosphi_abs > cosphi_threshold))[0]
+        bad_set = set(int(e) for e in bad_edges.tolist())
+        sort_idx = (
+            np.argsort(cosphi_abs[bad_edges])[::-1]
+            if bad_edges.size > 0
+            else np.array([], dtype=np.int64)
         )
-        problematic_edges = np.concatenate([bad_edges_sorted, small_only]) if bad_edges_sorted.size > 0 else small_only
-
+        bad_edges_sorted = (
+            bad_edges[sort_idx] if bad_edges.size > 0 else np.array([], dtype=np.int64)
+        )
+        small_only = np.array(
+            [e for e in small_edges_arr.tolist() if e not in bad_set], dtype=np.int64
+        )
+        problematic_edges = (
+            np.concatenate([bad_edges_sorted, small_only])
+            if bad_edges_sorted.size > 0
+            else small_only
+        )
         if problematic_edges.size == 0:
-            print(f"[ORTHO] Iter {it}: no problematic edge (cosphi or small link), stop.")
             break
-        visited_faces_global: Set[int] = set()
-        improved_zones = 0
-        total_zones = 0
-        accept_good = 0
-        accept_bad = 0
-        rollback_good = 0
-        rollback_bad = 0
 
+        visited_faces_global: Set[int] = set()
         for e in problematic_edges:
             f1, f2 = mesh.edge_faces[e, :]
             start_faces: List[int] = []
@@ -2855,15 +2766,12 @@ def orthogonalize_netcdf(
             if not start_faces:
                 continue
 
-            # Slightly enlarge zones for truly bad edges to avoid sharp transitions at the buffer boundary
-            this_buffer = buffer_layers
-            if e in bad_set:
-                this_buffer = buffer_layers + 1
+            this_buffer = buffer_layers + (1 if int(e) in bad_set else 0)
             faces_zone = bfs_faces(start_faces, face_neighbors, this_buffer)
             if faces_zone.issubset(visited_faces_global):
                 continue
-            total_zones += 1
-            improved, zone_was_good = apply_combined_ortho_smoother_to_zone(
+
+            apply_combined_ortho_smoother_to_zone(
                 mesh=mesh,
                 faces_zone=faces_zone,
                 cosphi_abs=cosphi_abs,
@@ -2874,45 +2782,28 @@ def orthogonalize_netcdf(
                 small_edges_global=small_edges_arr,
                 removesmalllinkstrsh=removesmalllinkstrsh,
                 verbose=verbose,
+                jsferic=jsferic,
+                smalllink_priority=smalllink_priority,
             )
-            if improved:
-                improved_zones += 1
-                if zone_was_good:
-                    accept_good += 1
-                else:
-                    accept_bad += 1
-            else:
-                if zone_was_good:
-                    rollback_good += 1
-                else:
-                    rollback_bad += 1
+            n_zones_orthogonalized += 1
             visited_faces_global.update(faces_zone)
 
-        if total_zones > 0:
-            frac_improved = improved_zones / float(total_zones)
-        else:
-            frac_improved = 0.0
-        print(
-            f"[ORTHO] Iter {it}: zones = {total_zones} "
-            f"accept = {improved_zones} ({frac_improved:.2%}) [good={accept_good} bad={accept_bad}] "
-            f"rollback = {rollback_good + rollback_bad} [good={rollback_good} bad={rollback_bad}] "
-            f"distinct_faces = {len(visited_faces_global)}"
-        )
-
+    # Final metrics.
     _, _, cosphi_abs_final = compute_cosphi_abs_from_arrays(
         mesh.node_x,
         mesh.node_y,
         mesh.face_nodes,
         mesh.edge_nodes,
         mesh.edge_faces,
-        use_file_centers=False,
         use_circumcenter_3d=True,
+        jsferic=jsferic,
     )
     mask_final = ~np.isnan(cosphi_abs_final)
-    if np.any(mask_final):
-        max_cosphi_final = float(np.nanmax(cosphi_abs_final[mask_final]))
-    else:
-        max_cosphi_final = float("nan")
+    max_final = (
+        float(np.nanmax(cosphi_abs_final[mask_final]))
+        if np.any(mask_final)
+        else float("nan")
+    )
     n_small_final, _ = compute_small_links_from_arrays(
         mesh.node_x,
         mesh.node_y,
@@ -2920,119 +2811,17 @@ def orthogonalize_netcdf(
         mesh.edge_nodes,
         mesh.edge_faces,
         removesmalllinkstrsh=removesmalllinkstrsh,
-    )
-    print(
-        f"[ORTHO] Final small flow links (circumcenters too close) = "
-        f"{n_small_final} (threshold={removesmalllinkstrsh})"
+        jsferic=jsferic,
     )
 
-    # -------------------------
-    # Full reconstruction via adcirc2DFlowFM
-    # -------------------------
-    # NODE: (n_nodes, 3) -> x, y, z. Re-read z from input NetCDF if present.
-    try:
-        with Dataset(input_path, "r") as src:
-            if "mesh2d_node_z" in src.variables:
-                node_z = np.asarray(src["mesh2d_node_z"][:], dtype=np.float64).ravel()
-            else:
-                node_z = np.zeros_like(mesh.node_x, dtype=np.float64)
-    except Exception:
-        node_z = np.zeros_like(mesh.node_x, dtype=np.float64)
-
-    NODE = np.column_stack(
-        [
-            mesh.node_x.astype(np.float64),
-            mesh.node_y.astype(np.float64),
-            node_z,
-        ]
+    vert_out = np.column_stack([mesh.node_x, mesh.node_y]).astype(
+        np.float64, copy=False
     )
-
-    # EDGE: (n_elements, 3) -> 0-based triangles derived from UGRID face_nodes
-    EDGE = _triangles_from_face_nodes(mesh.face_nodes)
-
-    print(
-        f"[ORTHO] Building UGRID with adcirc2DFlowFM: "
-        f"{NODE.shape[0]} nodes, {EDGE.shape[0]} triangles"
+    tria_out = np.asarray(mesh.face_nodes[:, :3], dtype=np.int64)
+    return TriaOrthoResult(
+        vert=vert_out,
+        tria=tria_out,
+        max_cosphi=max_final,
+        n_small_flow_links=int(n_small_final),
+        n_zones_orthogonalized=int(n_zones_orthogonalized),
     )
-    ds_out = adcirc2DFlowFM(NODE=NODE, EDGE=EDGE)
-    ds_out.to_netcdf(output_path)
-
-    # [V3] Optional: merge remaining small-link pairs into quads (requires pymesh2d + xarray)
-    if merge_small_links and n_small_final > 0:
-        try:
-            import xarray as xr
-            from ..geomesh_util.merge_circumcenters import merge_circumcenters as _merge_cc
-            ds = xr.open_dataset(output_path)
-            ds_m = _merge_cc(ds, removesmalllinkstrsh=removesmalllinkstrsh)
-            ds_m.to_netcdf(output_path)
-            ds.close()
-            print(f"[ORTHO] Merged remaining {n_small_final} small-link pairs into quads (output has tri+quad faces).")
-        except Exception as exc:
-            print(f"[ORTHO] merge_circumcenters skipped ({exc}); output is ortho mesh only.")
-
-    return max_cosphi_final
-
-
-def main() -> None:
-    p = argparse.ArgumentParser(
-        description=(
-            "Local orthogonalization of a UGRID *_net.nc* mesh by zones "
-            "(buffer in number of cells) using the |cosphi| metric from "
-            "meshkernel_orthogonality.py."
-        )
-    )
-    p.add_argument("netcdf_path", help="Input *_net.nc* file")
-    p.add_argument(
-        "-o",
-        "--output",
-        help="Output *_net.nc* file (default: suffix _ortho.nc)",
-        default=None,
-    )
-    p.add_argument(
-        "--threshold",
-        type=float,
-        default=0.49,
-        help="Maximum acceptable threshold for |cosphi| (default 0.49)",
-    )
-    p.add_argument(
-        "--buffer",
-        type=int,
-        default=2,
-        help="Topological radius in cells around a bad edge (2 or 3 recommended)",
-    )
-    p.add_argument(
-        "--max-iter",
-        type=int,
-        default=8,
-        help="Maximum number of global orthogonalization iterations",
-    )
-    p.add_argument(
-        "--smooth-iter",
-        type=int,
-        default=16,
-        help="Number of local elliptic smoothing iterations per zone",
-    )
-    p.add_argument(
-        "--merge-small-links",
-        action="store_true",
-        help="After ortho, merge remaining small-link triangle pairs into quads (pymesh2d)",
-    )
-
-    args = p.parse_args()
-
-    max_cosphi = orthogonalize_netcdf(
-        input_path=args.netcdf_path,
-        output_path=args.output,
-        cosphi_threshold=args.threshold,
-        removesmalllinkstrsh=0.1,
-        buffer_layers=args.buffer,
-        max_global_iter=args.max_iter,
-        smooth_iter=args.smooth_iter,
-        merge_small_links=args.merge_small_links,
-    )
-    print(f"Orthogonalization done. Final max |cosphi| = {max_cosphi:.6f}")
-
-
-if __name__ == "__main__":
-    main()
-
