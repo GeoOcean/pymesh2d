@@ -58,11 +58,19 @@ def _faces_from_face_nodes(face_nodes: np.ndarray) -> List[np.ndarray]:
     return faces
 
 
-def _triangulate_faces_for_ortho(vert_xy: np.ndarray, faces: Sequence[np.ndarray]) -> np.ndarray:
+def _triangulate_faces_for_ortho(
+    vert_xy: np.ndarray, faces: Sequence[np.ndarray]
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     Triangle rows for ``orthogonalize_tria_mesh``, aligned with ``merge_circumcenters`` quads
     and NetCDF export: use :func:`~pymesh2d.geomesh_util.grd_util.triangulate_mixed_face_row_to_tris`
     so 4-node faces use diagonal ``(v1,v2)``, not fan-from-``a``.
+
+    Returns
+    -------
+    (tria, tri_face_id)
+        - tria: (T,3) triangle rows.
+        - tri_face_id: (T,) index into ``faces`` of the origin face of each row.
     """
     from ..geomesh_util.grd_util import triangulate_mixed_face_row_to_tris
 
@@ -71,14 +79,64 @@ def _triangulate_faces_for_ortho(vert_xy: np.ndarray, faces: Sequence[np.ndarray
         raise ValueError("vert_xy must have shape (N, 2) or (N, >=2) for x,y")
     xy = vert_xy[:, :2]
     out: List[Tuple[int, int, int]] = []
-    for nodes in faces:
+    face_ids: List[int] = []
+    for fid, nodes in enumerate(faces):
         n = np.asarray(nodes, dtype=np.int64).reshape(-1)
         if n.size < 3:
             continue
-        out.extend(triangulate_mixed_face_row_to_tris(xy, n))
+        tris = triangulate_mixed_face_row_to_tris(xy, n)
+        out.extend(tris)
+        face_ids.extend([fid] * len(tris))
     if out:
-        return np.asarray(out, dtype=np.int64)
-    return np.empty((0, 3), dtype=np.int64)
+        return np.asarray(out, dtype=np.int64), np.asarray(face_ids, dtype=np.int64)
+    return np.empty((0, 3), dtype=np.int64), np.empty(0, dtype=np.int64)
+
+
+def _faces_with_ortho_topology(
+    faces: Sequence[np.ndarray],
+    tria_in: np.ndarray,
+    tria_out: np.ndarray,
+    tri_face_id: np.ndarray,
+) -> Sequence[np.ndarray]:
+    """
+    Propagate topology changes (edge flips) made by ``orthogonalize_tria_mesh``
+    on the triangle proxy back onto the mixed face list.
+
+    ``orthogonalize_tria_mesh`` flips edges by rewriting the two triangle rows
+    in place, so rows of ``tria_out`` correspond 1:1 to rows of ``tria_in``.
+    Faces whose proxy rows are unchanged are kept as-is (including quads). A
+    quad whose proxy rows changed only by re-diagonalization (no external node
+    entered) is also kept — the 4-node face is the same, only the proxy
+    diagonal moved. Any other changed face is replaced by its flipped triangle
+    rows: without this, flips were silently discarded by the dataset rebuild
+    and the outer/recovery cycles could stall forever on an edge that only a
+    flip can fix, while the ortho stage kept reporting it as solved.
+    """
+    if tria_out.shape != tria_in.shape:
+        # Unexpected: fall back to the original faces (previous behaviour).
+        return faces
+    row_changed = np.any(
+        np.sort(tria_in, axis=1) != np.sort(tria_out, axis=1), axis=1
+    )
+    if not np.any(row_changed):
+        return faces
+
+    changed_faces = set(int(f) for f in np.unique(tri_face_id[row_changed]))
+    faces_out: List[np.ndarray] = []
+    for fid, f in enumerate(faces):
+        if fid not in changed_faces:
+            faces_out.append(f)
+            continue
+        rows = np.where(tri_face_id == fid)[0]
+        face_nodes = set(int(v) for v in np.asarray(f).reshape(-1))
+        out_nodes = set(int(v) for v in tria_out[rows].ravel())
+        if len(f) >= 4 and out_nodes <= face_nodes:
+            # Internal re-diagonalization of a quad: same 4-node face.
+            faces_out.append(f)
+        else:
+            for r in rows:
+                faces_out.append(np.asarray(tria_out[r], dtype=np.int64).copy())
+    return faces_out
 
 
 def _face_nodes_raw_to_0b(face_nodes_raw: np.ndarray, start_index: int) -> np.ndarray:
@@ -306,7 +364,7 @@ def ortho_merge_iterate_dataset(
         start_index = int(ds_in["mesh2d_face_nodes"].attrs.get("start_index", 1))
         face_nodes = _face_nodes_raw_to_0b(face_nodes_raw, start_index)
         faces = _faces_from_face_nodes(face_nodes)
-        tria_for_ortho = _triangulate_faces_for_ortho(vert, faces)
+        tria_for_ortho, tri_face_id = _triangulate_faces_for_ortho(vert, faces)
 
         bl = int(buffer_layers if buffer_layers_override is None else buffer_layers_override)
         mgi = int(max_global_iter if max_global_iter_override is None else max_global_iter_override)
@@ -327,7 +385,10 @@ def ortho_merge_iterate_dataset(
         )
 
         NODE = np.column_stack([ortho_res.vert[:, 0], ortho_res.vert[:, 1], node_z])
-        ugrid_arrays = build_ugrid_arrays_mixed(NODE, faces)
+        faces_after_ortho = _faces_with_ortho_topology(
+            faces, tria_for_ortho, np.asarray(ortho_res.tria, dtype=np.int64), tri_face_id
+        )
+        ugrid_arrays = build_ugrid_arrays_mixed(NODE, faces_after_ortho)
         ds_after_ortho = _rebuild_ds_from_form(ds_in, ugrid_arrays)
 
         nfaces_before = int(
