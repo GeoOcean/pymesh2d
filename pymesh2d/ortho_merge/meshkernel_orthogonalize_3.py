@@ -507,14 +507,16 @@ def _circumcenters_lonlat_ugrid(
     edge_faces: np.ndarray,
     face_mask: Optional[np.ndarray] = None,
     jsferic: int = 1,
+    num_interior: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Circumcenters in lon/lat per face (UGRID). Boundary faces use mass center.
-    numberOfInteriorEdges is derived from edge_faces.
+    numberOfInteriorEdges is derived from edge_faces (or passed precomputed).
     If face_mask is provided, only compute for faces where face_mask is True (faster for zones).
     """
     nface = face_nodes.shape[0]
-    num_interior = _num_interior_edges_per_face(edge_faces, nface)
+    if num_interior is None:
+        num_interior = _num_interior_edges_per_face(edge_faces, nface)
 
     out = np.full((nface, 2), np.nan, dtype=np.float64) if face_mask is not None else np.zeros((nface, 2), dtype=np.float64)
     tria = face_nodes[:, :3]
@@ -548,12 +550,15 @@ def compute_small_links_from_arrays(
     removesmalllinkstrsh: float = 0.11,
     edge_indices: Optional[np.ndarray] = None,
     jsferic: int = 1,
+    num_interior: Optional[np.ndarray] = None,
 ) -> Tuple[int, np.ndarray]:
     """
     Small flow links (Delft3D): dxlink < 0.9*removesmalllinkstrsh*0.5*(sqrt(ba1)+sqrt(ba2)).
     Inputs 0-based (invalid = -1). Returns (n_small, edge_indices_of_small_links).
     If edge_indices is provided, only those edges are tested (returned small_edges are a subset).
     Coordinates are lon/lat degrees for jsferic=1, planar x/y for jsferic=0.
+    `num_interior` may pass the precomputed `_num_interior_edges_per_face`
+    (topology-only) to avoid the O(n_edges) recount in tight trial loops.
     """
     node_x = np.asarray(node_x, dtype=np.float64).ravel()
     node_y = np.asarray(node_y, dtype=np.float64).ravel()
@@ -596,7 +601,8 @@ def compute_small_links_from_arrays(
     g2 = pos_in_needed[g2[keep]]
 
     # Circumcenters (lon/lat) of the needed faces.
-    num_interior = _num_interior_edges_per_face(edge_faces, nface)
+    if num_interior is None:
+        num_interior = _num_interior_edges_per_face(edge_faces, nface)
     t0, t1, t2 = tria[faces_needed, 0], tria[faces_needed, 1], tria[faces_needed, 2]
     circ = _circumcenters_lonlat_compact(
         np.column_stack([node_x[t0], node_y[t0]]),
@@ -687,9 +693,12 @@ def try_flip_small_flow_edge_ugrid(
     sa2 = _signed_area_tri_deg(node_x, node_y, opp1, opp2, k4)
     if sa1 * sa2 >= 0:
         return False
-    # Both new triangles must have positive area (CCW)
+    # Both new triangles must have positive area (CCW). The sign of sa1 only
+    # reflects the arbitrary storage order of the apexes: if k3 is on the
+    # negative side of (opp1 -> opp2), swap the apexes instead of refusing a
+    # geometrically valid flip.
     if sa1 <= 0:
-        return False
+        opp1, opp2 = opp2, opp1
     # New triangles: (opp1, opp2, k3) and (opp2, opp1, k4)
     face_nodes[f1, 0], face_nodes[f1, 1], face_nodes[f1, 2] = opp1, opp2, k3
     face_nodes[f2, 0], face_nodes[f2, 1], face_nodes[f2, 2] = opp2, opp1, k4
@@ -738,26 +747,6 @@ def _edges_among_nodes(edge_nodes: np.ndarray, nodes: np.ndarray) -> np.ndarray:
     return np.where(m)[0]
 
 
-def _max_cosphi_among_nodes(mesh: "MeshData", nodes: np.ndarray, jsferic: int) -> float:
-    """Max |cosphi| over the edges connecting `nodes` (NaN-free; 0.0 if none)."""
-    edges = _edges_among_nodes(mesh.edge_nodes, nodes)
-    if edges.size == 0:
-        return 0.0
-    cos = _cosphi_abs_for_edges(
-        mesh.node_x,
-        mesh.node_y,
-        mesh.face_nodes,
-        mesh.edge_nodes,
-        mesh.edge_faces,
-        edges,
-        use_circumcenter_3d=True,
-        jsferic=jsferic,
-    )
-    vals = cos[edges]
-    vals = vals[np.isfinite(vals)]
-    return float(np.max(vals)) if vals.size else 0.0
-
-
 def try_flip_candidate_edges_ugrid(
     mesh: "MeshData",
     candidate_edges: np.ndarray,
@@ -783,12 +772,26 @@ def try_flip_candidate_edges_ugrid(
         return 0
 
     total_flipped = 0
+    def _quad_max_cosphi(quad_edges: np.ndarray) -> float:
+        cos = _cosphi_abs_for_edges(
+            mesh.node_x,
+            mesh.node_y,
+            mesh.face_nodes,
+            mesh.edge_nodes,
+            mesh.edge_faces,
+            quad_edges,
+            use_circumcenter_3d=True,
+            jsferic=jsferic,
+        )
+        vals = cos[quad_edges]
+        vals = vals[np.isfinite(vals)]
+        return float(np.max(vals)) if vals.size else 0.0
+
     for _ in range(max_flip_iter):
         flipped_any = False
         for ei in range(candidate_edges.size):
             e = int(candidate_edges[ei])
             quad_nodes = None
-            rows_before = None
             if max_cosphi_allowed is not None and 0 <= e < mesh.edge_faces.shape[0]:
                 f1, f2 = int(mesh.edge_faces[e, 0]), int(mesh.edge_faces[e, 1])
                 if f1 >= 0 and f2 >= 0:
@@ -798,31 +801,62 @@ def try_flip_candidate_edges_ugrid(
                         )
                     )
                     quad_nodes = quad_nodes[quad_nodes >= 0]
+                    # The flip only rewires the quad: its 5 edges keep their
+                    # slots (the new diagonal reuses slot `e`), so snapshot
+                    # them and update surgically instead of rebuilding the
+                    # full edge arrays twice per rejected attempt.
+                    quad_edges = _edges_among_nodes(mesh.edge_nodes, quad_nodes)
                     rows_before = (
                         f1,
                         mesh.face_nodes[f1].copy(),
                         f2,
                         mesh.face_nodes[f2].copy(),
                     )
-                    max_before = _max_cosphi_among_nodes(mesh, quad_nodes, jsferic)
+                    edge_nodes_before = mesh.edge_nodes[e].copy()
+                    edge_faces_before = mesh.edge_faces[quad_edges].copy()
+                    max_before = _quad_max_cosphi(quad_edges)
 
             if not try_flip_small_flow_edge_ugrid(mesh, e):
                 continue
 
-            mesh.edge_nodes, mesh.edge_faces = _build_edges_from_tria(mesh.face_nodes[:, :3])
+            if quad_nodes is None:
+                mesh.edge_nodes, mesh.edge_faces = _build_edges_from_tria(mesh.face_nodes[:, :3])
+                total_flipped += 1
+                flipped_any = True
+                break
 
-            if quad_nodes is not None:
-                max_after = _max_cosphi_among_nodes(mesh, quad_nodes, jsferic)
-                if max_after > max(float(max_cosphi_allowed), max_before) + 1.0e-12:
-                    # Revert: restore the two pre-flip face rows.
-                    f1, row1, f2, row2 = rows_before
-                    mesh.face_nodes[f1] = row1
-                    mesh.face_nodes[f2] = row2
-                    mesh.edge_nodes, mesh.edge_faces = _build_edges_from_tria(
-                        mesh.face_nodes[:, :3]
-                    )
-                    continue
+            # Surgical topology update: slot `e` becomes the new diagonal
+            # (the node pair shared by the two rewritten faces) and each quad
+            # edge's face pair is recomputed against the new rows.
+            r1 = set(int(x) for x in mesh.face_nodes[f1, :3])
+            r2 = set(int(x) for x in mesh.face_nodes[f2, :3])
+            diag = sorted(r1 & r2)
+            mesh.edge_nodes[e, 0] = diag[0]
+            mesh.edge_nodes[e, 1] = diag[1]
+            for eidx in quad_edges:
+                a, b = int(mesh.edge_nodes[eidx, 0]), int(mesh.edge_nodes[eidx, 1])
+                fa, fb = int(mesh.edge_faces[eidx, 0]), int(mesh.edge_faces[eidx, 1])
+                adj = []
+                if a in r1 and b in r1:
+                    adj.append(f1)
+                if a in r2 and b in r2:
+                    adj.append(f2)
+                adj.extend(f for f in (fa, fb) if f >= 0 and f != f1 and f != f2)
+                mesh.edge_faces[eidx, 0] = adj[0] if len(adj) >= 1 else -1
+                mesh.edge_faces[eidx, 1] = adj[1] if len(adj) >= 2 else -1
 
+            max_after = _quad_max_cosphi(quad_edges)
+            if max_after > max(float(max_cosphi_allowed), max_before) + 1.0e-12:
+                # Revert: restore face rows and the snapshotted edge entries.
+                f1r, row1, f2r, row2 = rows_before
+                mesh.face_nodes[f1r] = row1
+                mesh.face_nodes[f2r] = row2
+                mesh.edge_nodes[e] = edge_nodes_before
+                mesh.edge_faces[quad_edges] = edge_faces_before
+                continue
+
+            # Accepted: the surgically updated arrays are already consistent
+            # (the caller re-canonicalizes edge numbering after the batch).
             total_flipped += 1
             flipped_any = True
             break
@@ -1710,14 +1744,26 @@ def _classify_zone_nodes(
 # ---------------------------------------------------------------------------
 
 def build_face_adjacency(edge_faces: np.ndarray, n_faces: int) -> List[List[int]]:
-    """Adjacency graph (neighboring faces via a shared edge)."""
-    neigh: List[Set[int]] = [set() for _ in range(n_faces)]
-    for e in range(edge_faces.shape[0]):
-        f1, f2 = edge_faces[e, :]  # already 0-based
-        if f1 >= 0 and f2 >= 0 and f1 != f2:
-            neigh[f1].add(f2)
-            neigh[f2].add(f1)
-    return [sorted(list(s)) for s in neigh]
+    """Adjacency graph (neighboring faces via a shared edge; sorted, unique)."""
+    ef = np.asarray(edge_faces)
+    m = (ef[:, 0] >= 0) & (ef[:, 1] >= 0) & (ef[:, 0] != ef[:, 1])
+    a = ef[m, 0].astype(np.int64)
+    b = ef[m, 1].astype(np.int64)
+    src = np.concatenate([a, b])
+    dst = np.concatenate([b, a])
+    order = np.lexsort((dst, src))
+    src, dst = src[order], dst[order]
+    keep = np.r_[True, (src[1:] != src[:-1]) | (dst[1:] != dst[:-1])] if src.size else np.zeros(0, dtype=bool)
+    src, dst = src[keep], dst[keep]
+    counts = np.bincount(src, minlength=n_faces) if src.size else np.zeros(n_faces, dtype=np.int64)
+    dst_list = dst.tolist()
+    neigh: List[List[int]] = []
+    idx = 0
+    for f in range(n_faces):
+        c = int(counts[f])
+        neigh.append(dst_list[idx:idx + c])
+        idx += c
+    return neigh
 
 
 def bfs_faces(
@@ -1862,7 +1908,14 @@ def apply_combined_ortho_smoother_to_zone(
     small_edges_set = set(small_edges_global.tolist()) if small_edges_global is not None and small_edges_global.size > 0 else set()
     small_in_zone = [e for e in edges_in_zone if e in small_edges_set]
     n_small_zone_before = 0
+    # Topology is fixed during this zone call: precompute the per-face interior
+    # edge counts used by every small-link evaluation below (recomputing them is
+    # an O(n_edges) scan per trial and dominated the runtime).
+    num_interior_pre: Optional[np.ndarray] = None
     if small_edges_global is not None and small_edges_global.size > 0:
+        num_interior_pre = _num_interior_edges_per_face(
+            mesh.edge_faces, mesh.face_nodes.shape[0]
+        )
         _, small_zone_list = compute_small_links_from_arrays(
             mesh.node_x,
             mesh.node_y,
@@ -1872,6 +1925,7 @@ def apply_combined_ortho_smoother_to_zone(
             removesmalllinkstrsh=removesmalllinkstrsh,
             edge_indices=edges_in_zone_arr,
             jsferic=jsferic,
+            num_interior=num_interior_pre,
         )
         n_small_zone_before = len(small_zone_list)
 
@@ -2166,22 +2220,53 @@ def apply_combined_ortho_smoother_to_zone(
                 removesmalllinkstrsh=removesmalllinkstrsh,
                 edge_indices=edges_in_zone_arr,
                 jsferic=jsferic,
+                num_interior=num_interior_pre,
             )
             n_small_zone_current = len(small_zone_current)
             nface = mesh.face_nodes.shape[0]
-            face_mask_zone = np.zeros(nface, dtype=bool)
-            for fid in faces_zone:
-                face_mask_zone[int(fid)] = True
+            # Circumcenters/areas are only read for the faces adjacent to the
+            # zone's small links; computing them mesh-wide per inner iteration
+            # dominated the runtime on large meshes.
+            link_faces = sorted(
+                {
+                    int(ff)
+                    for e2 in small_in_zone[:max_small_edges_per_zone]
+                    for ff in mesh.edge_faces[e2]
+                    if ff >= 0 and ff < nface
+                }
+            )
+            link_faces_arr = np.asarray(link_faces, dtype=np.int64)
+            face_mask_links = np.zeros(nface, dtype=bool)
+            face_mask_links[link_faces_arr] = True
             vert_deg = np.column_stack([mesh.node_x, mesh.node_y])
             circum_ll = _circumcenters_lonlat_ugrid(
                 vert_deg, mesh.face_nodes, mesh.edge_faces,
-                face_mask=face_mask_zone, jsferic=jsferic,
+                face_mask=face_mask_links, jsferic=jsferic,
+                num_interior=num_interior_pre,
             )
-            vert_xy, _, _ = _lonlat_to_local_xy(mesh.node_x, mesh.node_y, jsferic)
             tria = mesh.face_nodes[:, :3]
-            valid_t = (tria[:, 0] >= 0) & (tria[:, 1] >= 0) & (tria[:, 2] >= 0)
+            # Face areas in the same local frame `_lonlat_to_local_xy` uses
+            # (full-mesh mean reference), computed only for the link faces.
+            x0m = float(np.nanmean(mesh.node_x))
+            y0m = float(np.nanmean(mesh.node_y))
             ba = np.zeros(nface, dtype=np.float64)
-            ba[valid_t] = np.abs(_triarea_2d(vert_xy, tria[valid_t]))
+            if link_faces_arr.size > 0:
+                tlf = tria[link_faces_arr]
+                valid_lf = (tlf >= 0).all(axis=1)
+                tv = tlf[valid_lf]
+                nodes_lf = np.unique(tv)
+                x0a = np.full(nodes_lf.size, x0m)
+                y0a = np.full(nodes_lf.size, y0m)
+                ux = _getdx_vec(x0a, y0a, mesh.node_x[nodes_lf], mesh.node_y[nodes_lf], jsferic)
+                uy = _getdy_vec(x0a, y0a, mesh.node_x[nodes_lf], mesh.node_y[nodes_lf], jsferic)
+                q0 = np.searchsorted(nodes_lf, tv[:, 0])
+                q1 = np.searchsorted(nodes_lf, tv[:, 1])
+                q2 = np.searchsorted(nodes_lf, tv[:, 2])
+                ev12x, ev12y = ux[q1] - ux[q0], uy[q1] - uy[q0]
+                ev13x, ev13y = ux[q2] - ux[q0], uy[q2] - uy[q0]
+                ba[link_faces_arr[valid_lf]] = np.abs(
+                    0.5 * (ev12x * ev13y - ev12y * ev13x)
+                )
             for li, e in enumerate(small_in_zone[:max_small_edges_per_zone]):
                 f1, f2 = mesh.edge_faces[e, 0], mesh.edge_faces[e, 1]
                 k3, k4 = mesh.edge_nodes[e, 0], mesh.edge_nodes[e, 1]
@@ -2241,39 +2326,47 @@ def apply_combined_ortho_smoother_to_zone(
                     s1_opts = (1.0, -1.0) if move_opp1 else (0.0,)
                     s2_opts = (1.0, -1.0) if move_opp2 else (0.0,)
                     found = False
+                    # Trial by in-place displace/restore of the two apexes:
+                    # copying the full coordinate arrays per candidate is the
+                    # dominant allocation cost of this search.
+                    keep1 = (float(mesh.node_x[opp1]), float(mesh.node_y[opp1]))
+                    keep2 = (float(mesh.node_x[opp2]), float(mesh.node_y[opp2]))
                     for frac in (0.25, 0.5, 1.0, 2.0):
                         step = frac * max_step_meters
                         for s1 in s1_opts:
                             for s2 in s2_opts:
                                 if s1 == 0.0 and s2 == 0.0:
                                     continue
-                                trial_x = mesh.node_x.copy()
-                                trial_y = mesh.node_y.copy()
                                 if move_opp1:
-                                    trial_x[opp1] += s1 * step * axx
-                                    trial_y[opp1] += s1 * step * axy
+                                    mesh.node_x[opp1] = keep1[0] + s1 * step * axx
+                                    mesh.node_y[opp1] = keep1[1] + s1 * step * axy
                                 if move_opp2:
-                                    trial_x[opp2] += s2 * step * axx
-                                    trial_y[opp2] += s2 * step * axy
+                                    mesh.node_x[opp2] = keep2[0] + s2 * step * axx
+                                    mesh.node_y[opp2] = keep2[1] + s2 * step * axy
                                 n_tr, _ = compute_small_links_from_arrays(
-                                    trial_x, trial_y,
+                                    mesh.node_x, mesh.node_y,
                                     mesh.face_nodes, mesh.edge_nodes, mesh.edge_faces,
                                     removesmalllinkstrsh=removesmalllinkstrsh,
                                     edge_indices=edges_in_zone_arr,
                                     jsferic=jsferic,
+                                    num_interior=num_interior_pre,
                                 )
-                                if int(n_tr) >= n_small_zone_current:
-                                    continue
-                                cq = _cosphi_abs_for_edges(
-                                    trial_x, trial_y,
-                                    mesh.face_nodes, mesh.edge_nodes, mesh.edge_faces,
-                                    quad_edges,
-                                    use_circumcenter_3d=True,
-                                    jsferic=jsferic,
-                                )
-                                vals = cq[quad_edges]
-                                vals = vals[np.isfinite(vals)]
-                                if vals.size and float(np.max(vals)) > cosphi_threshold:
+                                ok_trial = int(n_tr) < n_small_zone_current
+                                if ok_trial:
+                                    cq = _cosphi_abs_for_edges(
+                                        mesh.node_x, mesh.node_y,
+                                        mesh.face_nodes, mesh.edge_nodes, mesh.edge_faces,
+                                        quad_edges,
+                                        use_circumcenter_3d=True,
+                                        jsferic=jsferic,
+                                    )
+                                    vals = cq[quad_edges]
+                                    vals = vals[np.isfinite(vals)]
+                                    if vals.size and float(np.max(vals)) > cosphi_threshold:
+                                        ok_trial = False
+                                mesh.node_x[opp1], mesh.node_y[opp1] = keep1
+                                mesh.node_x[opp2], mesh.node_y[opp2] = keep2
+                                if not ok_trial:
                                     continue
                                 if move_opp1:
                                     dx_small[opp1] += s1 * step * axx
@@ -2316,6 +2409,7 @@ def apply_combined_ortho_smoother_to_zone(
                         removesmalllinkstrsh=removesmalllinkstrsh,
                         edge_indices=edges_in_zone_arr,
                         jsferic=jsferic,
+                        num_interior=num_interior_pre,
                     )
                     if len(small_trial) < best_n_small:
                         best_n_small = len(small_trial)
@@ -2418,6 +2512,7 @@ def apply_combined_ortho_smoother_to_zone(
                 removesmalllinkstrsh=removesmalllinkstrsh,
                 edge_indices=edges_in_zone_arr,
                 jsferic=jsferic,
+                num_interior=num_interior_pre,
             )
             n_small_za = len(small_zone_after_list)
         is_strict_improved = (
