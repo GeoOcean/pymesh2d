@@ -732,6 +732,32 @@ def try_flip_small_flow_edges_ugrid(
     return total_flipped
 
 
+def _edges_among_nodes(edge_nodes: np.ndarray, nodes: np.ndarray) -> np.ndarray:
+    """Indices of edges whose both endpoints are in `nodes`."""
+    m = np.isin(edge_nodes[:, 0], nodes) & np.isin(edge_nodes[:, 1], nodes)
+    return np.where(m)[0]
+
+
+def _max_cosphi_among_nodes(mesh: "MeshData", nodes: np.ndarray, jsferic: int) -> float:
+    """Max |cosphi| over the edges connecting `nodes` (NaN-free; 0.0 if none)."""
+    edges = _edges_among_nodes(mesh.edge_nodes, nodes)
+    if edges.size == 0:
+        return 0.0
+    cos = _cosphi_abs_for_edges(
+        mesh.node_x,
+        mesh.node_y,
+        mesh.face_nodes,
+        mesh.edge_nodes,
+        mesh.edge_faces,
+        edges,
+        use_circumcenter_3d=True,
+        jsferic=jsferic,
+    )
+    vals = cos[edges]
+    vals = vals[np.isfinite(vals)]
+    return float(np.max(vals)) if vals.size else 0.0
+
+
 def try_flip_candidate_edges_ugrid(
     mesh: "MeshData",
     candidate_edges: np.ndarray,
@@ -743,9 +769,14 @@ def try_flip_candidate_edges_ugrid(
     """
     Try to flip a set of candidate edges.
 
-    The caller is responsible for the global quality check after the batch.
-    This keeps the helper cheap: it only verifies geometric validity of each
-    flip and updates connectivity once per accepted flip.
+    If ``max_cosphi_allowed`` is given, each flip is quality-checked on the
+    edges of its convex quad: the flip is reverted unless the local max
+    |cosphi| stays within ``max(max_cosphi_allowed, value before the flip)``.
+    Without this, a geometrically valid flip can create very obtuse triangles
+    whose (pulled-inside) circumcenters give |cosphi| ~ 1.0 on a neighbouring
+    edge — an unrecoverable degradation that stalls the outer/recovery cycles.
+    With ``max_cosphi_allowed=None`` only geometric validity is verified and
+    the caller is responsible for the global quality check after the batch.
     """
     candidate_edges = np.asarray(candidate_edges, dtype=np.int64).ravel()
     if candidate_edges.size == 0:
@@ -756,10 +787,41 @@ def try_flip_candidate_edges_ugrid(
         flipped_any = False
         for ei in range(candidate_edges.size):
             e = int(candidate_edges[ei])
+            quad_nodes = None
+            rows_before = None
+            if max_cosphi_allowed is not None and 0 <= e < mesh.edge_faces.shape[0]:
+                f1, f2 = int(mesh.edge_faces[e, 0]), int(mesh.edge_faces[e, 1])
+                if f1 >= 0 and f2 >= 0:
+                    quad_nodes = np.unique(
+                        np.concatenate(
+                            [mesh.face_nodes[f1, :3], mesh.face_nodes[f2, :3]]
+                        )
+                    )
+                    quad_nodes = quad_nodes[quad_nodes >= 0]
+                    rows_before = (
+                        f1,
+                        mesh.face_nodes[f1].copy(),
+                        f2,
+                        mesh.face_nodes[f2].copy(),
+                    )
+                    max_before = _max_cosphi_among_nodes(mesh, quad_nodes, jsferic)
+
             if not try_flip_small_flow_edge_ugrid(mesh, e):
                 continue
 
             mesh.edge_nodes, mesh.edge_faces = _build_edges_from_tria(mesh.face_nodes[:, :3])
+
+            if quad_nodes is not None:
+                max_after = _max_cosphi_among_nodes(mesh, quad_nodes, jsferic)
+                if max_after > max(float(max_cosphi_allowed), max_before) + 1.0e-12:
+                    # Revert: restore the two pre-flip face rows.
+                    f1, row1, f2, row2 = rows_before
+                    mesh.face_nodes[f1] = row1
+                    mesh.face_nodes[f2] = row2
+                    mesh.edge_nodes, mesh.edge_faces = _build_edges_from_tria(
+                        mesh.face_nodes[:, :3]
+                    )
+                    continue
 
             total_flipped += 1
             flipped_any = True
@@ -1895,6 +1957,10 @@ def apply_combined_ortho_smoother_to_zone(
         mu_it = mu_max
 
     alpha = DEFAULT_ORTHO_ALPHA  # Base amplitude of ortho displacement per edge
+    # Cumulative targeted ortho displacement (kept separate so the line search
+    # can retry it alone when the combined delta fails acceptance).
+    ortho_cum_x = np.zeros_like(mesh.node_x)
+    ortho_cum_y = np.zeros_like(mesh.node_y)
     tag = "good" if zone_already_good else "bad"
     # Log start for this zone (relax_zone, scale_smooth help tune when many rollbacks)
     if verbose:
@@ -1953,7 +2019,17 @@ def apply_combined_ortho_smoother_to_zone(
                     g4 = int(k4)
                     move3 = g3 in internal_set
                     move4 = g4 in internal_set
-                    if not (move3 or move4):
+                    # Movable apex (opposite) vertices of the two adjacent
+                    # faces: for obtuse pairs (pulled-inside circumcenters)
+                    # moving the apex is often the only effective correction.
+                    opps: List[int] = []
+                    for fe in (int(mesh.edge_faces[e, 0]), int(mesh.edge_faces[e, 1])):
+                        if fe >= 0:
+                            for vtx in mesh.face_nodes[fe, :3]:
+                                vtx = int(vtx)
+                                if vtx >= 0 and vtx != g3 and vtx != g4 and vtx in internal_set:
+                                    opps.append(vtx)
+                    if not (move3 or move4 or opps):
                         continue
                     x3, y3 = mesh.node_x[g3], mesh.node_y[g3]
                     x4, y4 = mesh.node_x[g4], mesh.node_y[g4]
@@ -1962,59 +2038,94 @@ def apply_combined_ortho_smoother_to_zone(
                     norm_e = np.hypot(ex, ey)
                     if norm_e < 1.0e-8:
                         continue
-                    # Candidate directions (perpendicular + opposite)
-                    px = -ey / norm_e
-                    py = ex / norm_e
-                    dirs = [(px, py), (-px, -py)]
-                    best_improve = 0.0
-                    best_dx3 = best_dy3 = 0.0
-                    best_dx4 = best_dy4 = 0.0
-                    base_val = float(np.abs(cosphi_abs[e]))
+                    # Fresh |cosphi| at the current positions: the global
+                    # cosphi_abs snapshot goes stale as nodes move, and a stale
+                    # base makes the improvement test accept no-ops forever.
+                    base_arr = _cosphi_abs_for_edges(
+                        mesh.node_x,
+                        mesh.node_y,
+                        mesh.face_nodes,
+                        mesh.edge_nodes,
+                        mesh.edge_faces,
+                        np.array([e]),
+                        use_circumcenter_3d=True,
+                        jsferic=jsferic,
+                    )
+                    base_val = float(np.abs(base_arr[e]))
                     if not np.isfinite(base_val):
                         continue
                     w_excess = base_val - cosphi_threshold
                     if w_excess <= 0.0:
                         continue
-                    step = alpha * w_excess
-                    for (ux, uy) in dirs:
-                        # Trial displacement: local copy of coordinates
-                        trial_x = mesh.node_x.copy()
-                        trial_y = mesh.node_y.copy()
+                    px = -ey / norm_e
+                    py = ex / norm_e
+                    midx = 0.5 * (x3 + x4)
+                    midy = 0.5 * (y3 + y4)
+                    # Candidate move sets: endpoints perpendicular to the edge
+                    # (both senses) and each movable apex radially from the
+                    # edge midpoint (both senses).
+                    candidates: List[List[Tuple[int, float, float]]] = []
+                    for s in (1.0, -1.0):
+                        moves: List[Tuple[int, float, float]] = []
                         if move3:
-                            trial_x[g3] = x3 - step * ux
-                            trial_y[g3] = y3 - step * uy
+                            moves.append((g3, -s * px, -s * py))
                         if move4:
-                            trial_x[g4] = x4 + step * ux
-                            trial_y[g4] = y4 + step * uy
-                        cosphi_trial = _cosphi_abs_for_edges(
-                            trial_x,
-                            trial_y,
-                            mesh.face_nodes,
-                            mesh.edge_nodes,
-                            mesh.edge_faces,
-                            np.array([e]),
-                            use_circumcenter_3d=True,
-                            jsferic=jsferic,
-                        )
-                        new_val = float(np.abs(cosphi_trial[e]))
-                        if not np.isfinite(new_val):
+                            moves.append((g4, s * px, s * py))
+                        if moves:
+                            candidates.append(moves)
+                    for vo in opps:
+                        rx = float(mesh.node_x[vo]) - midx
+                        ry = float(mesh.node_y[vo]) - midy
+                        rn = np.hypot(rx, ry)
+                        if rn < 1.0e-12:
                             continue
-                        improve = base_val - new_val
-                        if improve > best_improve and new_val < base_val:
-                            best_improve = improve
-                            if move3:
-                                best_dx3 = -step * ux
-                                best_dy3 = -step * uy
-                            if move4:
-                                best_dx4 = step * ux
-                                best_dy4 = step * uy
-                    if best_improve > 0.0:
-                        if move3:
-                            dx_o[g3] += best_dx3
-                            dy_o[g3] += best_dy3
-                        if move4:
-                            dx_o[g4] += best_dx4
-                            dy_o[g4] += best_dy4
+                        for s in (1.0, -1.0):
+                            candidates.append([(vo, s * rx / rn, s * ry / rn)])
+                    # Line search over fractions of the local edge length: the
+                    # zone-level acceptance (strict improvement + rollback)
+                    # still gates the combined displacement, so trying larger
+                    # steps here is safe. An absolute step (as before) is
+                    # metres-invisible on projected meshes and kilometres-huge
+                    # on lon/lat ones.
+                    best_improve = 0.0
+                    best_moves: Optional[List[Tuple[int, float, float]]] = None
+                    done = False
+                    for moves in candidates:
+                        for frac in (0.3, 0.1, 0.03):
+                            step = frac * norm_e
+                            trial_x = mesh.node_x.copy()
+                            trial_y = mesh.node_y.copy()
+                            for nd, udx, udy in moves:
+                                trial_x[nd] += step * udx
+                                trial_y[nd] += step * udy
+                            cosphi_trial = _cosphi_abs_for_edges(
+                                trial_x,
+                                trial_y,
+                                mesh.face_nodes,
+                                mesh.edge_nodes,
+                                mesh.edge_faces,
+                                np.array([e]),
+                                use_circumcenter_3d=True,
+                                jsferic=jsferic,
+                            )
+                            new_val = float(np.abs(cosphi_trial[e]))
+                            if not np.isfinite(new_val):
+                                continue
+                            improve = base_val - new_val
+                            if improve > best_improve and new_val < base_val:
+                                best_improve = improve
+                                best_moves = [
+                                    (nd, step * udx, step * udy) for nd, udx, udy in moves
+                                ]
+                                if new_val <= cosphi_threshold:
+                                    done = True
+                                    break
+                        if done:
+                            break
+                    if best_moves is not None:
+                        for nd, ddx, ddy in best_moves:
+                            dx_o[nd] += ddx
+                            dy_o[nd] += ddy
 
         # Small-link term [V3]: pymesh2d-style — move opposite vertices along circumcenter separation
         dx_small = np.zeros_like(mesh.node_x)
@@ -2142,12 +2253,18 @@ def apply_combined_ortho_smoother_to_zone(
             if gid not in internal_set:
                 continue
             w_node = dist_weight.get(gid, 1.0)
-            dx_o_and_small = w_node * (dx_o[gid] + beta_small * dx_small[gid])
-            dy_o_and_small = w_node * (dy_o[gid] + beta_small * dy_small[gid])
-            dx = (1.0 - mu_it) * scale_smooth * dx_s[gid] + mu_it * dx_o_and_small
-            dy = (1.0 - mu_it) * scale_smooth * dy_s[gid] + mu_it * dy_o_and_small
-            new_x[gid] += relax_zone * dx
-            new_y[gid] += relax_zone * dy
+            dx_small_w = w_node * beta_small * dx_small[gid]
+            dy_small_w = w_node * beta_small * dy_small[gid]
+            dx = (1.0 - mu_it) * scale_smooth * dx_s[gid] + mu_it * dx_small_w
+            dy = (1.0 - mu_it) * scale_smooth * dy_s[gid] + mu_it * dy_small_w
+            # The ortho displacement was validated by a per-edge line search at
+            # this exact magnitude; damping it by relax*mu makes it ineffective
+            # (a fraction of a percent of the local edge length). Apply it at
+            # full weight — the zone-level acceptance/rollback still gates it.
+            new_x[gid] += relax_zone * dx + w_node * dx_o[gid]
+            new_y[gid] += relax_zone * dy + w_node * dy_o[gid]
+            ortho_cum_x[gid] += w_node * dx_o[gid]
+            ortho_cum_y[gid] += w_node * dy_o[gid]
         mesh.node_x[:] = new_x
         mesh.node_y[:] = new_y
 
@@ -2157,14 +2274,27 @@ def apply_combined_ortho_smoother_to_zone(
     delta_y = mesh.node_y[zone_idx].copy() - y_old
     mesh.node_x[zone_idx] = x_old
     mesh.node_y[zone_idx] = y_old
+    # Candidate displacements: the combined delta first; if it fails, the
+    # accumulated targeted ortho moves alone. On strongly graded meshes the
+    # Laplacian part of the combined delta can degrade the crown and veto a
+    # valid per-edge repair bundled in the same displacement.
+    delta_candidates = [(delta_x, delta_y)]
+    delta_ox = ortho_cum_x[zone_idx].copy()
+    delta_oy = ortho_cum_y[zone_idx].copy()
+    if np.any(delta_ox != 0.0) or np.any(delta_oy != 0.0):
+        delta_candidates.append((delta_ox, delta_oy))
     improved = False
     best_factor = 0.0
+    best_delta = delta_candidates[0]
     max_cosphi_after = float("inf")
     min_cosphi_after = 0.0
     n_small_zone_after = n_small_zone_before
-    for factor in (1.0, 0.5, 0.25):
-        mesh.node_x[zone_idx] = x_old + factor * delta_x
-        mesh.node_y[zone_idx] = y_old + factor * delta_y
+    for cand_dx, cand_dy in delta_candidates:
+      if improved:
+          break
+      for factor in (1.0, 0.5, 0.25):
+        mesh.node_x[zone_idx] = x_old + factor * cand_dx
+        mesh.node_y[zone_idx] = y_old + factor * cand_dy
         cosphi_after = _cosphi_abs_for_edges(
             mesh.node_x,
             mesh.node_y,
@@ -2212,6 +2342,7 @@ def apply_combined_ortho_smoother_to_zone(
             if is_acceptable and not improved:
                 improved = True
                 best_factor = factor
+                best_delta = (cand_dx, cand_dy)
                 max_cosphi_after = max_ca
                 min_cosphi_after = min_ca
                 n_small_zone_after = n_small_za
@@ -2222,6 +2353,7 @@ def apply_combined_ortho_smoother_to_zone(
                     and (n_small_za < n_small_zone_after or (n_small_za == n_small_zone_after and factor > best_factor))
                 ):
                     best_factor = factor
+                    best_delta = (cand_dx, cand_dy)
                     max_cosphi_after = max_ca
                     min_cosphi_after = min_ca
                     n_small_zone_after = n_small_za
@@ -2230,17 +2362,18 @@ def apply_combined_ortho_smoother_to_zone(
             if is_strict_improved:
                 improved = True
                 best_factor = factor
+                best_delta = (cand_dx, cand_dy)
                 max_cosphi_after = max_ca
                 min_cosphi_after = min_ca
                 n_small_zone_after = n_small_za
                 break
     if improved and zone_already_good:
         # Apply best factor (we may have tried several)
-        mesh.node_x[zone_idx] = x_old + best_factor * delta_x
-        mesh.node_y[zone_idx] = y_old + best_factor * delta_y
+        mesh.node_x[zone_idx] = x_old + best_factor * best_delta[0]
+        mesh.node_y[zone_idx] = y_old + best_factor * best_delta[1]
     elif improved and not zone_already_good:
-        mesh.node_x[zone_idx] = x_old + best_factor * delta_x
-        mesh.node_y[zone_idx] = y_old + best_factor * delta_y
+        mesh.node_x[zone_idx] = x_old + best_factor * best_delta[0]
+        mesh.node_y[zone_idx] = y_old + best_factor * best_delta[1]
     if not improved:
         mesh.node_x[zone_idx] = x_old
         mesh.node_y[zone_idx] = y_old

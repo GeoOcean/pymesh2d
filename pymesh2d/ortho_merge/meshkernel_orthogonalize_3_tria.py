@@ -111,11 +111,14 @@ def orthogonalize_tria_mesh(
         # problematic edges participate so the mesh can keep improving.
         if enable_edge_flips:
             flip_candidates = small_edges_arr if n_small > 0 else bad_edges
+            # Always cap the local |cosphi| a flip may introduce: an unguarded
+            # flip can create very obtuse triangles with |cosphi| ~ 1.0 that no
+            # later node movement can repair.
             _ = mk3.try_flip_candidate_edges_ugrid(
                 mesh,
                 flip_candidates,
                 removesmalllinkstrsh,
-                max_cosphi_allowed=(cosphi_threshold if n_small == 0 else None),
+                max_cosphi_allowed=cosphi_threshold,
                 jsferic=jsferic,
             )
             # After flips, recompute edges & faces because topology changed
