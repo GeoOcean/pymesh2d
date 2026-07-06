@@ -35,6 +35,10 @@ def _ortho_merge_pipeline(vert, conn, tria, tnum, opts):
     # jsferic=1 -> spherical (lon/lat degrees); jsferic=0 -> planar x/y.
     jsferic = 1 if bool(opts.get("spherical", True)) else 0
 
+    # Triangles-only mode: clear small flow links by guarded flips and node
+    # movement instead of merging triangle pairs into quads.
+    merge_small_links = bool(opts.get("merge_small_links", True))
+
     do_log = not np.isinf(opts.get("disp", 4))
 
     # Initial snapshot (triangle proxy: 1 mixed-face row per input triangle).
@@ -99,6 +103,7 @@ def _ortho_merge_pipeline(vert, conn, tria, tnum, opts):
         on_state=_on_state if do_log else None,
         verbose=False,
         jsferic=jsferic,
+        merge_small_links=merge_small_links,
     )
 
     # Final snapshot (triangle proxy built from mixed faces).
@@ -320,6 +325,13 @@ def smood(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg
           geometry uses the Delft3D spherical (jsferic=1) formulas. Set False for a mesh
           already in a projected planar CRS (metres); geometry then uses plain 2D
           (jsferic=0) distances and circumcenters.
+        - 'merge_small_links' : bool, default = True
+          If True (default), remaining small flow links are removed by merging each
+          triangle pair into a quad (``merge_circumcenters``). If False, the mesh stays
+          pure triangles throughout: small links are cleared by quality-guarded edge
+          flips and circumcenter-separation node movement, targeting the same dual
+          criteria. Usually harder to satisfy — some small links may only be removable
+          by a merge.
         - 'disp' : int or float, default = 4
           Display frequency for iteration progress. Set to `np.inf` for quiet execution.
     hfun : callable, optional
@@ -612,5 +624,12 @@ def makeopt_smood(opts=None):
     else:
         if not isinstance(opts["spherical"], bool):
             raise TypeError("smood:incorrectInputClass - spherical must be bool.")
+
+    # --------------------------- MERGE_SMALL_LINKS
+    if "merge_small_links" not in opts:
+        opts["merge_small_links"] = True
+    else:
+        if not isinstance(opts["merge_small_links"], bool):
+            raise TypeError("smood:incorrectInputClass - merge_small_links must be bool.")
 
     return opts

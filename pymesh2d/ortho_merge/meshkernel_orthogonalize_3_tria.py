@@ -42,6 +42,7 @@ def orthogonalize_tria_mesh(
     enable_edge_flips: bool = True,
     verbose: bool = True,
     jsferic: int = 1,
+    smalllink_priority: bool = False,
 ) -> TriaOrthoResult:
     """
     Orthogonalize a pure triangle mesh using the V3 zone logic.
@@ -187,6 +188,7 @@ def orthogonalize_tria_mesh(
                 removesmalllinkstrsh=removesmalllinkstrsh,
                 verbose=verbose,
                 jsferic=jsferic,
+                smalllink_priority=smalllink_priority,
             )
             n_zones_orthogonalized += 1
             visited_faces_global.update(faces_zone)

@@ -290,9 +290,15 @@ def ortho_merge_iterate_dataset(
     on_state: Optional[Callable[[OrthoMergeStats], None]] = None,
     verbose: bool = True,
     jsferic: int = 1,
+    merge_small_links: bool = True,
 ) -> tuple:
     """
     Iteratively apply (**orthogonalize → merge_circumcenters**) on a UGRID dataset.
+
+    With ``merge_small_links=False`` the mesh stays pure triangles: the
+    ``merge_circumcenters`` step is skipped and the orthogonalizer's own
+    small-flow-link handling (guarded edge flips + circumcenter-separation
+    displacement) is enabled instead, targeting the same dual criteria.
 
     Parameters
     ----------
@@ -370,7 +376,14 @@ def ortho_merge_iterate_dataset(
         mgi = int(max_global_iter if max_global_iter_override is None else max_global_iter_override)
         si = int(smooth_iter if smooth_iter_override is None else smooth_iter_override)
 
-        ortho_smalllink_trsh = 1.0e-12 if ortho_disable_smalllink_logic else removesmalllinkstrsh
+        if merge_small_links:
+            # Small links are removed by merge_circumcenters below; keep the
+            # orthogonalizer focused on |cosphi| only.
+            ortho_smalllink_trsh = 1.0e-12 if ortho_disable_smalllink_logic else removesmalllinkstrsh
+        else:
+            # Triangles-only mode: the orthogonalizer itself must clear small
+            # links (guarded flips + circumcenter-separation displacement).
+            ortho_smalllink_trsh = removesmalllinkstrsh
         ortho_res = orthogonalize_tria_mesh(
             vert,
             tria_for_ortho,
@@ -382,6 +395,7 @@ def ortho_merge_iterate_dataset(
             enable_edge_flips=enable_edge_flips,
             verbose=verbose,
             jsferic=jsferic,
+            smalllink_priority=not merge_small_links,
         )
 
         NODE = np.column_stack([ortho_res.vert[:, 0], ortho_res.vert[:, 1], node_z])
@@ -390,6 +404,9 @@ def ortho_merge_iterate_dataset(
         )
         ugrid_arrays = build_ugrid_arrays_mixed(NODE, faces_after_ortho)
         ds_after_ortho = _rebuild_ds_from_form(ds_in, ugrid_arrays)
+
+        if not merge_small_links:
+            return ds_after_ortho, ortho_res, 0, ds_before_outer
 
         nfaces_before = int(
             ds_after_ortho.sizes.get("mesh2d_nFaces", ds_after_ortho["mesh2d_face_nodes"].shape[0])
@@ -466,7 +483,8 @@ def ortho_merge_iterate_dataset(
         if on_state is not None:
             on_state(stats[-1])
 
-        if stop_if_no_merge and merged_this_iter == 0:
+        # Not meaningful in triangles-only mode (nothing is ever merged).
+        if merge_small_links and stop_if_no_merge and merged_this_iter == 0:
             break
 
     if bool(require_both_criteria):
@@ -600,6 +618,7 @@ def ortho_merge_iterate_tria(
     on_state: Optional[Callable[[OrthoMergeStats], None]] = None,
     verbose: bool = True,
     jsferic: int = 1,
+    merge_small_links: bool = True,
 ) -> tuple:
     """
     Convenience wrapper that starts from a pure triangle mesh (vert, tria).
@@ -665,6 +684,7 @@ def ortho_merge_iterate_tria(
         on_state=on_state,
         verbose=verbose,
         jsferic=jsferic,
+        merge_small_links=merge_small_links,
     )
 
     vert_out = np.column_stack(

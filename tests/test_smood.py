@@ -45,6 +45,40 @@ class TestSmood(unittest.TestCase):
         )
         self.assertTrue(np.all(area2 > 0))
 
+    def test_smood_triangles_only_mode(self):
+        """
+        `merge_small_links=False` must keep the mesh pure triangles (no quad
+        merging) while still targeting the same dual criteria via guarded
+        flips and node movement.
+        """
+        import numpy as np
+
+        from pymesh2d.ortho_merge import meshkernel_orthogonalize_3 as mk3
+        from pymesh2d.ortho_merge.geometry import build_edges_from_tria
+
+        vert, conn, tria, tnum = build_smood_input()
+        opts = dict(SMOOD_OPTS)
+        opts["merge_small_links"] = False
+        opts["iter"] = 4
+        vert_s, conn_s, tria_s, tnum_s = smood(vert, conn, tria, tnum, opts)
+
+        # Pure triangles: no quad rows and same triangle count as the input.
+        self.assertEqual(tria_s.shape[1], 3)
+        self.assertEqual(tria_s.shape[0], tria.shape[0])
+        self.assertFalse(np.any(np.isnan(vert_s)))
+
+        # Dual criteria on the triangle output.
+        tt = np.asarray(tria_s, dtype=np.int64)
+        en, ef = build_edges_from_tria(tt)
+        _, _, cos = mk3.compute_cosphi_abs_from_arrays(
+            vert_s[:, 0], vert_s[:, 1], tt, en, ef, use_circumcenter_3d=True
+        )
+        n_small, _ = mk3.compute_small_links_from_arrays(
+            vert_s[:, 0], vert_s[:, 1], tt, en, ef, removesmalllinkstrsh=0.11
+        )
+        self.assertLessEqual(float(np.nanmax(cos)), 0.49 + 1e-9)
+        self.assertEqual(int(n_small), 0)
+
     def test_smood_planar_mode_on_projected_mesh(self):
         """
         `spherical=False` runs the pipeline with plain 2D geometry so a mesh

@@ -1789,6 +1789,7 @@ def apply_combined_ortho_smoother_to_zone(
     removesmalllinkstrsh: float = 0.1,
     verbose: bool = True,
     jsferic: int = 1,
+    smalllink_priority: bool = False,
 ) -> Tuple[bool, bool]:
     """
     Combine simple (Laplacian) smoothing and orthogonality-oriented displacement,
@@ -2144,11 +2145,17 @@ def apply_combined_ortho_smoother_to_zone(
             aggressive_factor = 1.2
         else:
             aggressive_factor = 1.0
-        if (
-            small_in_zone
-            and zone_already_good
-            and max_cosphi_before <= 0.30
-            and (inner_i % 2 == 0)
+        # In small-link priority mode (triangles-only pipeline: no quad merge
+        # available) the term must fire for every good zone and every inner
+        # iteration — the 0.30 gate and parity skip were tuned for the merge
+        # pipeline where remaining links were merge's job.
+        if small_in_zone and (
+            (smalllink_priority and zone_already_good)
+            or (
+                zone_already_good
+                and max_cosphi_before <= 0.30
+                and (inner_i % 2 == 0)
+            )
         ):
             _, small_zone_current = compute_small_links_from_arrays(
                 mesh.node_x,
@@ -2190,23 +2197,100 @@ def apply_combined_ortho_smoother_to_zone(
                 move_opp1 = opp1 in internal_set
                 move_opp2 = opp2 in internal_set
                 if not (move_opp1 or move_opp2):
-                    continue
+                    if smalllink_priority and (k3 in internal_set or k4 in internal_set):
+                        # Boundary-locked apexes: fall back to searching moves
+                        # of the shared edge's endpoints instead.
+                        opp1, opp2 = k3, k4
+                        move_opp1 = k3 in internal_set
+                        move_opp2 = k4 in internal_set
+                    else:
+                        continue
                 cc1, cc2 = circum_ll[f1], circum_ll[f2]
                 if np.any(np.isnan(cc1)) or np.any(np.isnan(cc2)):
                     continue
                 dx_m = _getdx(cc1[0], cc1[1], cc2[0], cc2[1], jsferic)
                 dy_m = _getdy(cc1[0], cc1[1], cc2[0], cc2[1], jsferic)
                 dxlink = np.sqrt(dx_m * dx_m + dy_m * dy_m)
-                if dxlink < 1e-12:
+                if not smalllink_priority and dxlink < 1e-12:
                     continue
                 sqrt_ba1 = np.sqrt(max(ba[f1], 1e-20))
                 sqrt_ba2 = np.sqrt(max(ba[f2], 1e-20))
                 dxlim = 0.9 * removesmalllinkstrsh * 0.5 * (sqrt_ba1 + sqrt_ba2)
                 if dxlink >= dxlim:
                     continue
+                max_step_meters = min(np.sqrt(max(ba[f1], 1e-20)), np.sqrt(max(ba[f2], 1e-20))) * 0.5
+
+                if smalllink_priority:
+                    # Probe-style search: move the apexes along the edge's
+                    # perpendicular bisector (both circumcenters live on that
+                    # axis; the cc-difference direction is numerical noise for
+                    # near-cocircular links), trying independent per-apex sign
+                    # combinations and ascending step sizes. Accept the first
+                    # candidate that reduces the zone's link count without
+                    # pushing the local |cosphi| above the threshold.
+                    exk = float(mesh.node_x[k4] - mesh.node_x[k3])
+                    eyk = float(mesh.node_y[k4] - mesh.node_y[k3])
+                    eln = np.hypot(exk, eyk)
+                    if eln < 1.0e-12:
+                        continue
+                    axx = -eyk / eln
+                    axy = exk / eln
+                    quad_nodes = np.unique(np.concatenate([tri1, tri2]))
+                    quad_nodes = quad_nodes[quad_nodes >= 0]
+                    quad_edges = _edges_among_nodes(mesh.edge_nodes, quad_nodes)
+                    s1_opts = (1.0, -1.0) if move_opp1 else (0.0,)
+                    s2_opts = (1.0, -1.0) if move_opp2 else (0.0,)
+                    found = False
+                    for frac in (0.25, 0.5, 1.0, 2.0):
+                        step = frac * max_step_meters
+                        for s1 in s1_opts:
+                            for s2 in s2_opts:
+                                if s1 == 0.0 and s2 == 0.0:
+                                    continue
+                                trial_x = mesh.node_x.copy()
+                                trial_y = mesh.node_y.copy()
+                                if move_opp1:
+                                    trial_x[opp1] += s1 * step * axx
+                                    trial_y[opp1] += s1 * step * axy
+                                if move_opp2:
+                                    trial_x[opp2] += s2 * step * axx
+                                    trial_y[opp2] += s2 * step * axy
+                                n_tr, _ = compute_small_links_from_arrays(
+                                    trial_x, trial_y,
+                                    mesh.face_nodes, mesh.edge_nodes, mesh.edge_faces,
+                                    removesmalllinkstrsh=removesmalllinkstrsh,
+                                    edge_indices=edges_in_zone_arr,
+                                    jsferic=jsferic,
+                                )
+                                if int(n_tr) >= n_small_zone_current:
+                                    continue
+                                cq = _cosphi_abs_for_edges(
+                                    trial_x, trial_y,
+                                    mesh.face_nodes, mesh.edge_nodes, mesh.edge_faces,
+                                    quad_edges,
+                                    use_circumcenter_3d=True,
+                                    jsferic=jsferic,
+                                )
+                                vals = cq[quad_edges]
+                                vals = vals[np.isfinite(vals)]
+                                if vals.size and float(np.max(vals)) > cosphi_threshold:
+                                    continue
+                                if move_opp1:
+                                    dx_small[opp1] += s1 * step * axx
+                                    dy_small[opp1] += s1 * step * axy
+                                if move_opp2:
+                                    dx_small[opp2] += s2 * step * axx
+                                    dy_small[opp2] += s2 * step * axy
+                                found = True
+                                break
+                            if found:
+                                break
+                        if found:
+                            break
+                    continue
+
                 needed_distance = (dxlim - dxlink) * aggressive_factor
                 cc_diff_deg = np.array([cc2[0] - cc1[0], cc2[1] - cc1[1]], dtype=np.float64)
-                max_step_meters = min(np.sqrt(max(ba[f1], 1e-20)), np.sqrt(max(ba[f2], 1e-20))) * 0.5
                 # Conservative step: at most 25% of needed distance, and at most half the current link length
                 step_meters = min(needed_distance * 0.25, max_step_meters, 0.5 * dxlink)
                 if step_meters < 1e-12:
@@ -2253,18 +2337,30 @@ def apply_combined_ortho_smoother_to_zone(
             if gid not in internal_set:
                 continue
             w_node = dist_weight.get(gid, 1.0)
-            dx_small_w = w_node * beta_small * dx_small[gid]
-            dy_small_w = w_node * beta_small * dy_small[gid]
-            dx = (1.0 - mu_it) * scale_smooth * dx_s[gid] + mu_it * dx_small_w
-            dy = (1.0 - mu_it) * scale_smooth * dy_s[gid] + mu_it * dy_small_w
+            if smalllink_priority:
+                # The circumcenter-separation push was validated by the sign
+                # trial at this exact magnitude; apply it at full weight like
+                # the ortho displacement (the mu*relax damping below shrinks
+                # it ~20x, which cannot clear a link).
+                full_dx = w_node * (dx_o[gid] + dx_small[gid])
+                full_dy = w_node * (dy_o[gid] + dy_small[gid])
+                dx = (1.0 - mu_it) * scale_smooth * dx_s[gid]
+                dy = (1.0 - mu_it) * scale_smooth * dy_s[gid]
+            else:
+                full_dx = w_node * dx_o[gid]
+                full_dy = w_node * dy_o[gid]
+                dx_small_w = w_node * beta_small * dx_small[gid]
+                dy_small_w = w_node * beta_small * dy_small[gid]
+                dx = (1.0 - mu_it) * scale_smooth * dx_s[gid] + mu_it * dx_small_w
+                dy = (1.0 - mu_it) * scale_smooth * dy_s[gid] + mu_it * dy_small_w
             # The ortho displacement was validated by a per-edge line search at
             # this exact magnitude; damping it by relax*mu makes it ineffective
             # (a fraction of a percent of the local edge length). Apply it at
             # full weight — the zone-level acceptance/rollback still gates it.
-            new_x[gid] += relax_zone * dx + w_node * dx_o[gid]
-            new_y[gid] += relax_zone * dy + w_node * dy_o[gid]
-            ortho_cum_x[gid] += w_node * dx_o[gid]
-            ortho_cum_y[gid] += w_node * dy_o[gid]
+            new_x[gid] += relax_zone * dx + full_dx
+            new_y[gid] += relax_zone * dy + full_dy
+            ortho_cum_x[gid] += full_dx
+            ortho_cum_y[gid] += full_dy
         mesh.node_x[:] = new_x
         mesh.node_y[:] = new_y
 
@@ -2337,7 +2433,13 @@ def apply_combined_ortho_smoother_to_zone(
             # For [good]: accept only if we don't degrade orthogonality near the zone boundary too much.
             # This prevents "small-link only" actions from quietly increasing max|cosphi| in the crown.
             ortho_slack = 0.02
-            ortho_cap = min(cosphi_threshold, max_cosphi_before + ortho_slack)
+            if smalllink_priority:
+                # Clearing a link may legitimately trade |cosphi| slack below
+                # the criteria threshold; capping at max_before+0.02 vetoes
+                # valid repairs in already-very-orthogonal zones.
+                ortho_cap = cosphi_threshold
+            else:
+                ortho_cap = min(cosphi_threshold, max_cosphi_before + ortho_slack)
             is_acceptable = (max_ca <= ortho_cap) and (n_small_za <= n_small_zone_before)
             if is_acceptable and not improved:
                 improved = True
@@ -2347,11 +2449,19 @@ def apply_combined_ortho_smoother_to_zone(
                 min_cosphi_after = min_ca
                 n_small_zone_after = n_small_za
             elif is_acceptable and improved:
-                # Prefer smaller max_ca, then smaller n_small_za, then larger factor
-                if max_ca < max_cosphi_after or (
-                    max_ca == max_cosphi_after
-                    and (n_small_za < n_small_zone_after or (n_small_za == n_small_zone_after and factor > best_factor))
-                ):
+                if smalllink_priority:
+                    # Prefer clearing links first, then smaller max_ca, then larger factor
+                    better = n_small_za < n_small_zone_after or (
+                        n_small_za == n_small_zone_after
+                        and (max_ca < max_cosphi_after or (max_ca == max_cosphi_after and factor > best_factor))
+                    )
+                else:
+                    # Prefer smaller max_ca, then smaller n_small_za, then larger factor
+                    better = max_ca < max_cosphi_after or (
+                        max_ca == max_cosphi_after
+                        and (n_small_za < n_small_zone_after or (n_small_za == n_small_zone_after and factor > best_factor))
+                    )
+                if better:
                     best_factor = factor
                     best_delta = (cand_dx, cand_dy)
                     max_cosphi_after = max_ca
