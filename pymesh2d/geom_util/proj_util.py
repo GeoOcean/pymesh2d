@@ -4,7 +4,7 @@ from shapely.ops import transform
 
 
 def get_utm_crs_from_crs(crs):
-    """Return a UTM CRS suited to the given geographic CRS."""
+    """Retourne un CRS UTM adapté au CRS géographique donné."""
     if crs.is_projected:
         return crs
     transformer = pyproj.Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
@@ -15,33 +15,33 @@ def get_utm_crs_from_crs(crs):
 
 def get_local_utm_crs(crs, x=None, y=None, bbox=None):
     """
-    Return a local UTM CRS (Transverse Mercator centered on the data).
+    Retourne un CRS UTM local (Transverse Mercator centré sur les données).
 
-    If the CRS is already projected, it is returned unchanged.
-    Otherwise, the data is converted to WGS84 to compute a center point,
-    and a Transverse Mercator projection is built with that central
-    meridian and origin latitude (units in meters).
+    Si le CRS est déjà projeté, il est renvoyé tel quel.
+    Sinon, les données sont converties en WGS84 pour calculer un centre,
+    puis un Transverse Mercator est créé avec ce méridien central et
+    cette latitude d'origine (unités en mètres).
 
     Parameters
     ----------
     crs : pyproj.CRS
-        CRS of the input data (geographic or projected).
+        CRS des données d'entrée (géographique ou projeté).
     x, y : array-like, optional
-        Point coordinates (same size). Ignored if bbox is provided.
+        Coordonnées des points (même taille). Ignorés si bbox est fourni.
     bbox : tuple, optional
-        (xmin, ymin, xmax, ymax) in the input CRS.
-        Used if (x, y) are not provided.
+        (xmin, ymin, xmax, ymax) dans le CRS d'entrée.
+        Utilisé si (x, y) ne sont pas fournis.
 
     Returns
     -------
     pyproj.CRS
-        Projected CRS in meters, centered on the data's area.
+        CRS projeté en mètres, centré sur la zone des données.
     """
     crs = pyproj.CRS.from_user_input(crs)
     if crs.is_projected:
         return crs
 
-    # Compute the center in the source CRS
+    # Calculer le centre dans le CRS source
     if bbox is not None:
         xmin, ymin, xmax, ymax = bbox
         x_center = (xmin + xmax) / 2.0
@@ -50,14 +50,14 @@ def get_local_utm_crs(crs, x=None, y=None, bbox=None):
         x_center = np.nanmean(np.asarray(x))
         y_center = np.nanmean(np.asarray(y))
     else:
-        raise ValueError("Provide either (x, y) or bbox.")
+        raise ValueError("Fournir soit (x, y), soit bbox.")
 
-    # Convert the center to WGS84
+    # Convertir le centre en WGS84
     transformer = pyproj.Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
     lon_center, lat_center = transformer.transform(x_center, y_center)
 
-    # Local Transverse Mercator: central meridian = lon_center, origin latitude = lat_center
-    # k=1 at the central meridian, units in meters
+    # Transverse Mercator local : méridien central = lon_center, latitude d'origine = lat_center
+    # k=1 au méridien central, unités en mètres
     wkt = (
         f'PROJCS["UTM local",'
         f'GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],'

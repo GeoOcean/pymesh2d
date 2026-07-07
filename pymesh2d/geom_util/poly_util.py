@@ -11,25 +11,25 @@ def simplify_polygon_by_angle(
     min_angle_deg: float = 3.0,
 ) -> Polygon:
     """
-    Simplify a polygon by removing points whose interior angle is below
-    min_angle_deg (very sharp turns).
-    Applies to both the exterior ring and all holes (interior rings).
+    Simplifie un polygone en supprimant les points dont l'angle intérieur
+    est inférieur à min_angle_deg (virages très serrés).
+    S'applique au contour extérieur et à tous les trous (contours intérieurs).
 
     Parameters
     ----------
     polygon : shapely.geometry.Polygon
-        Polygon to simplify.
+        Polygone à simplifier.
     min_angle_deg : float, default=3.0
-        Minimum angle in degrees. Points with a smaller interior angle are removed.
+        Angle minimal en degrés. Les points avec un angle intérieur plus petit sont supprimés.
 
     Returns
     -------
     Polygon
-        Simplified polygon (exterior and interiors treated identically).
+        Polygone simplifié (exterior et interiors traités de la même manière).
     """
 
     def _calculate_interior_angle(p1, p2, p3):
-        """Interior angle at point p2 between (p1-p2) and (p2-p3), in degrees (0 to 180)."""
+        """Angle intérieur au point p2 entre (p1-p2) et (p2-p3), en degrés (0 à 180)."""
         v1 = np.asarray(p1) - np.asarray(p2)
         v2 = np.asarray(p3) - np.asarray(p2)
         norm1 = np.linalg.norm(v1)
@@ -42,7 +42,7 @@ def simplify_polygon_by_angle(
         return np.degrees(np.arccos(cos_angle))
 
     def _simplify_ring_by_angle(coords, min_angle_deg):
-        """Simplify a ring (exterior or interior) by removing only the small angles."""
+        """Simplifie un anneau (exterior ou interior) en ne supprimant que les petits angles."""
         coords = np.asarray(coords)
         if len(coords) < 3:
             return coords
@@ -85,11 +85,11 @@ def simplify_polygon_by_angle(
     if polygon.type == "MultiPolygon":
         polygon = max(polygon.geoms, key=lambda p: p.area)
 
-    # Exterior ring
+    # Contour extérieur
     exterior_coords = np.array(polygon.exterior.coords[:-1])
     exterior_simplified = _simplify_ring_by_angle(exterior_coords, min_angle_deg)
 
-    # Holes: same treatment as the exterior ring
+    # Trous : même traitement que l’extérieur
     interiors_simplified = []
     for interior in polygon.interiors:
         interior_coords = np.array(interior.coords[:-1])
@@ -395,7 +395,7 @@ def _prune_ring_by_hfun(ring_coords, hfun, harg=(), min_fraction=1.0):
 
 
 def _signed_area(ring):
-    """Signed area (positive = CCW). ring: (N, 2), closed (last point = first)."""
+    """Aire signée (positive = CCW). ring: (N, 2), fermé (dernier = premier)."""
     r = np.asarray(ring)
     if len(r) < 4:
         return 0.0
@@ -532,21 +532,81 @@ def resample_polygon_hfun(
     return poly_resampled
 
 
+def resample_polygon(polygon, spacing: float):
+    """
+    Resample a shapely Polygon (or MultiPolygon) at uniform spacing along
+    its exterior and interior boundaries.
+
+    Parameters
+    ----------
+    polygon : shapely.geometry.Polygon or MultiPolygon
+        Input polygon geometry (must be closed).
+    spacing : float
+        Desired distance between consecutive points along the boundaries.
+
+    Returns
+    -------
+    Polygon
+        Resampled polygon with the same topology (holes preserved).
+    """
+
+    # -----------------------handle MultiPolygon input
+    if polygon.geom_type == "MultiPolygon":
+        # keep largest polygon only
+        polygon = max(polygon.geoms, key=lambda p: p.area)
+
+    def resample_line(coords, spacing):
+        coords = np.asarray(coords)
+        if not np.allclose(coords[0], coords[-1]):
+            coords = np.vstack([coords, coords[0]])  # close ring if open
+        dists = np.cumsum(np.r_[0, np.sqrt(((coords[1:] - coords[:-1]) ** 2).sum(1))])
+        if dists[-1] == 0:
+            return coords
+        new_d = np.arange(0, dists[-1], spacing)
+        x = np.interp(new_d, dists, coords[:, 0])
+        y = np.interp(new_d, dists, coords[:, 1])
+        return np.c_[x, y]
+
+    # ---- Exterior ----
+    exterior = np.asarray(polygon.exterior.coords)
+    exterior_resampled = resample_line(exterior, spacing)
+
+    if len(exterior_resampled) < 4:
+        raise ValueError("Exterior ring too short to form a polygon")
+
+    # ---- Interiors ----
+    interiors_resampled = []
+    for interior in polygon.interiors:
+        ring = np.asarray(interior.coords)
+        ring_resampled = resample_line(ring, spacing)
+        if len(ring_resampled) >= 4:
+            interiors_resampled.append(ring_resampled)
+
+    # ---- Construct polygon safely ----
+    poly_new = Polygon(exterior_resampled, interiors_resampled)
+
+    # ---- Fix geometry if invalid (self-intersection, etc.) ----
+    if not poly_new.is_valid:
+        poly_new = poly_new.buffer(0)
+
+    return poly_new
+
+
 def _resample_ring_by_spacing(xy: np.ndarray, spacing: float) -> np.ndarray:
     """
-    Resample a ring (closed polygon) so points are spaced at least `spacing`
-    apart along the contour. Based on cumulative distance + linear interpolation.
+    Resample un anneau (polygone fermé) pour espacer les points d'au moins `spacing`
+    le long du contour. Basé sur distance cumulée + interpolation linéaire.
     """
     xy = np.asarray(xy, dtype=float)
     if len(xy) < 2:
         return xy
 
-    # Close the ring for length/interpolation purposes
+    # Fermer l'anneau pour la longueur et l'interp
     if not np.allclose(xy[0], xy[-1]):
         xy = np.vstack([xy, xy[0:1]])
     n = len(xy)
 
-    # Cumulative distance along the contour (includes the closing segment)
+    # Distance cumulée le long du contour (inclut le segment de fermeture)
     d = np.cumsum(
         np.r_[0, np.sqrt(((np.diff(xy, axis=0)) ** 2).sum(axis=1))]
     )
@@ -554,19 +614,19 @@ def _resample_ring_by_spacing(xy: np.ndarray, spacing: float) -> np.ndarray:
     if total_length <= 0:
         return xy[:1]
 
-    # Number of points to get segments >= spacing
+    # Nombre de points pour avoir des segments >= spacing
     n_pts = max(4, int(np.floor(total_length / spacing)))
     n_pts = min(n_pts, max(4, n - 1))
 
-    # Regularly spaced curvilinear abscissas (without duplicating the closing point)
+    # Abscisses curvilignes régulièrement espacées (sans dupliquer le point de fermeture)
     d_sampled = np.linspace(0, total_length, n_pts, endpoint=False)
 
-    # Interpolate x and y
+    # Interpolation x et y
     x_new = np.interp(d_sampled, d, xy[:, 0])
     y_new = np.interp(d_sampled, d, xy[:, 1])
     xy_interp = np.column_stack([x_new, y_new])
 
-    # Closed ring for Shapely (first point repeated at the end)
+    # Anneau fermé pour Shapely (premier point répété à la fin)
     return np.vstack([xy_interp, xy_interp[0:1]])
 
 
@@ -575,9 +635,9 @@ def resample_polygon(
     spacing: float,
 ) -> Polygon:
     """
-    Resample the polygon: points spaced at least `spacing` apart along the
-    contour (exterior and interiors). Simple cumulative-distance +
-    interpolation method.
+    Resample le polygone : points espacés d'au moins `spacing` le long du contour
+    (exterior et interiors). Méthode simple par distance cumulée + interpolation.
+    Les paramètres max_iter_* sont ignorés (conservés pour compatibilité d'API).
     """
     if spacing <= 0:
         raise ValueError("spacing must be positive")

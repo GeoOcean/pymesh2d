@@ -178,7 +178,7 @@ def depth_field_from_xr(ds, input_crs, output_crs, var_name="elevation"):
         grid_points = np.column_stack([Lon.ravel(), Lat.ravel()])
         grid_values = z.ravel()
     else:
-        raise ValueError(f"z must be 2D, got shape {z.shape}")
+        raise ValueError(f"z doit être 2D, reçu shape {z.shape}")
 
     tree = cKDTree(grid_points)
 

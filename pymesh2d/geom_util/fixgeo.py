@@ -1,9 +1,9 @@
 import numpy as np
 
-from ..aabb_tree.findball import findball
-from ..aabb_tree.findline import findline
-from ..aabb_tree.lineline import lineline
-from ..aabb_tree.linenear import linenear
+from pymesh2d.aabb_tree.findball import findball
+from pymesh2d.aabb_tree.findline import findline
+from pymesh2d.aabb_tree.lineline import lineline
+from pymesh2d.aabb_tree.linenear import linenear
 
 
 def fixgeo(node, edge, part):

@@ -1,4 +1,5 @@
 import time
+import warnings
 
 import numpy as np
 from scipy.sparse import csr_matrix
@@ -7,6 +8,8 @@ from .mesh_cost.triscr import triscr
 from .mesh_util.deltri import deltri
 from .mesh_util.setset import setset
 from .mesh_util.tricon import tricon
+
+warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 
 def smooth(vert=None, conn=None, tria=None, tnum=None, opts=None, hfun=None, harg=[]):
@@ -456,7 +459,7 @@ def evalhfn(vert, edge, EMAT, hfun=None, harg=[]):
             try:
                 hvrt = np.asarray(hfun(vert, *harg)).flatten()
             except Exception:
-                # hfun may fail on out-of-domain vertices (e.g. bbox) -> fall back to default
+                # hfun peut échouer sur des sommets hors domaine (ex. bbox) -> fallback global
                 hvrt = default_hvrt.copy()
             else:
                 if hvrt.size != vert.shape[0]:
@@ -464,7 +467,7 @@ def evalhfn(vert, edge, EMAT, hfun=None, harg=[]):
                         "smooth:evalhfn - hfun must return one value per vertex, "
                         f"got size {hvrt.size} for {vert.shape[0]} vertices."
                     )
-                # out-of-domain vertices (e.g. bbox) may yield NaN/inf: fall back to default
+                # Sommets hors domaine (ex. bbox) peuvent donner NaN/inf : on utilise le défaut
                 bad = ~np.isfinite(hvrt) | (hvrt <= 0)
                 hvrt[bad] = default_hvrt[bad]
     else:

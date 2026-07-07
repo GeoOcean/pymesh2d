@@ -209,10 +209,3 @@ __marimo__/
 # Data Files
 *.nc
 *.grd
-
-# setuptools-scm generated version file
-pymesh2d/_version.py
-
-# Large reference data regenerated in CI (see tests/README.md)
-tests/reference_data/demo9_vert.txt
-tests/reference_data/demo9_tria.txt

@@ -1,9 +1,9 @@
 import numpy as np
 
-from ..aabb_tree.findtria import findtria
-from ..mesh_util.bfstri import bfstri
-from ..mesh_util.deltri import deltri
-from ..mesh_util.setset import setset
+from pymesh2d.aabb_tree.findtria import findtria
+from pymesh2d.mesh_util.bfstri import bfstri
+from pymesh2d.mesh_util.deltri import deltri
+from pymesh2d.mesh_util.setset import setset
 
 
 def bfsgeo(node, edge, seed):

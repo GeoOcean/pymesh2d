@@ -7,15 +7,7 @@ from .cfmtri import cfmtri
 import triangle as tr
 
 
-def deltri(
-    vert=None,
-    conn=None,
-    node=None,
-    PSLG=None,
-    part=None,
-    kind="constrained",
-    spherical=False,
-):
+def deltri(vert=None, conn=None, node=None, PSLG=None, part=None, kind="constrained"):
     """
     DELTRI : compute a constrained 2-simplex Delaunay triangulation in the 2D plane.
 
@@ -94,27 +86,18 @@ def deltri(
     # - 'constrained': use delaunayTriangulation (triangle library in Python)
     # - 'conforming': use cfmtri (bisection algorithm)
     if kind == "constrained":
-        if spherical:
-            # Triangulate in the conformal (Mercator) plane so the Delaunay
-            # connectivity is metric-consistent, then map every returned vertex
-            # (including any Steiner points the library inserts) back to lon/lat.
-            from ..geom_util.sphere import from_conformal, to_conformal
-
-            tri_output = tr.triangulate(
-                {"vertices": to_conformal(vert), "segments": conn}, "p"
-            )
-            vert = from_conformal(tri_output["vertices"])
-            tria = tri_output["triangles"]
-        else:
-            tri_input = {"vertices": vert, "segments": conn}
-            # 'p' = triangulate PSLG (planar straight line graph)
-            tri_output = tr.triangulate(tri_input, "p")
-            vert = tri_output["vertices"]
-            tria = tri_output["triangles"]
+        tri_input = {
+            'vertices': vert,
+            'segments': conn
+        }
+        # 'p' = triangulate PSLG (planar straight line graph)
+        tri_output = tr.triangulate(tri_input, 'p')
+        vert = tri_output['vertices']
+        tria = tri_output['triangles']
     elif kind == "conforming":
         # "conforming" Delaunay - use cfmtri (bisection algorithm)
         vert, conn, tria = cfmtri(vert, conn)
-
+    
     else:
         raise ValueError(f"deltri: invalid KIND selection '{kind}'")
 

@@ -27,9 +27,9 @@ def bfstri(PSLG, tria, seed):
 
     See Also
     --------
-    bfsgeo : partition geometry using BFS.
-    refine : perform (Frontal-)Delaunay refinement.
-    fixgeo : repair invalid or redundant geometry definitions.
+    bfsgio2 : partition geometry using BFS.
+    refine2 : perform (Frontal-)Delaunay refinement.
+    fixgeo2 : repair invalid or redundant geometry definitions.
 
     References
     ----------

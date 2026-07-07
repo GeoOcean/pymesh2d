@@ -12,7 +12,7 @@ def inspect(mesh, base=None, item=None):
 
     References
     ----------
-    Translation of the MESH2D function `INSPECT`.
+    Translation of the MESH2D function `CERTIFY`.
     Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
     if not isinstance(mesh, dict):
