@@ -11,25 +11,25 @@ def simplify_polygon_by_angle(
     min_angle_deg: float = 3.0,
 ) -> Polygon:
     """
-    Simplifie un polygone en supprimant les points dont l'angle intérieur
-    est inférieur à min_angle_deg (virages très serrés).
-    S'applique au contour extérieur et à tous les trous (contours intérieurs).
+    Simplify a polygon by removing points whose interior angle is below
+    min_angle_deg (very sharp turns).
+    Applies to both the exterior ring and all holes (interior rings).
 
     Parameters
     ----------
     polygon : shapely.geometry.Polygon
-        Polygone à simplifier.
+        Polygon to simplify.
     min_angle_deg : float, default=3.0
-        Angle minimal en degrés. Les points avec un angle intérieur plus petit sont supprimés.
+        Minimum angle in degrees. Points with a smaller interior angle are removed.
 
     Returns
     -------
     Polygon
-        Polygone simplifié (exterior et interiors traités de la même manière).
+        Simplified polygon (exterior and interiors treated identically).
     """
 
     def _calculate_interior_angle(p1, p2, p3):
-        """Angle intérieur au point p2 entre (p1-p2) et (p2-p3), en degrés (0 à 180)."""
+        """Interior angle at point p2 between (p1-p2) and (p2-p3), in degrees (0 to 180)."""
         v1 = np.asarray(p1) - np.asarray(p2)
         v2 = np.asarray(p3) - np.asarray(p2)
         norm1 = np.linalg.norm(v1)
@@ -42,7 +42,7 @@ def simplify_polygon_by_angle(
         return np.degrees(np.arccos(cos_angle))
 
     def _simplify_ring_by_angle(coords, min_angle_deg):
-        """Simplifie un anneau (exterior ou interior) en ne supprimant que les petits angles."""
+        """Simplify a ring (exterior or interior) by removing only the small angles."""
         coords = np.asarray(coords)
         if len(coords) < 3:
             return coords
@@ -85,11 +85,11 @@ def simplify_polygon_by_angle(
     if polygon.type == "MultiPolygon":
         polygon = max(polygon.geoms, key=lambda p: p.area)
 
-    # Contour extérieur
+    # Exterior ring
     exterior_coords = np.array(polygon.exterior.coords[:-1])
     exterior_simplified = _simplify_ring_by_angle(exterior_coords, min_angle_deg)
 
-    # Trous : même traitement que l’extérieur
+    # Holes: same treatment as the exterior ring
     interiors_simplified = []
     for interior in polygon.interiors:
         interior_coords = np.array(interior.coords[:-1])
@@ -283,8 +283,119 @@ def _resample_ring_hfun(ring_coords, hfun, harg=()):
     # Close ring: first point repeated at end
     return np.vstack([node, node[0:1]])
 
+
+def _make_hfun_evaluator(reference_pts, hfun, harg=()):
+    """
+    Build hfun(pts) -> (M,) with NaN filled from the nearest reference vertex.
+    """
+
+    def eval_h_raw(pts):
+        pts = np.atleast_2d(pts)
+        if np.isscalar(hfun) or isinstance(hfun, (int, float, np.number)):
+            return np.full(pts.shape[0], float(hfun))
+        return np.asarray(hfun(pts, *harg)).ravel()[: pts.shape[0]]
+
+    reference_pts = np.asarray(reference_pts, dtype=float)
+    h_verts = eval_h_raw(reference_pts).astype(float)
+    nan_mask = np.isnan(h_verts)
+    if np.any(nan_mask):
+        tree_ref = cKDTree(reference_pts)
+        ok = np.where(~nan_mask)[0]
+        if len(ok) == 0:
+            h_verts[:] = 1.0
+        else:
+            for i in np.where(nan_mask)[0]:
+                _, j = tree_ref.query(reference_pts[i], k=1)
+                j = j if np.isscalar(j) else j[0]
+                if nan_mask[j]:
+                    h_verts[i] = (
+                        np.nanmean(h_verts[~nan_mask])
+                        if np.any(~nan_mask)
+                        else 1.0
+                    )
+                else:
+                    h_verts[i] = h_verts[j]
+    tree_ref = cKDTree(reference_pts)
+
+    def eval_h(pts):
+        pts = np.atleast_2d(pts)
+        h = eval_h_raw(pts).astype(float)
+        nan_pts = np.isnan(h)
+        if np.any(nan_pts):
+            idx_nan = np.where(nan_pts)[0]
+            _, nearest = tree_ref.query(pts[idx_nan], k=1)
+            if np.ndim(nearest) == 0:
+                nearest = np.array([nearest])
+            h[idx_nan] = h_verts[nearest]
+        return h
+
+    return eval_h
+
+
+def _prune_ring_by_hfun(ring_coords, hfun, harg=(), min_fraction=1.0):
+    """
+    Remove ring vertices whose spacing along the contour is below hfun(p).
+
+    A vertex is removed when either adjacent edge length is shorter than
+    ``min_fraction * h(p)`` at that vertex. The pass is repeated until stable.
+    """
+    ring = np.asarray(ring_coords, dtype=float)
+    if len(ring) < 4:
+        return ring
+
+    if np.allclose(ring[0], ring[-1]):
+        pts = ring[:-1].copy()
+    else:
+        pts = ring.copy()
+
+    if len(pts) < 3:
+        return ring
+
+    eval_h = _make_hfun_evaluator(pts, hfun, harg)
+    eps = np.finfo(float).eps
+    max_iterations = max(len(pts) * 2, 1)
+
+    for _ in range(max_iterations):
+        n = len(pts)
+        if n <= 3:
+            break
+
+        to_remove = np.zeros(n, dtype=bool)
+        for i in range(n):
+            prev_i = (i - 1) % n
+            next_i = (i + 1) % n
+            d_prev = np.linalg.norm(pts[i] - pts[prev_i])
+            d_next = np.linalg.norm(pts[next_i] - pts[i])
+            h_req = max(min_fraction * float(eval_h(pts[i : i + 1])[0]), eps)
+            if d_prev < h_req or d_next < h_req:
+                to_remove[i] = True
+
+        if not np.any(to_remove):
+            break
+
+        if np.count_nonzero(~to_remove) < 3:
+            scores = []
+            for i in range(n):
+                prev_i = (i - 1) % n
+                next_i = (i + 1) % n
+                d_prev = np.linalg.norm(pts[i] - pts[prev_i])
+                d_next = np.linalg.norm(pts[next_i] - pts[i])
+                h_req = max(min_fraction * float(eval_h(pts[i : i + 1])[0]), eps)
+                scores.append((i, min(d_prev, d_next) / h_req))
+            worst = min(scores, key=lambda item: item[1])[0]
+            to_remove = np.zeros(n, dtype=bool)
+            to_remove[worst] = True
+
+        pts = pts[~to_remove]
+
+    if len(pts) < 3:
+        return ring
+
+    return np.vstack([pts, pts[0:1]])
+
+
 def _signed_area(ring):
-    """Aire signée (positive = CCW). ring: (N, 2), fermé (dernier = premier)."""
+    """Signed area (positive = CCW). ring: (N, 2), closed (last point = first)."""
     r = np.asarray(ring)
     if len(r) < 4:
         return 0.0
@@ -306,7 +417,13 @@ def _ensure_ring_orientation(ring_coords, want_ccw):
     return np.vstack([r, r[0:1]])
 
 
-def resample_polygon_hfun(polygon, hfun, harg=()):
+def resample_polygon_hfun(
+    polygon,
+    hfun,
+    harg=(),
+    verify_spacing=True,
+    verify_min_fraction=1.0,
+):
     """
     Resample a closed polygon so that consecutive vertices are spaced by
     approximately h(p) along the contour, where h is given by the mesh-size
@@ -325,6 +442,12 @@ def resample_polygon_hfun(polygon, hfun, harg=()):
         If float, a constant spacing is used.
     harg : tuple, optional
         Extra arguments passed to hfun when callable.
+    verify_spacing : bool, optional
+        If True (default), run a final pass on each resampled ring and remove
+        vertices whose adjacent edge length is shorter than ``h(p)``.
+    verify_min_fraction : float, optional
+        Required minimum edge length as a fraction of ``h(p)`` during the final
+        verification pass. Default is 1.0 (strictly enforce hfun spacing).
 
     Returns
     -------
@@ -370,6 +493,10 @@ def resample_polygon_hfun(polygon, hfun, harg=()):
     
     # Resample exterior
     exterior_ring = _resample_ring_hfun(polygon, hfun, harg)
+    if verify_spacing:
+        exterior_ring = _prune_ring_by_hfun(
+            exterior_ring, hfun, harg, min_fraction=verify_min_fraction
+        )
     exterior_ring = _ensure_ring_orientation(exterior_ring, want_ccw=True)
     
     # Ensure exterior has at least 4 points (required for LinearRing)
@@ -382,6 +509,13 @@ def resample_polygon_hfun(polygon, hfun, harg=()):
     if has_interiors:
         for interior_coords in interiors:
             resampled_interior = _resample_ring_hfun(interior_coords, hfun, harg)
+            if verify_spacing:
+                resampled_interior = _prune_ring_by_hfun(
+                    resampled_interior,
+                    hfun,
+                    harg,
+                    min_fraction=verify_min_fraction,
+                )
             # Filter out invalid interiors (need at least 4 points for LinearRing)
             if len(resampled_interior) >= 4:
                 resampled_interiors.append(resampled_interior)
@@ -398,81 +532,21 @@ def resample_polygon_hfun(polygon, hfun, harg=()):
     return poly_resampled
 
 
-def resample_polygon(polygon, spacing: float):
-    """
-    Resample a shapely Polygon (or MultiPolygon) at uniform spacing along
-    its exterior and interior boundaries.
-
-    Parameters
-    ----------
-    polygon : shapely.geometry.Polygon or MultiPolygon
-        Input polygon geometry (must be closed).
-    spacing : float
-        Desired distance between consecutive points along the boundaries.
-
-    Returns
-    -------
-    Polygon
-        Resampled polygon with the same topology (holes preserved).
-    """
-
-    # -----------------------handle MultiPolygon input
-    if polygon.geom_type == "MultiPolygon":
-        # keep largest polygon only
-        polygon = max(polygon.geoms, key=lambda p: p.area)
-
-    def resample_line(coords, spacing):
-        coords = np.asarray(coords)
-        if not np.allclose(coords[0], coords[-1]):
-            coords = np.vstack([coords, coords[0]])  # close ring if open
-        dists = np.cumsum(np.r_[0, np.sqrt(((coords[1:] - coords[:-1]) ** 2).sum(1))])
-        if dists[-1] == 0:
-            return coords
-        new_d = np.arange(0, dists[-1], spacing)
-        x = np.interp(new_d, dists, coords[:, 0])
-        y = np.interp(new_d, dists, coords[:, 1])
-        return np.c_[x, y]
-
-    # ---- Exterior ----
-    exterior = np.asarray(polygon.exterior.coords)
-    exterior_resampled = resample_line(exterior, spacing)
-
-    if len(exterior_resampled) < 4:
-        raise ValueError("Exterior ring too short to form a polygon")
-
-    # ---- Interiors ----
-    interiors_resampled = []
-    for interior in polygon.interiors:
-        ring = np.asarray(interior.coords)
-        ring_resampled = resample_line(ring, spacing)
-        if len(ring_resampled) >= 4:
-            interiors_resampled.append(ring_resampled)
-
-    # ---- Construct polygon safely ----
-    poly_new = Polygon(exterior_resampled, interiors_resampled)
-
-    # ---- Fix geometry if invalid (self-intersection, etc.) ----
-    if not poly_new.is_valid:
-        poly_new = poly_new.buffer(0)
-
-    return poly_new
-
-
 def _resample_ring_by_spacing(xy: np.ndarray, spacing: float) -> np.ndarray:
     """
-    Resample un anneau (polygone fermé) pour espacer les points d'au moins `spacing`
-    le long du contour. Basé sur distance cumulée + interpolation linéaire.
+    Resample a ring (closed polygon) so points are spaced at least `spacing`
+    apart along the contour. Based on cumulative distance + linear interpolation.
     """
     xy = np.asarray(xy, dtype=float)
     if len(xy) < 2:
         return xy
 
-    # Fermer l'anneau pour la longueur et l'interp
+    # Close the ring for length/interpolation purposes
     if not np.allclose(xy[0], xy[-1]):
         xy = np.vstack([xy, xy[0:1]])
     n = len(xy)
 
-    # Distance cumulée le long du contour (inclut le segment de fermeture)
+    # Cumulative distance along the contour (includes the closing segment)
     d = np.cumsum(
         np.r_[0, np.sqrt(((np.diff(xy, axis=0)) ** 2).sum(axis=1))]
     )
@@ -480,19 +554,19 @@ def _resample_ring_by_spacing(xy: np.ndarray, spacing: float) -> np.ndarray:
     if total_length <= 0:
         return xy[:1]
 
-    # Nombre de points pour avoir des segments >= spacing
+    # Number of points to get segments >= spacing
     n_pts = max(4, int(np.floor(total_length / spacing)))
     n_pts = min(n_pts, max(4, n - 1))
 
-    # Abscisses curvilignes régulièrement espacées (sans dupliquer le point de fermeture)
+    # Regularly spaced curvilinear abscissas (without duplicating the closing point)
     d_sampled = np.linspace(0, total_length, n_pts, endpoint=False)
 
-    # Interpolation x et y
+    # Interpolate x and y
     x_new = np.interp(d_sampled, d, xy[:, 0])
     y_new = np.interp(d_sampled, d, xy[:, 1])
     xy_interp = np.column_stack([x_new, y_new])
 
-    # Anneau fermé pour Shapely (premier point répété à la fin)
+    # Closed ring for Shapely (first point repeated at the end)
     return np.vstack([xy_interp, xy_interp[0:1]])
 
 
@@ -501,9 +575,9 @@ def resample_polygon(
     spacing: float,
 ) -> Polygon:
     """
-    Resample le polygone : points espacés d'au moins `spacing` le long du contour
-    (exterior et interiors). Méthode simple par distance cumulée + interpolation.
-    Les paramètres max_iter_* sont ignorés (conservés pour compatibilité d'API).
+    Resample the polygon: points spaced at least `spacing` apart along the
+    contour (exterior and interiors). Simple cumulative-distance +
+    interpolation method.
     """
     if spacing <= 0:
         raise ValueError("spacing must be positive")

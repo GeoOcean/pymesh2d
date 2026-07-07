@@ -91,7 +91,7 @@ def getiso(xpos, ypos, zdat, ilev, filt=0.0):
     return node, edge
 
 
-def getiso_polygone(x, y, z, zmax=None, grid_res=None) -> Polygon:
+def getiso_polygon(x, y, z, zmax=None, grid_res=None) -> Polygon:
     """
     Extract a MultiPolygon from a 2D scalar field by thresholding (similar to getiso logic).
 
@@ -191,6 +191,6 @@ def getiso_polygone(x, y, z, zmax=None, grid_res=None) -> Polygon:
         polygons = [p for p in polygons if not p.within(outer)]
         final_polys.append(Polygon(outer.exterior.coords, holes))
 
-    largest_poly = max(final_polys, key=lambda p: p.area)
+    #final_polys = max(final_polys, key=lambda p: p.area)
 
-    return largest_poly
+    return final_polys
