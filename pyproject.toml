@@ -16,12 +16,10 @@ authors = [
 
 dynamic = ["version"]
 
-requires-python = ">=3.7"
+requires-python = ">=3.9"
 classifiers = [
     "Programming Language :: Python :: 3 :: Only",
     "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
-    "Programming Language :: Python :: 3.7",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -38,11 +36,12 @@ dependencies = [
     "rasterio",
     "xarray",
     "shapely",
+    "pyproj",
 ]
 
 [project.optional-dependencies]
 
-geo = ["shapely"]
+dev = ["pytest"]
 
 [project.urls]
 
@@ -61,3 +60,6 @@ local_scheme = "no-local-version"
 
 [tool.setuptools.packages.find]
 exclude = ["assets", "assets.*"]
+
+[tool.setuptools.package-data]
+pymesh2d = ["poly_data/*.msh"]

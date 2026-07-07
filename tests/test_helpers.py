@@ -3,6 +3,7 @@ Helper functions for test reference data management.
 """
 import os
 import numpy as np
+from scipy.spatial import cKDTree
 
 
 def save_reference_data(vert, tria, demo_num, suffix=""):
@@ -107,29 +108,23 @@ def compare_meshes(vert1, tria1, vert2, tria2, rtol=1e-10, atol=1e-12):
     if tria1.shape[1] != tria2.shape[1]:
         return False, f"Triangle dimension mismatch: {tria1.shape[1]} vs {tria2.shape[1]}"
     
-    # Compare vertices: sort by coordinates and compare
-    vert1_sorted_idx = np.lexsort((vert1[:, 1], vert1[:, 0]))
-    vert2_sorted_idx = np.lexsort((vert2[:, 1], vert2[:, 0]))
-    
-    vert1_sorted = vert1[vert1_sorted_idx]
-    vert2_sorted = vert2[vert2_sorted_idx]
-    
-    if not np.allclose(vert1_sorted, vert2_sorted, rtol=rtol, atol=atol):
-        max_diff = np.max(np.abs(vert1_sorted - vert2_sorted))
+    # Compare vertices via nearest-neighbor matching (robust to insertion-order
+    # differences and to floating-point tie-breaks on structured/grid-like point
+    # sets, where a lexicographic sort can mis-pair near-duplicate coordinates
+    # after a sub-epsilon perturbation).
+    tree2 = cKDTree(vert2)
+    dist, nn2_of_1 = tree2.query(vert1, k=1)
+
+    max_diff = float(np.max(dist)) if dist.size else 0.0
+    tol = atol + rtol * np.max(np.abs(vert2)) if vert2.size else atol
+    if max_diff > tol:
         return False, f"Vertex coordinates differ (max diff: {max_diff:.2e})"
-    
-    # Build mapping from vert1 indices to vert2 indices
-    vert1_to_vert2 = np.zeros(vert1.shape[0], dtype=int)
-    for i, v1_idx in enumerate(vert1_sorted_idx):
-        # Find matching vertex in vert2 (they should be in same order after sorting)
-        if i < len(vert2_sorted_idx):
-            v2_idx = vert2_sorted_idx[i]
-            if np.allclose(vert1[v1_idx], vert2[v2_idx], rtol=rtol, atol=atol):
-                vert1_to_vert2[v1_idx] = v2_idx
-            else:
-                return False, f"Vertex mapping failed at index {i}"
-        else:
-            return False, "Vertex count mismatch after sorting"
+
+    # Nearest-neighbor matching must be a bijection (each vert2 point used once).
+    if len(np.unique(nn2_of_1)) != vert2.shape[0]:
+        return False, "Vertex matching is not a bijection (duplicate/ambiguous points)"
+
+    vert1_to_vert2 = nn2_of_1
     
     # Remap triangle indices from vert1 to vert2
     tria1_remapped = vert1_to_vert2[tria1]

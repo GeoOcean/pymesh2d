@@ -4,6 +4,16 @@ import time
 import numpy as np
 
 from .aabb_tree.findball import findball
+from .geom_util.sphere import (
+    cdtbal1_sph,
+    cdtbal2_sph,
+    findball_sph,
+    isfeat_sph,
+    minlen_sph,
+    sphdist,
+    sphmid,
+    sphmove,
+)
 from .mesh_ball.cdtbal1 import cdtbal1
 from .mesh_ball.cdtbal2 import cdtbal2
 from .mesh_util.deltri import deltri
@@ -13,7 +23,7 @@ from .mesh_util.setset import setset
 from .mesh_util.tricon import tricon
 
 
-def refine(*args):
+def refine(node=None, edge=None, part=None, opts=None, hfun=None, *harg):
     """
     Perform (Frontal)-Delaunay-refinement for two-dimensional polygonal geometries.
 
@@ -56,11 +66,18 @@ def refine(*args):
           triangle length (based on circumradius) and H is the tria-centered mesh-size.
         - 'disp' : int or float, default=10
           Refinement verbosity level. Set to `np.inf` for quiet execution.
+        - 'spherical' : bool, default=False
+          If True, NODE coordinates are interpreted as lon/lat degrees on the
+          sphere and all metric computations (edge lengths, circumballs,
+          encroachment tests, Steiner-point placement) use great-circle
+          geometry, with `hfun` expressed in metres. Nothing is projected:
+          vertices stay in lon/lat throughout. The default (False) keeps the
+          historical planar behaviour for projected (e.g. UTM) coordinates.
     hfun : float or callable, optional
         Mesh-size function or scalar constraint.
         If `hfun` is a float, a constant mesh size is imposed globally.
-        If `hfun` is callable, it must accept coordinates `PP` (N×2 array)
-        and return corresponding mesh-size values `HH` (N×1 array).
+        If `hfun` is callable, it must accept coordinates `vert` (N×2 array)
+        and return corresponding mesh-size values `hvrt` (N×1 array).
         The function must be fully vectorized.
     *harg : tuple, optional
         Additional arguments passed to `hfun`.
@@ -108,29 +125,13 @@ def refine(*args):
     Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
 
-    # -------------------------------- init variables
-    node = np.array([])
-    PSLG = np.array([])
-    part = []
-    opts = {}
-    hfun = []
-    harg = []
+    # -------------------------------- default argument values
+    node = np.array([]) if node is None else node
+    PSLG = np.array([]) if edge is None else edge
+    part = [] if part is None else part
+    hfun = [] if hfun is None else hfun
 
-    # -------------------------------- extract args
-    if len(args) >= 1:
-        node = args[0]
-    if len(args) >= 2:
-        PSLG = args[1]
-    if len(args) >= 3:
-        part = args[2]
-    if len(args) >= 4:
-        opts = args[3]
-    if len(args) >= 5:
-        hfun = args[4]
-    if len(args) >= 6:
-        harg = args[5:]
-
-    opts = makeopt(opts)
+    opts = makeopt({} if opts is None else opts)
 
     # -------------------------------- default EDGE
     nnod = node.shape[0]
@@ -295,12 +296,19 @@ def cdtbal0(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
     Original MATLAB source: https://github.com/dengwirda/mesh2d
     """
 
+    spherical = bool(opts.get("spherical", False))
+
     if iter <= opts["iter"]:
         # ------------------------------------- build current CDT
-        vert, conn, tria, tnum = deltri(vert, conn, node, PSLG, part, opts["dtri"])
+        vert, conn, tria, tnum = deltri(
+            vert, conn, node, PSLG, part, opts["dtri"], spherical=spherical
+        )
         # ------------------------------------- build current adj
         edge, tria = tricon(tria, conn)
-        feat, ftri = isfeat(vert, edge, tria)
+        if spherical:
+            feat, ftri = isfeat_sph(vert, edge, tria)
+        else:
+            feat, ftri = isfeat(vert, edge, tria)
         apex = np.zeros(vert.shape[0], dtype=bool)
         apex[tria[:, :3][ftri].ravel()] = True
         # ------------------------------------- eval. length-fun.
@@ -315,16 +323,21 @@ def cdtbal0(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
 
         conn = np.sort(conn, axis=1)
         # ------------------------------------- form edge vectors
-        evec = vert[conn[:, 1], :] - vert[conn[:, 0], :]
-        elen = np.sqrt(np.sum(evec**2, axis=1))
+        if spherical:
+            elen = sphdist(vert[conn[:, 0], :2], vert[conn[:, 1], :2])
+            evec = None
+        else:
+            evec = vert[conn[:, 1], :] - vert[conn[:, 0], :]
+            elen = np.sqrt(np.sum(evec**2, axis=1))
 
-        # éviter les divisions par zéro comme MATLAB
+        # avoid division by zero (mirrors MATLAB's behaviour)
         eps = np.finfo(float).eps
         mask_zero = elen < eps
         if np.any(mask_zero):
             elen[mask_zero] = eps
 
-        evec = evec / np.column_stack([elen, elen])
+        if not spherical:
+            evec = evec / np.column_stack([elen, elen])
         # ------------------------------------- min. adj. lengths
         for epos in range(conn.shape[0]):
             ivrt = conn[epos, 0]
@@ -339,16 +352,27 @@ def cdtbal0(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
         keep = ~apex[conn[:, 0]] & ~apex[conn[:, 1]]  # refine at neither
         # ------------------------------------- protecting collar
         ilen = vlen[conn[iref, 0]]
-        inew = vert[conn[iref, 0], :] + np.column_stack([ilen, ilen]) * evec[iref, :]
-
         jlen = vlen[conn[jref, 1]]
-        jnew = vert[conn[jref, 1], :] - np.column_stack([jlen, jlen]) * evec[jref, :]
-
         Ilen = vlen[conn[dref, 0]]
-        Inew = vert[conn[dref, 0], :] + np.column_stack([Ilen, Ilen]) * evec[dref, :]
-
         Jlen = vlen[conn[dref, 1]]
-        Jnew = vert[conn[dref, 1], :] - np.column_stack([Jlen, Jlen]) * evec[dref, :]
+        if spherical:
+            inew = sphmove(vert[conn[iref, 0], :2], vert[conn[iref, 1], :2], ilen)
+            jnew = sphmove(vert[conn[jref, 1], :2], vert[conn[jref, 0], :2], jlen)
+            Inew = sphmove(vert[conn[dref, 0], :2], vert[conn[dref, 1], :2], Ilen)
+            Jnew = sphmove(vert[conn[dref, 1], :2], vert[conn[dref, 0], :2], Jlen)
+        else:
+            inew = (
+                vert[conn[iref, 0], :] + np.column_stack([ilen, ilen]) * evec[iref, :]
+            )
+            jnew = (
+                vert[conn[jref, 1], :] - np.column_stack([jlen, jlen]) * evec[jref, :]
+            )
+            Inew = (
+                vert[conn[dref, 0], :] + np.column_stack([Ilen, Ilen]) * evec[dref, :]
+            )
+            Jnew = (
+                vert[conn[dref, 1], :] - np.column_stack([Jlen, Jlen]) * evec[dref, :]
+            )
 
         vnew = np.vstack([inew, jnew, Inew, Jnew])
 
@@ -460,6 +484,8 @@ def cdtref1(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
     # timers
     tcpu = {"full": 0.0, "ball": 0.0, "hfun": 0.0, "encr": 0.0, "offc": 0.0}
 
+    spherical = bool(opts.get("spherical", False))
+
     vidx = np.arange(vert.shape[0])  # "new" vert list to test
     tnow = time.time()
 
@@ -472,7 +498,7 @@ def cdtref1(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
 
         # ------------------------------------- calc. circumballs
         ttic = time.time()
-        bal1 = cdtbal1(vert, conn)
+        bal1 = cdtbal1_sph(vert, conn) if spherical else cdtbal1(vert, conn)
         tcpu["ball"] += time.time() - ttic
 
         # ------------------------------------- eval. length-fun.
@@ -502,7 +528,10 @@ def cdtref1(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
         ttic = time.time()
         bal1[:, 2] = (1.0 - np.finfo(float).eps ** 0.75) * bal1[:, 2]
 
-        vp, vi, _ = findball(bal1, vert[:, 0:2])
+        if spherical:
+            vp, vi, _ = findball_sph(bal1, vert[:, 0:2])
+        else:
+            vp, vi, _ = findball(bal1, vert[:, 0:2])
         # ------------------------------------- near=>[vert,edge]
         nexti = 0
         ebad = np.zeros((conn.shape[0],), dtype=bool)
@@ -586,9 +615,12 @@ def cdtref1(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
 
             ttic = time.time()
 
-            evec = vert[conn[ref1, 1], :] - vert[conn[ref1, 0], :]
-            elen = np.sqrt(np.sum(evec**2, axis=1))
-            evec = evec / np.column_stack([elen, elen])
+            if spherical:
+                evec = None
+            else:
+                evec = vert[conn[ref1, 1], :] - vert[conn[ref1, 0], :]
+                elen = np.sqrt(np.sum(evec**2, axis=1))
+                evec = evec / np.column_stack([elen, elen])
             # ------------------------------------- "voro"-type dist.
             vlen = np.sqrt(bal1[ref1, 2])
             # ------------------------------------- "size"-type dist.
@@ -598,8 +630,12 @@ def cdtref1(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
             ilen = np.minimum(vlen, ihfn)
             jlen = np.minimum(vlen, jhfn)
 
-            inew = vert[conn[ref1, 0], :] + np.column_stack([ilen, ilen]) * evec
-            jnew = vert[conn[ref1, 1], :] - np.column_stack([jlen, jlen]) * evec
+            if spherical:
+                inew = sphmove(vert[conn[ref1, 0], :2], vert[conn[ref1, 1], :2], ilen)
+                jnew = sphmove(vert[conn[ref1, 1], :2], vert[conn[ref1, 0], :2], jlen)
+            else:
+                inew = vert[conn[ref1, 0], :] + np.column_stack([ilen, ilen]) * evec
+                jnew = vert[conn[ref1, 1], :] - np.column_stack([jlen, jlen]) * evec
             # ------------------------------------- iter. "size"-type
             for _ in range(3):
                 # ---------------------------------- eval. length-fun.
@@ -620,12 +656,23 @@ def cdtref1(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
                 ilen = np.minimum(vlen, iprj)
                 jlen = np.minimum(vlen, jprj)
                 # ------------------------------------- locate offcentres
-                inew = vert[conn[ref1, 0], :] + np.column_stack([ilen, ilen]) * evec
-                jnew = vert[conn[ref1, 1], :] - np.column_stack([jlen, jlen]) * evec
+                if spherical:
+                    inew = sphmove(
+                        vert[conn[ref1, 0], :2], vert[conn[ref1, 1], :2], ilen
+                    )
+                    jnew = sphmove(
+                        vert[conn[ref1, 1], :2], vert[conn[ref1, 0], :2], jlen
+                    )
+                else:
+                    inew = vert[conn[ref1, 0], :] + np.column_stack([ilen, ilen]) * evec
+                    jnew = vert[conn[ref1, 1], :] - np.column_stack([jlen, jlen]) * evec
             # ------------------------------------- merge i,j if near
             near = ilen + jlen >= vlen * ntol
 
-            znew = 0.5 * (inew[near, :] + jnew[near, :])
+            if spherical:
+                znew = sphmid(inew[near, :], jnew[near, :])
+            else:
+                znew = 0.5 * (inew[near, :] + jnew[near, :])
             inew = inew[~near, :]
             jnew = jnew[~near, :]
             # ------------------------------------- split constraints
@@ -765,6 +812,8 @@ def cdtref2(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
         "filt": 0.0,
     }
 
+    spherical = bool(opts.get("spherical", False))
+
     vidx = np.arange(vert.shape[0])  # "new" vert list
 
     tnow = time.time()
@@ -777,7 +826,9 @@ def cdtref2(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
         ttic = time.time()
         nold = vert.shape[0]
 
-        vert, conn, tria, tnum = deltri(vert, conn, node, PSLG, part, opts["dtri"])
+        vert, conn, tria, tnum = deltri(
+            vert, conn, node, PSLG, part, opts["dtri"], spherical=spherical
+        )
 
         nnew = vert.shape[0]
         vidx = np.concatenate([vidx, np.arange(nold, nnew)])
@@ -793,9 +844,14 @@ def cdtref2(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
 
         # ------------------------------------- calc. circumballs
         ttic = time.time()
-        bal1 = cdtbal1(vert, conn)
-        bal2 = cdtbal2(vert, edge, tria)
-        len2, _ = minlen(vert, tria)
+        if spherical:
+            bal1 = cdtbal1_sph(vert, conn)
+            bal2 = cdtbal2_sph(vert, edge, tria)
+            len2, _ = minlen_sph(vert, tria)
+        else:
+            bal1 = cdtbal1(vert, conn)
+            bal2 = cdtbal2(vert, edge, tria)
+            len2, _ = minlen(vert, tria)
         rho2 = bal2[:, 2] / len2  # rad-edge ratio
         scr2 = rho2 * bal2[:, 2]
         tcpu["ball"] += time.time() - ttic
@@ -827,7 +883,10 @@ def cdtref2(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
         ref1 = np.zeros(conn.shape[0], dtype=bool)
         ref2 = np.zeros(tria.shape[0], dtype=bool)
 
-        stri, _ = isfeat(vert, edge, tria)
+        if spherical:
+            stri, _ = isfeat_sph(vert, edge, tria)
+        else:
+            stri, _ = isfeat(vert, edge, tria)
 
         ref2[rho2 > opts["rho2"] * opts["rho2"]] = True  # bad rad-edge len.
         ref2[stri] = False
@@ -868,7 +927,10 @@ def cdtref2(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
             and element-shape constraints.
             """
             # ------------------------------------- find frontal edge
-            lmin, emin = minlen(vert, tria[num2, :])
+            if spherical:
+                lmin, emin = minlen_sph(vert, tria[num2, :])
+            else:
+                lmin, emin = minlen(vert, tria[num2, :])
             ftri = np.zeros(len(num2), dtype=bool)
             epos = np.zeros(len(num2), dtype=int)
             tadj = np.zeros(len(num2), dtype=int)
@@ -895,12 +957,19 @@ def cdtref2(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
                 ftri[:] = True  # can this happen!?
 
             # ------------------------------------- locate offcentres
-            emid = (vert[edge[epos, 0], :] + vert[edge[epos, 1], :]) * 0.5
+            if spherical:
+                emid = sphmid(vert[edge[epos, 0], :2], vert[edge[epos, 1], :2])
+            else:
+                emid = (vert[edge[epos, 0], :] + vert[edge[epos, 1], :]) * 0.5
             elen = np.sqrt(lmin[:])
             # ------------------------------------- "voro"-type dist.
-            vvec = bal2[num2, 0:2] - emid
-            vlen = np.sqrt(np.sum(vvec**2, axis=1))
-            vvec = vvec / np.column_stack([vlen, vlen])
+            if spherical:
+                vvec = None
+                vlen = sphdist(emid, bal2[num2, 0:2])
+            else:
+                vvec = bal2[num2, 0:2] - emid
+                vlen = np.sqrt(np.sum(vvec**2, axis=1))
+                vvec = vvec / np.column_stack([vlen, vlen])
 
             hmid = (fun0[edge[epos, 0]] + fun0[edge[epos, 1]]) * 0.5
             # ------------------------------------- "ball"-type dist.
@@ -913,7 +982,10 @@ def cdtref2(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
             # ------------------------------------- bind "safe" dist.
             dist = np.minimum.reduce([dsiz, doff, vlen])
             # ------------------------------------- locate offcentres
-            off2 = emid + np.column_stack([dist, dist]) * vvec
+            if spherical:
+                off2 = sphmove(emid, bal2[num2, 0:2], dist)
+            else:
+                off2 = emid + np.column_stack([dist, dist]) * vvec
 
             # ------------------------------------- iter. "size"-type
             for _ in range(3):
@@ -933,7 +1005,10 @@ def cdtref2(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
                 # ------------------------------------- bind "safe" dist.
                 dist = np.minimum.reduce([dsiz, doff, vlen])
                 # ------------------------------------- locate offcentres
-                off2 = emid + np.column_stack([dist, dist]) * vvec
+                if spherical:
+                    off2 = sphmove(emid, bal2[num2, 0:2], dist)
+                else:
+                    off2 = emid + np.column_stack([dist, dist]) * vvec
 
             orad = np.sqrt((elen * 0.5) ** 2 + dist**2)
             # ------------------------------------- do offcentre pt's
@@ -949,7 +1024,10 @@ def cdtref2(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
         # ------------------------------------- inter.-ball dist.
         ttic = time.time()
         # ------------------------------------- proximity filters
-        vp, vi, _ = findball(new2, new2[:, 0:2])
+        if spherical:
+            vp, vi, _ = findball_sph(new2, new2[:, 0:2])
+        else:
+            vp, vi, _ = findball(new2, new2[:, 0:2])
 
         keep = np.ones(new2.shape[0], dtype=bool)
         for ii in range(vp.shape[0] - 1, -1, -1):
@@ -962,7 +1040,10 @@ def cdtref2(vert, conn, tria, tnum, node, PSLG, part, opts, hfun, harg, iter):
 
         # ------------------------------------- test encroachment
         bal1[:, 2] = (1.0 - np.finfo(float).eps ** 0.75) * bal1[:, 2]
-        vp, vi, _ = findball(bal1, new2[:, 0:2])
+        if spherical:
+            vp, vi, _ = findball_sph(bal1, new2[:, 0:2])
+        else:
+            vp, vi, _ = findball(bal1, new2[:, 0:2])
         keep = np.ones(new2.shape[0], dtype=bool)
         for ii in range(vp.shape[0]):
             for ip in range(vp[ii, 0], vp[ii, 1] + 1):
@@ -1127,5 +1208,12 @@ def makeopt(opts):
             raise TypeError("refine:incorrectInputClass - Incorrect input class.")
         if not isinstance(opts["dbug"], (bool, np.bool_)):
             raise ValueError("refine:incorrectDimensions - Incorrect input dimensions.")
+
+    # spherical option
+    if "spherical" not in opts:
+        opts["spherical"] = False
+    else:
+        if not isinstance(opts["spherical"], (bool, np.bool_)):
+            raise TypeError("refine:incorrectInputClass - spherical must be bool.")
 
     return opts
