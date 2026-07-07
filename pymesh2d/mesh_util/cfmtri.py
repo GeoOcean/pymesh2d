@@ -26,7 +26,7 @@ def cfmtri(vert, econ):
 
     See Also
     --------
-    deltri2 : perform unconstrained Delaunay triangulation.
+    deltri : perform unconstrained Delaunay triangulation.
     delaunayn : compute N-D Delaunay triangulation.
 
     References
