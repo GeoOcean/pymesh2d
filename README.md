@@ -1,12 +1,9 @@
-> ## This repository is no longer maintained
->
-> Development of `pymesh2D` has moved to **[BlueMesh2D](https://github.com/GeoOcean/BlueMesh2D)**.
->
-> Please use that repository for the latest code, issues and pull requests. This one is kept for reference only and will not receive further updates.
-
 <p align="center">
   <img src="assets/mesh_geocean.webp" alt="pymesh2D logo" width="120">
 </p>
+
+> ## This repository is no longer maintained
+> Development of **pymesh2D** has moved to [**BlueMesh2D**](https://github.com/GeoOcean/BlueMesh2D). Please use that repository for the latest code, issues and pull requests. This one is kept for reference only and will not receive further updates.
 
 ## `pymesh2D: Delaunay-based mesh generation in Python`
 
